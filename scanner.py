@@ -201,6 +201,18 @@ def log_alert(card: str, sent_errors):
         f.write(f"--- {stamp} [{status}]\n{card}\n\n")
 
 
+def record_alert(setup, now: datetime, stats):
+    """Structured record so the daily recap can grade each alert."""
+    rec = {
+        "date": now.strftime("%Y-%m-%d"), "time": now.strftime("%H:%M:%S"),
+        "ticker": setup.ticker, "direction": setup.direction,
+        "strike": setup.strike, "spot": setup.spot, "mom_pct": setup.mom_pct,
+        "win_rate": stats["win_rate"] if stats else None,
+    }
+    with (Path(__file__).parent / "alerts_sent.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
 def fetch_today_bars(yf_symbol: str, now: datetime):
     df = yf.download(yf_symbol, period="1d", interval="5m",
                      progress=False, auto_adjust=False)
@@ -273,6 +285,7 @@ def run(dry_run: bool):
                         alerted_today.add(ticker)
                         continue
                 alerted_today.add(ticker)
+                record_alert(setup, now, stats)
                 card = build_card(setup, now, backtest, stats)
                 if dry_run:
                     print(f"\n{card}\n")
