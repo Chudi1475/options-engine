@@ -1,0 +1,5 @@
+# scheduled event days the risk gate should flag — one per line:
+# YYYY-MM-DD  label
+# examples:
+# 2026-06-11  CPI release 8:30am
+# 2026-06-17  FOMC rate decision 2pm

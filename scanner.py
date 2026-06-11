@@ -17,8 +17,12 @@ Env vars (see .env.example):
 """
 
 import argparse
+import json
 import os
 import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # emoji on Windows console
 import time as time_mod
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -31,8 +35,30 @@ from strategy import StrategyConfig, detect_setup
 
 ET = ZoneInfo("America/New_York")
 ALERTS_LOG = Path(__file__).parent / "alerts.log"
-POLL_SECONDS = 60
-TICKER_COOLDOWN_MIN = 30  # one text per ticker per setup, not one per bar
+POLL_SECONDS = 15         # check often; a new 5m bar triggers a text within ~15s
+MIN_WINRATE = 70.0        # never text a setup below this backtested win rate
+
+# risk tiers — emoji stands in for color (Telegram has no colored text)
+TIERS = [
+    (85.0, "🟢🌟", "GREAT ODDS"),
+    (80.0, "🟢", "GOOD ODDS"),
+    (75.0, "🟠", "DECENT ODDS"),
+    (70.0, "🔴", "RISKY"),
+]
+
+
+def tier_for(win_rate: float):
+    for floor, emoji, label in TIERS:
+        if win_rate >= floor:
+            return emoji, label
+    return None, None
+
+
+def load_backtest():
+    path = Path(__file__).parent / "reports" / "backtest_results.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def load_env():
@@ -46,9 +72,13 @@ def load_env():
                 os.environ.setdefault(k.strip(), v.strip())
 
 
-def is_trading_day_approved() -> bool:
-    # Phase 5 stub: pre-market risk gate (news, VIX, CPI/FOMC). Always on for now.
-    return True
+def is_trading_day_approved():
+    """Phase 5 risk gate: VIX / overnight gap / scheduled events."""
+    try:
+        from risk_gate import morning_check
+        return morning_check()
+    except Exception as e:
+        return True, "⚪", f"Risk gate unavailable ({e}) — proceeding with standard rules."
 
 
 def next_expiry_for(ticker: str, now: datetime) -> str:
@@ -59,21 +89,66 @@ def next_expiry_for(ticker: str, now: datetime) -> str:
     return friday.strftime("%#m/%#d") if os.name == "nt" else friday.strftime("%-m/%-d")
 
 
-def build_card(setup, now: datetime) -> str:
+def setup_stats(setup, backtest: dict):
+    """Backtested stats for this exact ticker+direction, or None."""
+    if not backtest:
+        return None
+    return backtest.get("per_setup", {}).get(f"{setup.ticker}:{setup.direction}")
+
+
+def why_text(setup, stats) -> str:
+    """Plain-English reason a 6th grader could read."""
+    mom_dir = "UP" if setup.mom_pct > 0 else "DOWN"
+    if setup.direction == "call":
+        pattern = (f"{setup.ticker} just turned {mom_dir} over the last 15 minutes "
+                   f"({setup.mom_pct:+.2f}%). Buying calls when momentum has just "
+                   "turned up is the exact pattern behind Kelechi's best trades.")
+    else:
+        pattern = (f"{setup.ticker} is below its open and falling "
+                   f"({setup.mom_pct:+.2f}% in 15 min). This is the mirror of the "
+                   "call setup — less proven, treat with extra care.")
+    wins_in_100 = round(stats["win_rate"])
+    history = (f"In testing, this setup on {setup.ticker} {setup.direction}s won "
+               f"{wins_in_100} out of every 100 trades ({stats['trades']} real "
+               f"backtested trades, {stats['start']}–{stats['end']}).")
+    return f"{pattern} {history}"
+
+
+def build_card(setup, now: datetime, backtest=None, stats=None) -> str:
     acct = os.environ.get("ACCOUNT_SIZE")
     size_line = (f"Size: 10% of account (~${float(acct) * 0.10:,.0f})"
                  if acct else "Size: 10% of account")
     ticker_disp = "SPXW" if setup.ticker == "SPX" else setup.ticker
-    strike_disp = f"{setup.strike:g}"
+    arrow = "📈" if setup.direction == "call" else "📉"
+    if stats:
+        emoji, label = tier_for(stats["win_rate"])
+        header = f"{emoji} WIN RATE: {stats['win_rate']:.0f}% — {label}"
+        why = f"WHY: {why_text(setup, stats)}"
+        br = backtest["bracket"]
+        exit_line = (f"EXIT PLAN: sell at +{br['target_pct']:g}% profit. "
+                     f"Get out if it drops {br['stop_pct']:g}%.")
+        backtested = ("BACKTESTED: YES "
+                      f"(win rate {stats['win_rate']:.0f}%, "
+                      f"avg win {stats['avg_win_pct']:+.0f}%, "
+                      f"avg loss {stats['avg_loss_pct']:+.0f}%, "
+                      f"{stats['trades']} trades, {stats['start']}-{stats['end']}, "
+                      "approx pricing)")
+    else:
+        header = "⚪ WIN RATE: UNKNOWN (run backtest.py first)"
+        why = f"WHY: {setup.reason}"
+        exit_line = "EXIT PLAN: Half at +60%, full at +120%, stop at -30%"
+        backtested = "BACKTESTED: NO"
     return "\n".join([
-        f"Ticker: {ticker_disp}",
-        "Position:",
-        f"BUY {setup.direction.upper()} {strike_disp}",
-        f"Expiration: {next_expiry_for(setup.ticker, now)}",
+        header,
+        "",
+        f"{arrow} BUY {setup.direction.upper()} — {ticker_disp} {setup.strike:g}",
+        f"Expires: {next_expiry_for(setup.ticker, now)}",
         size_line,
-        f"Entry reason: {setup.reason}",
-        "Exit: Half at +60%, full at +120%, stop at -30%",
-        "BACKTESTED: NO",
+        "",
+        why,
+        "",
+        exit_line,
+        backtested,
         "Your call.",
     ])
 
@@ -140,12 +215,24 @@ def fetch_today_bars(yf_symbol: str, now: datetime):
 
 def run(dry_run: bool):
     cfg = StrategyConfig()
-    last_alert: dict = {}  # ticker -> datetime of last alert (cooldown)
+    backtest = load_backtest()
+    min_wr = float(os.environ.get("MIN_WINRATE", MIN_WINRATE))
+    alerted_today: set = set()  # tickers already alerted — one per ticker per day
+    if backtest is None:
+        print("WARNING: no backtest results found — every card will say "
+              "BACKTESTED: NO and the win-rate filter is OFF. Run backtest.py.")
     print(f"Scanner running ({'dry-run' if dry_run else 'live alerts'}). "
           f"Window {cfg.entry_start}-{cfg.entry_end} ET, polling every {POLL_SECONDS}s. "
-          f"Watchlist: {', '.join(cfg.watchlist)}")
-    if not is_trading_day_approved():
-        print("Trading day not approved by risk gate — exiting.")
+          f"Watchlist: {', '.join(cfg.watchlist)}. Min win rate: {min_wr:.0f}%. "
+          "Being picky: one alert per ticker per day, no forced trades.")
+    approved, _, day_msg = is_trading_day_approved()
+    print(day_msg)
+    if dry_run:
+        log_alert(day_msg, ["dry-run, not sent"])
+    else:
+        log_alert(day_msg, telegram_send(day_msg))  # morning day-report to everyone
+    if not approved:
+        print("Risk gate says stand down — exiting for today.")
         return
     while True:
         now = datetime.now(ET)
@@ -154,6 +241,8 @@ def run(dry_run: bool):
             return
         if now.weekday() < 5 and now.time() >= cfg.entry_start:
             for ticker, yf_symbol in cfg.watchlist.items():
+                if ticker in alerted_today:
+                    continue
                 try:
                     bars = fetch_today_bars(yf_symbol, now)
                 except Exception as e:
@@ -164,18 +253,35 @@ def run(dry_run: bool):
                 setup = detect_setup(ticker, bars, now, cfg)
                 if setup is None:
                     continue
-                last = last_alert.get(ticker)
-                if last and (now - last) < timedelta(minutes=TICKER_COOLDOWN_MIN):
-                    continue
-                last_alert[ticker] = now
-                card = build_card(setup, now)
+                stats = setup_stats(setup, backtest)
+                if backtest is not None:
+                    if stats is None:
+                        print(f"{now:%H:%M:%S} {ticker} {setup.direction}: setup "
+                              "formed but no backtest stats for it — skipped.")
+                        alerted_today.add(ticker)
+                        continue
+                    if stats["win_rate"] < min_wr:
+                        print(f"{now:%H:%M:%S} {ticker} {setup.direction}: setup "
+                              f"formed but win rate {stats['win_rate']:.0f}% is "
+                              f"below {min_wr:.0f}% — skipped, not forcing it.")
+                        alerted_today.add(ticker)
+                        continue
+                    if stats["expectancy_pct"] <= 0:
+                        print(f"{now:%H:%M:%S} {ticker} {setup.direction}: wins "
+                              f"{stats['win_rate']:.0f}% of the time but LOSES "
+                              "money overall in testing — skipped, not forcing it.")
+                        alerted_today.add(ticker)
+                        continue
+                alerted_today.add(ticker)
+                card = build_card(setup, now, backtest, stats)
                 if dry_run:
                     print(f"\n{card}\n")
                     log_alert(card, ["dry-run, not sent"])
                 else:
-                    errors = telegram_send(card)
+                    errors = telegram_send(card)  # sends the moment it's seen
                     log_alert(card, errors)
-                    print(f"{now:%H:%M:%S} alert sent: {ticker} {setup.strike:g}C"
+                    print(f"{now:%H:%M:%S} alert sent: {ticker} "
+                          f"{setup.strike:g} {setup.direction}"
                           + (f" (errors: {errors})" if errors else ""))
         time_mod.sleep(POLL_SECONDS)
 

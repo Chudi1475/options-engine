@@ -62,7 +62,24 @@ python scanner.py --dry-run  # prints cards instead of texting
 
 Cards say `BACKTESTED: NO` until the Phase 3 backtester has actually run.
 
-## Roadmap
+## Backtests
 
-- Phase 3 — `backtest.py`: honest backtest with slippage + fees (next)
-- Phase 5 — pre-market risk gate (stub: `is_trading_day_approved()` in scanner.py)
+```
+python backtest.py        # 60 days of 5-min bars: full strategy + exit-bracket grid
+python backtest_long.py   # 2y hourly cousin + 5y daily proxy (labeled)
+```
+
+`backtest.py` also writes `reports/backtest_results.json` — the scanner reads it to quote real per-setup win rates and the chosen exit bracket on every alert. Alerts only go out for setups with a backtested win rate ≥ 70% **and** positive expectancy (configurable via `MIN_WINRATE` env var).
+
+## Risk gate (`risk_gate.py`)
+
+```
+python risk_gate.py            # today's verdict: 🟢 normal / 🟠 caution / 🔴 stand down
+python risk_gate.py --study    # rebuild reports/news_study.md (5y VIX/gap study)
+```
+
+The scanner runs this at startup and texts the day verdict to everyone. Add CPI/FOMC/etc. dates to `data/event_days.txt` by hand.
+
+## Sharing
+
+`GUIDE.txt` is a plain-English explainer to send anyone who receives the alerts — what the texts mean and how to execute them (Robinhood steps included).

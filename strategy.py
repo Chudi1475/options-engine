@@ -31,7 +31,9 @@ class StrategyConfig:
     entry_start: time = time(9, 45)
     entry_end: time = time(10, 30)
     dte_target: int = 0          # 0DTE for SPX; nearest weekly for stocks
-    direction: str = "call"      # long premium, calls only (his measured style)
+    # "call" = validated direction only; "both" also fires the put mirror rule.
+    # The May study had only 14 puts — the put rule is a mirror, NOT validated.
+    direction: str = "both"
     mom_bars: int = 3            # 15 minutes of 5m bars
     # KELECHI RULE: strike selection. Placeholder = first strike above spot.
     strike_increment: dict = field(default_factory=lambda: {"SPX": 5.0})
@@ -53,9 +55,11 @@ class Setup:
     reason: str
 
 
-def _round_strike(spot: float, increment: float) -> float:
-    # first strike at or above spot (slightly OTM call)
-    return float(-(-spot // increment) * increment)
+def _round_strike(spot: float, increment: float, up: bool = True) -> float:
+    # first strike at or above spot for calls, at or below for puts (slightly OTM)
+    if up:
+        return float(-(-spot // increment) * increment)
+    return float(spot // increment * increment)
 
 
 def detect_setup(ticker: str, bars: pd.DataFrame, now, cfg: StrategyConfig):
@@ -72,21 +76,26 @@ def detect_setup(ticker: str, bars: pd.DataFrame, now, cfg: StrategyConfig):
     px = float(bars["Close"].iloc[-1])
     day_open = float(bars["Open"].iloc[0])
     mom = (px / float(bars["Close"].iloc[-(cfg.mom_bars + 1)]) - 1) * 100
+    above_open = px > day_open
 
-    # Core derived rule: short-term momentum must be positive.
-    if mom <= 0:
+    # Core derived rule (validated, 79% in-sample): momentum up -> call.
+    # Mirror rule (NOT validated, only 14 puts in the study): momentum down
+    # while also below the open -> put. Requiring below-open keeps the put
+    # side off during chop and mirrors the 0-for-6 anti-setup finding.
+    if mom > 0 and cfg.direction in ("call", "both"):
+        direction = "call"
+    elif mom < 0 and not above_open and cfg.direction in ("put", "both"):
+        direction = "put"
+    else:
         return None
 
-    # Anti-setup guard is implicit (mom>0 required); kept explicit for clarity:
-    # momentum down while extended above the open went 0-for-6 in May.
-
     # KELECHI RULE: his actual trigger (level break? candle pattern? flow?).
-    # Until he answers, momentum-positive is the whole trigger.
+    # Until he answers, momentum is the whole trigger.
 
     increment = cfg.strike_increment.get(ticker, cfg.default_strike_increment)
-    strike = _round_strike(px, increment)
-    above_open_txt = "above" if px > day_open else "below"
+    strike = _round_strike(px, increment, up=direction == "call")
+    above_open_txt = "above" if above_open else "below"
     reason = (f"15-min momentum {mom:+.2f}%, {above_open_txt} open "
               f"({(px / day_open - 1) * 100:+.2f}%) — derived rule, see win_study.md")
-    return Setup(ticker=ticker, direction=cfg.direction, strike=strike,
+    return Setup(ticker=ticker, direction=direction, strike=strike,
                  spot=px, mom_pct=mom, reason=reason)

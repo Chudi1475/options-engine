@@ -1,0 +1,88 @@
+================================================
+  OPTIONS ALERT BOT — HOW TO READ AND USE IT
+================================================
+
+WHAT THIS IS
+------------
+A Telegram bot that watches the market every morning (9:45-10:30 AM ET)
+and texts you when a high-probability options setup appears. It is built
+from a real trader's order history — it looks for the exact pattern
+behind his best trades and ignores everything else.
+
+The bot NEVER trades for you. It texts a suggestion. You decide.
+
+THE MORNING MESSAGE (comes first, around market open)
+------------------------------------------------------
+🟢 NORMAL DAY  = trade the alerts as normal
+🟠 CAUTION DAY = something is off (high fear, big gap, Fed/CPI day).
+                 Alerts still come, but consider HALF size.
+🔴 NO-TRADE DAY = market is in panic mode. Bot stands down. Don't trade.
+
+THE ALERT (this is the money text)
+-----------------------------------
+Example:
+
+  🔴 WIN RATE: 72% — RISKY
+
+  📈 BUY CALL — SPXW 7395
+  Expires: 5/13
+  Size: 10% of account
+
+  WHY: SPX just turned UP over the last 15 minutes. Buying calls when
+  momentum has just turned up is the exact pattern behind the best
+  trades. In testing, this setup won 72 out of every 100 trades.
+
+  EXIT PLAN: sell at +15% profit. Get out if it drops -60%.
+  BACKTESTED: YES (...real numbers...)
+  Your call.
+
+WHAT EACH LINE MEANS
+--------------------
+WIN RATE line — how often this exact setup made money in testing:
+  🔴 70-74%  RISKY        (wins 7 of 10, but rough ride)
+  🟠 75-79%  DECENT ODDS
+  🟢 80-84%  GOOD ODDS
+  🟢🌟 85%+   GREAT ODDS
+  Below 70%? You never see it. The bot stays silent instead of
+  forcing a weak trade. No text = no trade today. That's normal.
+
+BUY CALL / BUY PUT — the direction. 📈 CALL = betting it goes up.
+  📉 PUT = betting it goes down.
+
+The number after the ticker (7395) — the STRIKE price.
+
+Expires — the expiration date to pick. Same day for SPX = "0DTE".
+
+Size — never put more than 10% of your account into one trade.
+
+HOW TO TAKE THE TRADE ON ROBINHOOD (60 seconds)
+------------------------------------------------
+1. Open Robinhood, search the ticker from the text
+   (SPXW alerts = search "SPX". Robinhood shows SPX index options.)
+2. Tap "Trade" -> "Trade Options"
+3. Pick the EXPIRATION DATE from the text (top of screen)
+4. Pick CALL or PUT (matches the text)
+5. Find the STRIKE from the text (e.g. 7395)
+6. Tap it -> "Buy" -> enter how many contracts fit inside 10% of
+   your account -> swipe to submit at the ASK (or a nickel below)
+7. IMMEDIATELY set your exit:
+   - Set a LIMIT SELL at +15% above what you paid (the profit target)
+   - Watch the position: if it drops 60% from what you paid, sell.
+     Don't hope. Don't average down. Sell.
+8. Everything closes the SAME DAY. Do not hold 0DTE past the close —
+   it expires worthless at 4 PM if it's out of the money.
+
+THE THREE RULES THAT KEEP YOU ALIVE
+------------------------------------
+1. If you didn't get a text, there is no trade. Boredom is not a setup.
+2. The stop is the stop. One ignored stop can erase a week of wins.
+3. 10% of account max. A 70% win rate still loses 3 times out of 10 —
+   sometimes back to back. Size so that 3 losses in a row don't hurt.
+
+HONESTY NOTES (read once)
+-------------------------
+- Win rates come from a real backtest over ~3 months of market data
+  using approximated option pricing. They are estimates, not promises.
+- Past performance does not guarantee future results.
+- This is not financial advice. Every alert ends with "Your call."
+  because it genuinely is.
