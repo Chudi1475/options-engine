@@ -1,2 +1,4 @@
 pandas>=2.0
 matplotlib>=3.8
+yfinance>=0.2
+requests>=2.31
