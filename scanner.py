@@ -36,6 +36,7 @@ import yfinance as yf
 
 import cards
 import config
+import news
 import positions as poslib
 import quotes
 import risk_gate
@@ -105,6 +106,7 @@ class Service:
         self.skipped_today = set()
         self.daily_closes = {}
         self._sigma_retry = {}
+        self._bars_cache = {}  # one bars download per ticker per cycle
         self.mode, self.mode_reason = "green", ""
         self.morning_sent_for = None
         self.premarket_sent_for = None
@@ -172,6 +174,16 @@ class Service:
                 return 0.0
         return realized_vol(self.daily_closes[ticker], self.day)
 
+    def get_bars(self, yfs: str, now: datetime):
+        """Today's completed 5m bars, downloaded at most once per cycle even
+        when entry scan and position monitoring both need the same ticker."""
+        hit = self._bars_cache.get(yfs)
+        if hit and (now - hit[0]).total_seconds() < config.POLL_SECONDS - 2:
+            return hit[1]
+        bars = self.feed.today_bars(yfs, now)
+        self._bars_cache[yfs] = (now, bars)
+        return bars
+
     def current_mode(self):
         """Manual /risk override (today only) beats the automatic morning mode."""
         override = config.state_get("risk_override")
@@ -205,6 +217,12 @@ class Service:
             return
         self.morning_sent_for = today
         card = cards.morning_card(mode, reason, today)
+        try:  # earnings radar + hot headlines (news must never block the report)
+            extra = news.morning_lines(self.cfg.watchlist)
+            if extra:
+                card += "\n" + "\n".join(extra)
+        except Exception as e:
+            print(f"news scan failed: {e}")
         if config.paper_mode():
             card += "\n[PAPER MODE is ON — cards are practice, not trades.]"
         self.notify(card)
@@ -319,7 +337,7 @@ class Service:
             if ticker in self.skipped_today or ticker in opened:
                 continue
             try:
-                bars = self.feed.today_bars(yfs, now)
+                bars = self.get_bars(yfs, now)
                 if bars is None or bars.empty:
                     continue
                 setup = detect_setup(ticker, bars, now, self.cfg)
@@ -349,6 +367,18 @@ class Service:
             expiry_dt = expiry_dt.replace(year=expiry_date.year,
                                           month=expiry_date.month,
                                           day=expiry_date.day)
+
+        # earnings inside the option's life = a coin flip on the report,
+        # not the momentum pattern we backtested. Skip, say why in the log.
+        try:
+            blocked, e_date = news.earnings_inside(setup.ticker, expiry_date)
+        except Exception:
+            blocked, e_date = False, None
+        if blocked:
+            print(f"{now:%H:%M:%S} {setup.ticker} {setup.direction}: earnings "
+                  f"{e_date} lands inside this option's life — skipped, "
+                  "not gambling on a report.")
+            return True  # final decision for the day
         quote = quotes.get_option_quote(setup.ticker, right, setup.strike, expiry_date)
         sigma = self.sigma(setup.ticker)
         est = quotes.estimate_premium(setup.spot, setup.strike, right,
@@ -393,8 +423,15 @@ class Service:
             win_rate_quoted=display["win_rate"] if display else 0.0,
             ev_quoted=display["ev_pct"] if display else 0.0,
         )
+        news_lines = []
+        if setup.ticker != "SPX":
+            try:
+                news_lines = [f"⚠️ News today — {outlet}: {title}"
+                              for outlet, title in news.hot_headlines(setup.ticker)[:2]]
+            except Exception:
+                pass
         card = cards.entry_card(setup, pos, quote, display, mode, mode_reason,
-                                expiry_date, now.date())
+                                expiry_date, now.date(), news_lines=news_lines)
         errors = self.notify(card)  # sends the moment it's seen
         record_alert(setup, now, display)
         self.book.add(pos)
@@ -421,10 +458,15 @@ class Service:
 
     def monitor_one(self, pos: Position, now: datetime):
         yfs = self.cfg.watchlist.get(pos.ticker, pos.ticker)
-        bars = self.feed.today_bars(yfs, now)
+        bars = self.get_bars(yfs, now)
+        last_close = (float(bars["Close"].iloc[-1])
+                      if bars is not None and not bars.empty else None)
         spot = self.feed.latest_price(yfs)
-        if spot is None and bars is not None and not bars.empty:
-            spot = float(bars["Close"].iloc[-1])
+        if spot is None:
+            spot = last_close
+        elif last_close and abs(spot / last_close - 1) > 0.10:
+            spot = last_close  # garbage-tick guard: a 'live' price 10% away
+                               # from the last completed bar is not believable
         if spot is None:
             return
         sigma = self.sigma(pos.ticker)
@@ -505,6 +547,7 @@ class Service:
                     self.maybe_weekly(now)
                     print("Session over for today.")
                     return
+                t0 = time_mod.monotonic()
                 try:  # one bad cycle must never end the trading day
                     self.flush_pending()
                     self.handle_commands()
@@ -515,7 +558,10 @@ class Service:
                     self.maybe_weekly(now)
                 except Exception as e:
                     print(f"{now:%H:%M:%S} cycle error (continuing): {e}")
-                time_mod.sleep(config.POLL_SECONDS)
+                # adaptive sleep: data-fetch time counts toward the cadence,
+                # so a slow cycle doesn't push the next look further out
+                elapsed = time_mod.monotonic() - t0
+                time_mod.sleep(max(2.0, config.POLL_SECONDS - elapsed))
         finally:
             keep_awake(False)
 

@@ -99,21 +99,28 @@ def _expected_lines(stats: dict, dollars):
 
 
 def _winrate_footer(stats: dict) -> str:
-    emoji, label = tier_for(stats["win_rate"])
     if stats["source"] == "live":
+        emoji, label = tier_for(stats["win_rate"])
         return (f"{emoji} Live win rate: {stats['win_rate']:.0f} of 100 — {label} "
                 f"({stats['trades']} real signals)")
-    rules = "new exit rules" if stats["source"] == "backtest_new" else "old +15/-60 rules"
-    extra = ""
-    if stats.get("old_win_rate") is not None and stats["source"] == "backtest_new":
-        extra = f"; old rules won {stats['old_win_rate']:.0f} of 100"
+    if stats["source"] == "backtest_new" and stats.get("old_win_rate") is not None:
+        # the 70/75/80/85 tier bar belongs to the OLD-rules gate that
+        # qualified this setup; the new exits trade win count for win size
+        emoji, label = tier_for(stats["old_win_rate"])
+        return (f"{emoji} Setup tier: {label} — old rules won "
+                f"{stats['old_win_rate']:.0f} of 100. New exits win "
+                f"{stats['win_rate']:.0f} of 100 but make more per trade "
+                f"({stats['trades']} trades {stats['start']}-{stats['end']}, "
+                "approx pricing)")
+    emoji, label = tier_for(stats["win_rate"])
     return (f"{emoji} Win rate in testing: {stats['win_rate']:.0f} of 100 — {label} "
             f"({stats['trades']} trades {stats['start']}-{stats['end']}, "
-            f"{rules}{extra}, approx pricing)")
+            "old +15/-60 rules, approx pricing)")
 
 
 def entry_card(setup, pos, quote, stats: dict, risk_mode: str,
-               mode_reason: str, expiry: date, today: date) -> str:
+               mode_reason: str, expiry: date, today: date,
+               news_lines=None) -> str:
     lines = []
     if pos.paper:
         lines.append("[PAPER] practice mode — track it, don't trade it")
@@ -132,6 +139,8 @@ def entry_card(setup, pos, quote, stats: dict, risk_mode: str,
     lines += size
     lines.append("")
     lines.append(why_text(setup))
+    for n in (news_lines or []):
+        lines.append(n)
     lines.append("")
     lines.append("EXIT PLAN — I'll text you each step:")
     lines.append(f"1️⃣ SELL HALF at +{config.TP_HALF_PCT:g}%")
