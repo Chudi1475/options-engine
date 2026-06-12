@@ -99,6 +99,10 @@ TEXTING THE BOT (commands)
 /test              -> sends fake examples of all 5 alert types
 /help              -> the list above
 
+You can also just TALK to it like a person — ask "why did we stop out
+today?", send a chart screenshot, or send a file, and it reads it and
+answers in plain English. (Needs the AI key set up by the owner.)
+
 THE THREE RULES THAT KEEP YOU ALIVE
 ------------------------------------
 1. If you didn't get a text, there is no trade. Boredom is not a setup.

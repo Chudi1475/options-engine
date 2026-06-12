@@ -229,4 +229,7 @@ def help_card() -> str:
         "/status — risk mode, account, open positions right now",
         "/test — fire a fake signal through every alert type",
         "/help — this list",
+        "",
+        "You can also just TALK to me — ask anything, or send a chart "
+        "screenshot / PDF / CSV and I'll read it and answer like a human.",
     ])

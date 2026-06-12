@@ -12,4 +12,5 @@ positions_dryrun.json
 positions_test.json
 state.json
 calendar_cache.json
+chat_history.json
 *.tmp

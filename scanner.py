@@ -196,6 +196,10 @@ class Service:
     def morning_report(self, now: datetime, include_gap: bool = True,
                        premarket: bool = False):
         today = now.date()
+        # survives restarts: don't re-text the morning card after a reboot
+        if (self.morning_sent_for != today
+                and config.state_get("morning_sent") == str(today)):
+            self.morning_sent_for = today
         cached = config.state_get("risk_auto")
         if cached and cached.get("date") == str(today) \
                 and bool(cached.get("gap", False)) >= include_gap:
@@ -226,6 +230,7 @@ class Service:
         if config.paper_mode():
             card += "\n[PAPER MODE is ON — cards are practice, not trades.]"
         self.notify(card)
+        config.state_set("morning_sent", str(today))
 
     # ---------- telegram commands ----------
 
@@ -233,17 +238,34 @@ class Service:
         if self.dry:
             return
         try:
-            cmds, max_id = telegram.get_commands(timeout=timeout)
+            items, max_id = telegram.get_messages(timeout=timeout)
         except RuntimeError:
             return
-        for cid, cmd, args in cmds:
+        for item in items:
             try:
-                reply = self.run_command(cmd, args)
+                reply = self.handle_item(item)
             except Exception as e:
-                reply = f"That command hit an error: {e}"
+                reply = f"That message hit an error: {e}"
             if reply:
-                telegram.send_to(cid, reply)
+                telegram.send_to(item["chat_id"], reply)
         telegram.ack_offset(max_id)  # after processing: crash = safe replay
+
+    def handle_item(self, item: dict):
+        """Commands run as commands; everything else (plain text, photos,
+        files) goes to the bot's brain — or an honest hint if no AI key."""
+        if item["kind"] == "command":
+            return self.run_command(item["cmd"], item["args"])
+        if item["kind"] == "unsupported":
+            return ("I can read text, photos, PDFs and CSV/TXT files — "
+                    "not voice or video yet.")
+        import assistant
+        if not assistant.enabled():
+            return ("I see your message, but my brain isn't plugged in yet. "
+                    "Add ANTHROPIC_API_KEY to the bot's .env "
+                    "(get one at console.anthropic.com) and I'll answer "
+                    "questions, read chart screenshots, and read files like "
+                    "a human. Commands still work any time: /help")
+        return assistant.respond(item, self.status_text())
 
     def run_command(self, cmd: str, args: str):
         if cmd == "/setaccount":

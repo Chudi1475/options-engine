@@ -50,11 +50,42 @@ def send(text: str) -> list:
     return errors
 
 
-def get_commands(timeout: int = 0):
-    """Poll for new messages. Returns ([(chat_id, command, args)], max_id)
-    from authorized chats only. The caller persists max_id (via ack_offset)
-    AFTER processing, so a crash mid-command replays it instead of losing it
-    — every command is idempotent, so replay is the safe direction."""
+def _parse_update(upd: dict, authorized: set):
+    """One Telegram update -> a message item, or None if it's not for us.
+    Kinds: command, text, photo, document, unsupported."""
+    msg = upd.get("message") or {}
+    cid = str(msg.get("chat", {}).get("id", ""))
+    if cid not in authorized:
+        return None
+    text = (msg.get("text") or "").strip()
+    if text.startswith("/"):
+        parts = text.split(None, 1)
+        return {"chat_id": cid, "kind": "command",
+                "cmd": parts[0].lower().split("@")[0],
+                "args": parts[1].strip() if len(parts) > 1 else ""}
+    if msg.get("photo"):  # Telegram orders sizes small->large; take the best
+        return {"chat_id": cid, "kind": "photo",
+                "file_id": msg["photo"][-1]["file_id"],
+                "mime": "image/jpeg",
+                "text": (msg.get("caption") or "").strip()}
+    if msg.get("document"):
+        d = msg["document"]
+        return {"chat_id": cid, "kind": "document", "file_id": d["file_id"],
+                "file_name": d.get("file_name", "file"),
+                "mime": d.get("mime_type", "application/octet-stream"),
+                "text": (msg.get("caption") or "").strip()}
+    if text:
+        return {"chat_id": cid, "kind": "text", "text": text}
+    if any(msg.get(k) for k in ("voice", "audio", "video", "video_note", "sticker")):
+        return {"chat_id": cid, "kind": "unsupported"}
+    return None
+
+
+def get_messages(timeout: int = 0):
+    """Poll for new messages of every kind. Returns (items, max_id) from
+    authorized chats only. The caller persists max_id (via ack_offset)
+    AFTER processing, so a crash mid-message replays it instead of losing
+    it — replay is the safe direction here."""
     offset = int(config.state_get("tg_offset", 0))
     try:
         r = requests.get(
@@ -67,15 +98,24 @@ def get_commands(timeout: int = 0):
     out, authorized, max_id = [], set(chat_ids()), offset
     for upd in updates:
         max_id = max(max_id, int(upd.get("update_id", 0)))
-        msg = upd.get("message") or {}
-        text = (msg.get("text") or "").strip()
-        cid = str(msg.get("chat", {}).get("id", ""))
-        if not text.startswith("/") or cid not in authorized:
-            continue
-        parts = text.split(None, 1)
-        cmd = parts[0].lower().split("@")[0]
-        out.append((cid, cmd, parts[1].strip() if len(parts) > 1 else ""))
+        item = _parse_update(upd, authorized)
+        if item:
+            out.append(item)
     return out, max_id
+
+
+def download_file(file_id: str, max_bytes: int = 10 * 1024 * 1024):
+    """Fetch a photo/document the user sent. Returns bytes or None."""
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{_token()}/getFile",
+                         params={"file_id": file_id}, timeout=15)
+        path = r.json()["result"]["file_path"]
+        f = requests.get(f"https://api.telegram.org/file/bot{_token()}/{path}",
+                         timeout=60)
+        f.raise_for_status()
+        return f.content if len(f.content) <= max_bytes else None
+    except Exception:
+        return None
 
 
 def ack_offset(max_id: int):

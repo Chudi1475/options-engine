@@ -185,6 +185,31 @@ for m in ("green", "yellow", "red"):
     check(f"morning card renders ({m})", "RISK MODE" in
           cards.morning_card(m, "reason here", TODAY))
 
+# --- telegram message parsing (pure, no network) ---
+import telegram as tg
+auth = {"123"}
+it = tg._parse_update({"message": {"chat": {"id": 123}, "text": "/risk red fomc"}}, auth)
+check("tg: command parsed", it["kind"] == "command" and it["cmd"] == "/risk"
+      and it["args"] == "red fomc")
+it = tg._parse_update({"message": {"chat": {"id": 123}, "text": "how we lookin"}}, auth)
+check("tg: plain text parsed", it["kind"] == "text" and it["text"] == "how we lookin")
+it = tg._parse_update({"message": {"chat": {"id": 123}, "caption": "what u think",
+                                   "photo": [{"file_id": "small"}, {"file_id": "big"}]}}, auth)
+check("tg: photo takes largest size + caption",
+      it["kind"] == "photo" and it["file_id"] == "big" and it["text"] == "what u think")
+it = tg._parse_update({"message": {"chat": {"id": 123},
+                                   "document": {"file_id": "d1", "file_name": "trades.csv",
+                                                "mime_type": "text/csv"}}}, auth)
+check("tg: document parsed", it["kind"] == "document" and it["file_name"] == "trades.csv")
+it = tg._parse_update({"message": {"chat": {"id": 999}, "text": "/status"}}, auth)
+check("tg: unauthorized chat ignored", it is None)
+it = tg._parse_update({"message": {"chat": {"id": 123}, "voice": {"file_id": "v"}}}, auth)
+check("tg: voice flagged unsupported", it["kind"] == "unsupported")
+
+import assistant
+check("assistant: disabled without API key (honest hint path)",
+      not assistant.enabled() or bool(__import__("os").environ.get("ANTHROPIC_API_KEY")))
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")
