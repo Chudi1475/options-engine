@@ -18,8 +18,9 @@ MODE_EMOJI = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
 
 
 def tier_for(win_rate: float):
+    # rounded first — 69.77% displays as 70 everywhere, so it tiers as 70
     for floor, emoji, label in TIERS:
-        if win_rate >= floor:
+        if round(win_rate) >= floor:
             return emoji, label
     return "⚪", "?"
 
@@ -227,6 +228,7 @@ def help_card() -> str:
         "/setaccount 25000 — set your account size (sizes cards in dollars)",
         "/risk green|yellow|red [reason] — override today's risk mode",
         "/status — risk mode, account, open positions right now",
+        "/score — your personal win/loss record (I keep it for you)",
         "/test — fire a fake signal through every alert type",
         "/help — this list",
         "",

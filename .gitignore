@@ -13,4 +13,6 @@ positions_test.json
 state.json
 calendar_cache.json
 chat_history.json
+user_trades.json
+user_trades_test.json
 *.tmp

@@ -254,6 +254,9 @@ class Service:
         """Commands run as commands; everything else (plain text, photos,
         files) goes to the bot's brain — or an honest hint if no AI key."""
         if item["kind"] == "command":
+            if item["cmd"] == "/score":
+                import assistant
+                return assistant.score_line(item["chat_id"])
             return self.run_command(item["cmd"], item["args"])
         if item["kind"] == "unsupported":
             return ("I can read text, photos, PDFs and CSV/TXT files — "
@@ -327,29 +330,33 @@ class Service:
     # ---------- entries (signal logic UNCHANGED) ----------
 
     def gate_stats(self, setup):
-        """The eligibility filter — identical rules to the old scanner:
-        backtested win rate >= MIN_WINRATE and positive expectancy, judged on
-        the old-rules backtest so the same setups fire as before."""
+        """The eligibility filter: backtested win rate of 70+ (rounded the
+        same way every card displays it — 69.77% IS the '70%' the user sees)
+        AND positive expectancy under the EXITS WE ACTUALLY TRADE (the
+        new-rules backtest when it exists, old-rules otherwise)."""
         if self.backtest_old is None:
             print("No backtest results — refusing to alert without real stats. "
                   "Run backtest.py.")
             return None
-        stats = self.backtest_old.get("per_setup", {}).get(
-            f"{setup.ticker}:{setup.direction}")
+        key = f"{setup.ticker}:{setup.direction}"
+        stats = self.backtest_old.get("per_setup", {}).get(key)
         now = et_now()
         if stats is None:
             print(f"{now:%H:%M:%S} {setup.ticker} {setup.direction}: setup formed "
                   "but no backtest stats for it — skipped.")
             return None
-        if stats["win_rate"] < config.MIN_WINRATE:
+        if round(stats["win_rate"]) < config.MIN_WINRATE:
             print(f"{now:%H:%M:%S} {setup.ticker} {setup.direction}: win rate "
                   f"{stats['win_rate']:.0f}% is below {config.MIN_WINRATE:.0f}% "
                   "— skipped, not forcing it.")
             return None
-        if stats["expectancy_pct"] <= 0:
+        new_stats = (self.backtest_new or {}).get("per_setup", {}).get(key)
+        exp = (new_stats or stats)["expectancy_pct"]
+        rules = "our exits" if new_stats else "the old exits"
+        if exp <= 0:
             print(f"{now:%H:%M:%S} {setup.ticker} {setup.direction}: wins "
-                  f"{stats['win_rate']:.0f}% of the time but LOSES money overall "
-                  "in testing — skipped, not forcing it.")
+                  f"{stats['win_rate']:.0f}% of the time but LOSES money with "
+                  f"{rules} in testing — skipped, not forcing it.")
             return None
         return stats
 

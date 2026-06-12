@@ -22,6 +22,7 @@ import telegram
 
 API_URL = "https://api.anthropic.com/v1/messages"
 HISTORY_FILE = config.DATA_DIR / "chat_history.json"
+TRADES_FILE = config.DATA_DIR / "user_trades.json"
 MAX_TURNS = 12          # rolling memory per chat
 MAX_TEXT_FILE = 20000   # chars of a text/CSV file passed to the model
 
@@ -33,21 +34,63 @@ options-ALERT bot built for Chudi and his trading partner Kelechi. The bot
 texts trade suggestions and exit steps; it NEVER places orders — the humans
 trade manually. You are the conversational side of that bot.
 
+Personality: talk like a sharp trading buddy, not a corporate helpdesk.
+Match their energy — "you up?" gets a short, alive answer ("always — eyes
+on the watchlist. what's good?"), a serious question gets a serious answer.
+Never state times, prices, or schedule facts you weren't given. Never
+lecture. Never pad.
+
+Scorekeeping — one of your main jobs:
+- ANY time the user reports how a trade went — text ("made $1,100 on the
+  SPX call", "lost 400 today") or a screenshot of their broker P&L — call
+  the log_trade_result tool, then confirm what you logged and give their
+  updated record in one line.
+- If the dollar amount isn't clear from what they sent, ask ONE short
+  question instead of guessing. NEVER log a number you aren't sure of.
+- When they ask "what's my record / score / how am I doing", call get_score.
+
 Hard rules:
-- NEVER invent statistics or prices. Only quote numbers that appear in the
-  LIVE BOT STATE block or in what the user sent you. If you don't have a
-  number, say so plainly.
+- NEVER invent statistics or prices. Only quote numbers from the LIVE BOT
+  STATE block, the tools, or what the user sent. Missing a number? Say so.
 - Never promise profits. When a question is really a trading decision,
   give your honest read and end with: Your call.
 - Plain language a 6th grader could read. Short, Telegram-sized answers —
-  a few sentences unless they ask for detail. No financial jargon without
-  a one-line explanation.
-- If they send a chart screenshot, describe what you actually see (trend,
-  levels, candles) and connect it to the bot's strategy: 15-minute momentum
-  turns, morning entry window 9:45-10:30 ET, sell half +25%, momentum-flip
-  trail, -30% stop.
-- The bot's commands are /setaccount /risk /status /test /help — point to
-  them when relevant."""
+  a few sentences unless they ask for detail.
+- Chart screenshots: describe what you actually see (trend, levels,
+  candles) and connect it to the bot's strategy: 15-minute momentum turns,
+  morning entry window 9:45-10:30 ET, sell half +25%, momentum-flip trail,
+  -30% stop.
+- The bot's commands are /setaccount /risk /status /score /test /help —
+  point to them when relevant."""
+
+TOOLS = [
+    {
+        "name": "log_trade_result",
+        "description": ("Record a trade result the user reports — their real "
+                        "fill, win or loss, in dollars. Use whenever they say "
+                        "or show how a trade went."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "profit_dollars": {"type": "number",
+                                   "description": "profit (positive) or loss (negative), dollars"},
+                "ticker": {"type": "string",
+                           "description": "ticker if known, e.g. SPX or QCOM"},
+                "note": {"type": "string",
+                         "description": "short note, e.g. 'call, sold half at +25'"},
+                "date": {"type": "string",
+                         "description": "YYYY-MM-DD if they said when; omit for today"},
+            },
+            "required": ["profit_dollars"],
+        },
+    },
+    {
+        "name": "get_score",
+        "description": ("The user's running personal record: wins, losses, "
+                        "total P&L from everything they've logged."),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+]
 
 
 def enabled() -> bool:
@@ -74,6 +117,71 @@ def _save_turn(chat_id: str, user_text: str, reply: str):
               {"role": "assistant", "content": reply}]
     hist[chat_id] = turns[-MAX_TURNS * 2:]
     HISTORY_FILE.write_text(json.dumps(hist, indent=1), encoding="utf-8")
+
+
+def _load_trades() -> dict:
+    if TRADES_FILE.exists():
+        try:
+            return json.loads(TRADES_FILE.read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def log_trade(chat_id: str, profit_dollars: float, ticker: str = "",
+              note: str = "", date_str: str = None) -> dict:
+    """Append one user-reported trade result to their personal ledger."""
+    from datetime import date as _date
+    entry = {
+        "date": date_str or str(_date.today()),
+        "profit_dollars": round(float(profit_dollars), 2),
+        "ticker": (ticker or "").upper(),
+        "note": note or "",
+    }
+    trades = _load_trades()
+    trades.setdefault(chat_id, []).append(entry)
+    TRADES_FILE.write_text(json.dumps(trades, indent=1), encoding="utf-8")
+    return entry
+
+
+def score(chat_id: str) -> dict:
+    """Running W:L record + total P&L from everything this user logged."""
+    entries = _load_trades().get(chat_id, [])
+    wins = [e for e in entries if e["profit_dollars"] > 0]
+    losses = [e for e in entries if e["profit_dollars"] <= 0]
+    return {
+        "entries": len(entries),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate_pct": round(len(wins) / len(entries) * 100) if entries else 0,
+        "total_dollars": round(sum(e["profit_dollars"] for e in entries), 2),
+        "last": entries[-1] if entries else None,
+    }
+
+
+def score_line(chat_id: str) -> str:
+    s = score(chat_id)
+    if not s["entries"]:
+        return ("No trades logged yet — just tell me how one went "
+                "(\"made $500 on SPX\") or send a P&L screenshot and "
+                "I'll keep score.")
+    return (f"📊 YOUR RECORD: {s['wins']}W - {s['losses']}L "
+            f"({s['win_rate_pct']}%) — total {s['total_dollars']:+,.0f} "
+            f"dollars across {s['entries']} logged trades.")
+
+
+def _run_tool(name: str, args: dict, chat_id: str) -> str:
+    try:
+        if name == "log_trade_result":
+            entry = log_trade(chat_id, args["profit_dollars"],
+                              args.get("ticker", ""), args.get("note", ""),
+                              args.get("date"))
+            return json.dumps({"logged": entry, "score": score(chat_id)})
+        if name == "get_score":
+            return json.dumps(score(chat_id))
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+    return json.dumps({"error": f"unknown tool {name}"})
 
 
 def _file_blocks(item: dict):
@@ -122,21 +230,34 @@ def respond(item: dict, context_text: str) -> str:
 
     history = _load_history().get(chat_id, [])
     messages = history + [{"role": "user", "content": blocks}]
+    reply = ""
     try:
-        r = requests.post(
-            API_URL,
-            headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"],
-                     "anthropic-version": "2023-06-01"},
-            json={"model": model(), "max_tokens": 800,
-                  "system": SYSTEM + "\n\nLIVE BOT STATE:\n" + context_text,
-                  "messages": messages},
-            timeout=120)
-        body = r.json()
-        if r.status_code != 200:
-            err = body.get("error", {}).get("message", r.text[:200])
-            return f"My brain hit an error: {err}"
-        reply = "".join(b.get("text", "") for b in body.get("content", [])
-                        if b.get("type") == "text").strip()
+        for _ in range(4):  # room for tool calls (log a trade, read the score)
+            r = requests.post(
+                API_URL,
+                headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                         "anthropic-version": "2023-06-01"},
+                json={"model": model(), "max_tokens": 800,
+                      "system": SYSTEM + "\n\nLIVE BOT STATE:\n" + context_text,
+                      "tools": TOOLS,
+                      "messages": messages},
+                timeout=120)
+            body = r.json()
+            if r.status_code != 200:
+                err = body.get("error", {}).get("message", r.text[:200])
+                return f"My brain hit an error: {err}"
+            content = body.get("content", [])
+            if body.get("stop_reason") == "tool_use":
+                messages.append({"role": "assistant", "content": content})
+                results = [{"type": "tool_result", "tool_use_id": b["id"],
+                            "content": _run_tool(b["name"], b.get("input", {}),
+                                                 chat_id)}
+                           for b in content if b.get("type") == "tool_use"]
+                messages.append({"role": "user", "content": results})
+                continue
+            reply = "".join(b.get("text", "") for b in content
+                            if b.get("type") == "text").strip()
+            break
     except requests.RequestException as e:
         return f"My brain couldn't connect: {e}"
     if not reply:

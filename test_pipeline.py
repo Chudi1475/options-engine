@@ -210,6 +210,27 @@ import assistant
 check("assistant: disabled without API key (honest hint path)",
       not assistant.enabled() or bool(__import__("os").environ.get("ANTHROPIC_API_KEY")))
 
+# --- personal W:L ledger (offline, isolated file) ---
+assistant.TRADES_FILE = config.DATA_DIR / "user_trades_test.json"
+if assistant.TRADES_FILE.exists():
+    assistant.TRADES_FILE.unlink()
+assistant.log_trade("u1", 1100, "SPX", "call, sold half +25")
+assistant.log_trade("u1", -400, "QCOM")
+assistant.log_trade("u2", 50)  # another user's ledger stays separate
+s = assistant.score("u1")
+check("ledger: 1W-1L for u1", s["wins"] == 1 and s["losses"] == 1
+      and s["entries"] == 2)
+check("ledger: total +700", abs(s["total_dollars"] - 700) < 0.01)
+check("ledger: per-user separation", assistant.score("u2")["entries"] == 1)
+check("ledger: score line renders", "1W - 1L" in assistant.score_line("u1"))
+check("ledger: empty user prompt", "No trades logged yet"
+      in assistant.score_line("nobody"))
+tool_out = assistant._run_tool("log_trade_result",
+                               {"profit_dollars": 200, "ticker": "spx"}, "u1")
+check("ledger: tool path logs + uppercases ticker",
+      '"SPX"' in tool_out and assistant.score("u1")["entries"] == 3)
+assistant.TRADES_FILE.unlink()
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")
