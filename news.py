@@ -60,9 +60,9 @@ def _fetch_titles(url: str) -> list:
             for it in root.iter("item")][:25]
 
 
-def _cached(key, fn):
+def _cached(key, fn, ttl=CACHE_SECONDS):
     hit = _cache.get(key)
-    if hit and time_mod.time() - hit[0] < CACHE_SECONDS:
+    if hit and time_mod.time() - hit[0] < ttl:
         return hit[1]
     try:
         val = fn()
@@ -72,21 +72,34 @@ def _cached(key, fn):
     return val
 
 
-def hot_headlines(ticker=None) -> list:
-    """Flagged (outlet, title) pairs — per-ticker if given, else market-wide."""
+def hot_headlines(ticker=None, ttl=CACHE_SECONDS) -> list:
+    """Flagged (outlet, title) pairs — per-ticker if given, else market-wide.
+    Pass a small ttl for intraday breaking-news watching."""
     if ticker:
         outlet, url = TICKER_FEED
         titles = _cached(f"t:{ticker}",
-                         lambda: _fetch_titles(url.format(sym=ticker)))
+                         lambda: _fetch_titles(url.format(sym=ticker)), ttl)
         feeds = [(outlet, titles)]
     else:
-        feeds = [(name, _cached(f"m:{name}", lambda u=url: _fetch_titles(u)))
+        feeds = [(name, _cached(f"m:{name}", lambda u=url: _fetch_titles(u), ttl))
                  for name, url in MARKET_FEEDS]
     out = []
     for outlet, titles in feeds:
         for t in titles:
             if t and HOT_WORDS.search(t):
                 out.append((outlet, t))
+    return out
+
+
+def all_hot(watchlist: dict, ttl=CACHE_SECONDS) -> list:
+    """Market-wide + per-stock-ticker hot headlines, deduped."""
+    out, seen = [], set()
+    for outlet, title in (hot_headlines(ttl=ttl)
+                          + [h for tk in watchlist if tk != "SPX"
+                             for h in hot_headlines(tk, ttl=ttl)]):
+        if title not in seen:
+            seen.add(title)
+            out.append((outlet, title))
     return out
 
 

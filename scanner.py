@@ -111,6 +111,7 @@ class Service:
         self.morning_sent_for = None
         self.premarket_sent_for = None
         self.heartbeat = 0
+        self._news_next = 0.0  # next breaking-news check (monotonic)
 
     # ---------- plumbing ----------
 
@@ -534,6 +535,44 @@ class Service:
             self.notify(builders[ev["type"]](pos, ev))
             print(f"{now:%H:%M:%S} {pos.ticker}: {ev['type']} at {ev['pct']:+.1f}%")
 
+    # ---------- breaking news ----------
+
+    def watch_news(self, now: datetime):
+        """Every ~2 minutes during the session: text the moment a NEW hot
+        headline hits the wires, with a one-line read from the brain.
+        Headlines already on the wires before startup are seeded silently
+        (the morning report covered those)."""
+        if time_mod.monotonic() < self._news_next:
+            return
+        self._news_next = time_mod.monotonic() + 120
+        hot = news.all_hot(self.cfg.watchlist, ttl=110)
+        seen = config.state_get("news_seen", [])
+        first_seed = config.state_get("news_seen_date") != str(now.date())
+        fresh = [(o, t) for o, t in hot if t not in seen]
+        if fresh:
+            seen = (seen + [t for _, t in fresh])[-300:]
+            config.state_set("news_seen", seen)
+        if first_seed:
+            config.state_set("news_seen_date", str(now.date()))
+            return  # seed silently — no replaying old headlines
+        for outlet, title in fresh[:3]:
+            msg = f"🚨 BREAKING — {outlet}: {title}"
+            try:
+                import assistant
+                if assistant.enabled():
+                    take = assistant.respond(
+                        {"chat_id": "newsdesk", "kind": "text",
+                         "text": ("One sentence only, no invented numbers: "
+                                  "what could this headline mean for SPX/QCOM/"
+                                  f"TSLA trades today? Headline: {title}")},
+                        self.status_text())
+                    if take and "error" not in take.lower():
+                        msg += f"\nQuick read: {take}"
+            except Exception:
+                pass
+            self.notify(msg)
+            print(f"{now:%H:%M:%S} breaking news alert: {title[:60]}")
+
     # ---------- weekly ----------
 
     def maybe_weekly(self, now: datetime):
@@ -584,6 +623,7 @@ class Service:
                         self.scan_entries(now)
                     if now.time() >= MONITOR_START:
                         self.monitor_positions(now)
+                    self.watch_news(now)
                     self.maybe_weekly(now)
                 except Exception as e:
                     print(f"{now:%H:%M:%S} cycle error (continuing): {e}")
