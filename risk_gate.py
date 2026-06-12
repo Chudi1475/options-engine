@@ -1,38 +1,64 @@
-"""Phase 5 — pre-market risk gate ("is today a good day to trade?").
+"""Pre-market risk gate: GREEN / YELLOW / RED, set fresh every trading day.
 
-There is no free archive of news headlines going back 5 years, so this gate
-uses what news actually moves: the VIX (the market's fear gauge — every
-headline, Fed speech, and war scare is priced into it within seconds), the
-overnight gap, and a manual list of scheduled event days (CPI/FOMC/etc.)
-in data/event_days.txt, one YYYY-MM-DD per line with an optional label.
+Sources, in order of authority:
+1. Manual override — /risk green|yellow|red texted to the bot (wins all day).
+2. Scheduled releases — the free ForexFactory weekly calendar feed
+   (nfs.faireconomy.media). USD high-impact FOMC/CPI/PPI/NFP -> RED;
+   any other USD high-impact release -> YELLOW. The feed allows only
+   2 fetches per 5 minutes, so the parsed result is cached to disk and a
+   failed fetch falls back to the last good pull (labeled).
+3. Market stress — VIX >= 35 -> RED, VIX >= 25 -> YELLOW, overnight SPX gap
+   >= 1% -> YELLOW (thresholds from the 5-year study in reports/news_study.md).
+4. Optional news check — if ANTHROPIC_API_KEY is set, a web-search model is
+   asked about major geopolitical escalation. Skipped silently if not set.
+5. data/event_days.txt — manual extra event dates, kept for compatibility.
 
---study mode measures, over 5 years and over his profitable May 2026 month,
-how morning follow-through behaved by VIX level and gap size, and writes
-reports/news_study.md. The live thresholds below come from that study.
+Effects (applied by the scanner): YELLOW adds a warning banner to cards;
+RED halves all suggested sizes and prepends "HIGH-RISK DAY".
 
 Usage:
-    python risk_gate.py            # print today's verdict
+    python risk_gate.py            # print today's mode + reason
     python risk_gate.py --study    # rebuild reports/news_study.md
 """
 
+import json
+import os
+import re
 import sys
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 import yfinance as yf
 
+import config
+
+ET = ZoneInfo("America/New_York")
 REPORTS_DIR = Path(__file__).parent / "reports"
 EVENT_FILE = Path(__file__).parent / "data" / "event_days.txt"
+CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+CALENDAR_CACHE = config.DATA_DIR / "calendar_cache.json"
 
-# live thresholds (see reports/news_study.md for where these come from)
-VIX_CAUTION = 25.0   # above this: trade smaller, expect whips
-VIX_BLOCK = 35.0     # above this: scanner stands down for the day
-GAP_CAUTION = 1.0    # overnight SPX gap bigger than ±1%: caution
+VIX_RED = 35.0       # panic
+VIX_YELLOW = 25.0    # elevated fear
+GAP_YELLOW = 1.0     # overnight SPX gap, percent
+
+# releases that historically whip the market hardest -> RED
+RED_EVENTS = re.compile(
+    r"FOMC|Federal Funds|CPI|Consumer Price|PPI|Producer Price|Non-?Farm|NFP",
+    re.IGNORECASE)
+
+SEVERITY = {"green": 0, "yellow": 1, "red": 2}
+
+
+def _worse(a: str, b: str) -> str:
+    return a if SEVERITY[a] >= SEVERITY[b] else b
 
 
 def load_event_days() -> dict:
@@ -58,30 +84,150 @@ def fetch_daily(symbol, period="5y"):
     return df
 
 
-def morning_check():
-    """Returns (approved, tier_emoji, message) for today."""
-    spx = fetch_daily("^GSPC", "10d")
-    vix = fetch_daily("^VIX", "10d")
-    vix_now = float(vix["Close"].iloc[-1])
-    gap = (float(spx["Open"].iloc[-1]) / float(spx["Close"].iloc[-2]) - 1) * 100
-    today = date.today()
-    event = load_event_days().get(today)
+def fetch_calendar() -> list:
+    """This week's scheduled releases. Cached to disk; the feed allows only
+    2 requests per 5 minutes, so never hammer it."""
+    cache = {}
+    if CALENDAR_CACHE.exists():
+        try:
+            cache = json.loads(CALENDAR_CACHE.read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, OSError):
+            cache = {}
+    today = str(date.today())
+    if cache.get("fetched_on") == today:
+        return cache.get("events", [])
+    try:
+        r = requests.get(CALENDAR_URL, timeout=20)
+        r.raise_for_status()
+        events = r.json()
+        CALENDAR_CACHE.write_text(
+            json.dumps({"fetched_on": today, "events": events}), encoding="utf-8")
+        return events
+    except (requests.RequestException, ValueError):
+        return cache.get("events", [])  # stale is better than blind
 
-    problems = []
-    if vix_now >= VIX_BLOCK:
-        return False, "🔴", (f"🔴 NO-TRADE DAY: VIX is {vix_now:.0f} (panic level). "
-                             "The bot is standing down today.")
-    if vix_now >= VIX_CAUTION:
-        problems.append(f"VIX is {vix_now:.0f} (elevated fear — moves get violent)")
-    if abs(gap) >= GAP_CAUTION:
-        problems.append(f"big overnight gap ({gap:+.1f}%) — chasing gaps lost money in testing")
-    if event:
-        problems.append(f"scheduled event today: {event} — expect fakeouts around the release")
-    if problems:
-        return True, "🟠", ("🟠 CAUTION DAY: " + "; ".join(problems) +
-                            ". Setups still fire but consider half size.")
-    return True, "🟢", (f"🟢 NORMAL DAY: VIX {vix_now:.0f}, overnight gap {gap:+.1f}%, "
-                        "no scheduled events listed. Standard rules apply.")
+
+def calendar_check(today: date):
+    """(mode, reasons) from this week's scheduled USD releases."""
+    mode, reasons = "green", []
+    for ev in fetch_calendar():
+        try:
+            ev_date = datetime.fromisoformat(ev["date"]).astimezone(ET).date()
+        except (KeyError, ValueError, TypeError):
+            continue
+        if ev_date != today or ev.get("country") != "USD":
+            continue
+        impact = (ev.get("impact") or "").lower()
+        title = ev.get("title", "scheduled release")
+        when = datetime.fromisoformat(ev["date"]).astimezone(ET).strftime("%I:%M %p").lstrip("0")
+        if impact == "high" and RED_EVENTS.search(title):
+            mode = _worse(mode, "red")
+            reasons.append(f"{title} at {when} ET (major release)")
+        elif impact == "high":
+            mode = _worse(mode, "yellow")
+            reasons.append(f"{title} at {when} ET")
+    return mode, reasons
+
+
+def market_stress_check(include_gap: bool):
+    """(mode, reasons) from VIX level and the overnight gap."""
+    mode, reasons = "green", []
+    vix_now = None
+    try:
+        vix = fetch_daily("^VIX", "10d")
+        vix_now = float(vix["Close"].iloc[-1])
+    except Exception:
+        reasons.append("couldn't read VIX")
+    if vix_now is not None:
+        if vix_now >= VIX_RED:
+            mode = "red"
+            reasons.append(f"VIX is {vix_now:.0f} (panic level)")
+        elif vix_now >= VIX_YELLOW:
+            mode = "yellow"
+            reasons.append(f"VIX is {vix_now:.0f} (elevated fear)")
+    gap = None
+    if include_gap:
+        try:
+            spx = fetch_daily("^GSPC", "10d")
+            gap = (float(spx["Open"].iloc[-1]) / float(spx["Close"].iloc[-2]) - 1) * 100
+            if abs(gap) >= GAP_YELLOW:
+                mode = _worse(mode, "yellow")
+                reasons.append(f"big overnight gap ({gap:+.1f}%)")
+        except Exception:
+            pass
+    return mode, reasons, vix_now, gap
+
+
+def anthropic_news_check(today: date):
+    """Optional: ask a web-search model about unscheduled escalation.
+    Returns (mode, reason) or None. Silently skipped without an API key."""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        return None
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+            json={
+                "model": os.environ.get("RISK_CHECK_MODEL", "claude-haiku-4-5-20251001"),
+                "max_tokens": 300,
+                "tools": [{"type": "web_search_20250305", "name": "web_search",
+                           "max_uses": 2}],
+                "messages": [{"role": "user", "content":
+                    f"Today is {today}. In the last 24 hours, has there been a "
+                    "MAJOR geopolitical escalation or unscheduled market-moving "
+                    "event that makes US index options unusually risky today? "
+                    "Reply with exactly one line: GREEN, YELLOW or RED, then a "
+                    "colon, then a reason of at most 12 words."}],
+            },
+            timeout=90)
+        text = "".join(b.get("text", "") for b in r.json().get("content", [])
+                       if b.get("type") == "text")
+        m = re.search(r"\b(GREEN|YELLOW|RED)\b\s*[:\-]?\s*(.*)", text,
+                      re.IGNORECASE | re.DOTALL)
+        if m:
+            reason = (m.group(2).strip().splitlines() or ["news check"])[0][:140]
+            return m.group(1).lower(), reason
+    except Exception:
+        pass
+    return None
+
+
+def risk_mode(include_gap: bool = True):
+    """Today's (mode, reason). Manual /risk override wins outright."""
+    today = datetime.now(ET).date()
+
+    override = config.state_get("risk_override")
+    if override and override.get("date") == str(today):
+        why = override.get("reason") or "manual override"
+        return override["mode"], f"{why} (set by hand with /risk)"
+
+    mode, reasons = calendar_check(today)
+    s_mode, s_reasons, vix_now, gap = market_stress_check(include_gap)
+    mode = _worse(mode, s_mode)
+    reasons += s_reasons
+
+    manual_event = load_event_days().get(today)
+    if manual_event:
+        mode = _worse(mode, "yellow")
+        reasons.append(f"event list: {manual_event}")
+
+    news = anthropic_news_check(today)
+    if news:
+        n_mode, n_reason = news
+        if n_mode != "green":
+            mode = _worse(mode, n_mode)
+            reasons.append(f"news: {n_reason}")
+
+    if not reasons or mode == "green":
+        calm = []
+        if vix_now is not None:
+            calm.append(f"VIX {vix_now:.0f}")
+        if gap is not None:
+            calm.append(f"overnight gap {gap:+.1f}%")
+        detail = ", ".join(calm) if calm else "no data problems"
+        return "green", f"No major releases scheduled. {detail}. All clear."
+    return mode, "; ".join(reasons)
 
 
 def study():
@@ -120,11 +266,11 @@ def study():
     add("")
     add("## 5 years: big overnight gaps")
     add("")
-    big = df[df["gap_pct"].abs() >= GAP_CAUTION]
-    small = df[df["gap_pct"].abs() < GAP_CAUTION]
-    add(f"- Gap ≥ ±{GAP_CAUTION:g}%: {len(big)} days, follow-through "
+    big = df[df["gap_pct"].abs() >= GAP_YELLOW]
+    small = df[df["gap_pct"].abs() < GAP_YELLOW]
+    add(f"- Gap >= ±{GAP_YELLOW:g}%: {len(big)} days, follow-through "
         f"{big['follow'].mean() * 100:.0f}%, avg abs move {big['day_ret'].abs().mean():.2f}%")
-    add(f"- Gap < ±{GAP_CAUTION:g}%: {len(small)} days, follow-through "
+    add(f"- Gap < ±{GAP_YELLOW:g}%: {len(small)} days, follow-through "
         f"{small['follow'].mean() * 100:.0f}%, avg abs move {small['day_ret'].abs().mean():.2f}%")
     add("")
 
@@ -146,19 +292,19 @@ def study():
             add(f"| {d} | ${pnl:,.0f} | {v:.0f} | {g:+.1f}% |")
         if rows:
             r = pd.DataFrame(rows, columns=["d", "pnl", "vix", "gap"])
-            calm = r[r["vix"] < VIX_CAUTION]
-            hot = r[r["vix"] >= VIX_CAUTION]
+            calm = r[r["vix"] < VIX_YELLOW]
+            hot = r[r["vix"] >= VIX_YELLOW]
             add("")
-            add(f"- Days with VIX under {VIX_CAUTION:g}: {len(calm)}, "
+            add(f"- Days with VIX under {VIX_YELLOW:g}: {len(calm)}, "
                 f"total P&L **${calm['pnl'].sum():,.0f}**")
-            add(f"- Days with VIX {VIX_CAUTION:g}+: {len(hot)}, "
+            add(f"- Days with VIX {VIX_YELLOW:g}+: {len(hot)}, "
                 f"total P&L **${hot['pnl'].sum():,.0f}**")
         add("")
     add("Live thresholds in risk_gate.py: "
-        f"caution at VIX {VIX_CAUTION:g}, stand-down at VIX {VIX_BLOCK:g}, "
-        f"gap caution at ±{GAP_CAUTION:g}%. Scheduled events (CPI/FOMC/wars/"
-        "tariff announcements) go in data/event_days.txt by hand — one date "
-        "per line — because no free feed lists them historically.")
+        f"YELLOW at VIX {VIX_YELLOW:g}, RED at VIX {VIX_RED:g}, "
+        f"gap YELLOW at ±{GAP_YELLOW:g}%. Scheduled releases come from the "
+        "free ForexFactory weekly feed (FOMC/CPI/PPI/NFP = RED); extra dates "
+        "can still go in data/event_days.txt by hand.")
     add("")
     out = REPORTS_DIR / "news_study.md"
     out.write_text("\n".join(lines), encoding="utf-8")
@@ -169,6 +315,5 @@ if __name__ == "__main__":
     if "--study" in sys.argv:
         study()
     else:
-        ok, tier, msg = morning_check()
-        print(msg)
-        sys.exit(0 if ok else 1)
+        mode, reason = risk_mode()
+        print(f"{mode.upper()}: {reason}")

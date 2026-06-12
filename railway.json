@@ -1,0 +1,8 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": { "builder": "RAILPACK" },
+  "deploy": {
+    "startCommand": "python -u scanner.py --daemon",
+    "restartPolicyType": "ALWAYS"
+  }
+}

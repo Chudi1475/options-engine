@@ -1,0 +1,87 @@
+{
+  "pricing": "approximated (Black-Scholes, realized vol)",
+  "rules": {
+    "tp_half_pct": 25.0,
+    "stop_pct": -30.0,
+    "trail": "momentum flip (15-min measure)"
+  },
+  "overall": {
+    "trades": 287,
+    "win_rate": 49.12891986062718,
+    "avg_win_pct": 50.48268237490813,
+    "avg_loss_pct": -41.99027280682763,
+    "expectancy_pct": 3.440691237161011,
+    "total_pnl": 8361.75348919128,
+    "max_drawdown": -11000.71203304637,
+    "start": "03/18/2026",
+    "end": "06/11/2026"
+  },
+  "per_setup": {
+    "SPX:call": {
+      "trades": 60,
+      "win_rate": 56.666666666666664,
+      "avg_win_pct": 50.35334258898205,
+      "avg_loss_pct": -41.62555245252699,
+      "expectancy_pct": 10.49582140432813,
+      "total_pnl": 12592.302268658743,
+      "max_drawdown": -4186.730849453983,
+      "start": "03/18/2026",
+      "end": "06/11/2026"
+    },
+    "SPX:put": {
+      "trades": 38,
+      "win_rate": 31.57894736842105,
+      "avg_win_pct": 67.83550289573866,
+      "avg_loss_pct": -46.294164010204256,
+      "expectancy_pct": -10.253216566222294,
+      "total_pnl": -8588.148747274112,
+      "max_drawdown": -13216.415014004111,
+      "start": "03/18/2026",
+      "end": "06/11/2026"
+    },
+    "TSLA:call": {
+      "trades": 56,
+      "win_rate": 39.285714285714285,
+      "avg_win_pct": 63.222729768212545,
+      "avg_loss_pct": -40.90221042130127,
+      "expectancy_pct": 0.004016081722016983,
+      "total_pnl": -876.4375984814101,
+      "max_drawdown": -2682.4190469776954,
+      "start": "03/18/2026",
+      "end": "06/11/2026"
+    },
+    "TSLA:put": {
+      "trades": 44,
+      "win_rate": 56.81818181818182,
+      "avg_win_pct": 39.723012369773706,
+      "avg_loss_pct": -38.30151481682446,
+      "expectancy_pct": 6.0306029028335875,
+      "total_pnl": 1944.997148188711,
+      "max_drawdown": -2073.70918148409,
+      "start": "03/18/2026",
+      "end": "06/11/2026"
+    },
+    "QCOM:call": {
+      "trades": 55,
+      "win_rate": 56.36363636363636,
+      "avg_win_pct": 49.958902989863546,
+      "avg_loss_pct": -44.036270616332764,
+      "expectancy_pct": 8.942827234432432,
+      "total_pnl": 3152.8507033072897,
+      "max_drawdown": -1993.6640347181365,
+      "start": "03/18/2026",
+      "end": "06/11/2026"
+    },
+    "QCOM:put": {
+      "trades": 34,
+      "win_rate": 50.0,
+      "avg_win_pct": 38.78336325041209,
+      "avg_loss_pct": -39.37604536058416,
+      "expectancy_pct": -0.2963410550860342,
+      "total_pnl": 136.18971479206613,
+      "max_drawdown": -2341.7170972453596,
+      "start": "03/18/2026",
+      "end": "06/10/2026"
+    }
+  }
+}

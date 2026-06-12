@@ -7,53 +7,72 @@ WHAT THIS IS
 A Telegram bot that watches the market every morning (9:45-10:30 AM ET)
 and texts you when a high-probability options setup appears. It is built
 from a real trader's order history — it looks for the exact pattern
-behind his best trades and ignores everything else.
+behind his best trades and ignores everything else. After an alert, it
+keeps watching YOUR trade all day and texts you every exit step.
 
 The bot NEVER trades for you. It texts a suggestion. You decide.
+Every message ends "Your call." because it genuinely is.
 
-THE MORNING MESSAGE (comes first, around market open)
-------------------------------------------------------
-🟢 NORMAL DAY  = trade the alerts as normal
-🟠 CAUTION DAY = something is off (high fear, big gap, Fed/CPI day).
-                 Alerts still come, but consider HALF size.
-🔴 NO-TRADE DAY = market is in panic mode. Bot stands down. Don't trade.
+THE MORNING MESSAGE (risk mode for the day)
+-------------------------------------------
+🟢 RISK MODE: GREEN  = normal day, standard rules
+🟡 RISK MODE: YELLOW = something's off (Fed speech, high fear, big gap).
+                       Alerts still come with a warning banner. Smaller size.
+🔴 RISK MODE: RED    = major event day (FOMC, CPI, PPI, jobs report) or
+                       panic. Consider sitting out. Any alert is HALF size.
 
-THE ALERT (this is the money text)
------------------------------------
-Example:
+THE ENTRY ALERT (this is the money text)
+-----------------------------------------
+  💰 EXPECTED: +10.5% per trade after est. costs
+  (NEW-RULES BACKTEST, approx pricing — live stats take over after 30 signals)
 
-  🔴 WIN RATE: 72% — RISKY
+  📈 BUY CALL — SPXW 7300, expires TODAY 6/11
+  Quote: Bid $4.20 / Ask $4.60 — set a LIMIT order near $4.40. Never market-order.
+  Size: ~3.3% of account (≈ $830) — risking 1% if stopped
 
-  📈 BUY CALL — SPXW 7395
-  Expires: 5/13
-  Size: 10% of account
+  WHY: SPX just turned UP in the last 15 minutes (+0.21%) — the exact
+  pattern behind Kelechi's best trades.
 
-  WHY: SPX just turned UP over the last 15 minutes. Buying calls when
-  momentum has just turned up is the exact pattern behind the best
-  trades. In testing, this setup won 72 out of every 100 trades.
+  EXIT PLAN — I'll text you each step:
+  1️⃣ SELL HALF at +25%
+  2️⃣ momentum flips → I text you → sell the rest
+  3️⃣ STOP: -30% → sell everything
+  4️⃣ expires today → I warn you 15 min before close
 
-  EXIT PLAN: sell at +15% profit. Get out if it drops -60%.
-  BACKTESTED: YES (...real numbers...)
+  🔴 Win rate in testing: 57 of 100 — RISKY (...)
   Your call.
 
 WHAT EACH LINE MEANS
 --------------------
-WIN RATE line — how often this exact setup made money in testing:
-  🔴 70-74%  RISKY        (wins 7 of 10, but rough ride)
-  🟠 75-79%  DECENT ODDS
-  🟢 80-84%  GOOD ODDS
-  🟢🌟 85%+   GREAT ODDS
-  Below 70%? You never see it. The bot stays silent instead of
-  forcing a weak trade. No text = no trade today. That's normal.
+EXPECTED — the average % this exact setup made per trade in testing,
+  after estimated costs. This is the number that matters. (Win rate alone
+  can lie: a setup can win often and still lose money.)
 
-BUY CALL / BUY PUT — the direction. 📈 CALL = betting it goes up.
-  📉 PUT = betting it goes down.
+Quote / LIMIT — buy with a LIMIT order near the middle price shown.
+  NEVER use a market order on options; the spread will eat you.
+  If the price already ran way past the quote, skip the trade — chasing
+  was not what got backtested.
 
-The number after the ticker (7395) — the STRIKE price.
+Size — how much to put in so that a full stop-out costs you exactly 1% of
+  your account. Text /setaccount 25000 to the bot once and it shows real
+  dollar amounts. "CORRELATED — half size" means you already have a
+  same-direction trade open, so this one is smaller.
 
-Expires — the expiration date to pick. Same day for SPX = "0DTE".
+Win rate — small line on purpose: 57 of 100 sounds worse than 72 of 100,
+  but the new exit rules make MORE money per trade by letting winners run.
+  Expected value is the honest headline.
 
-Size — never put more than 10% of your account into one trade.
+THE EXIT TEXTS (the bot watches your trade so you don't have to)
+----------------------------------------------------------------
+💰 SELL HALF — +25% target hit........sell half, let the rest ride
+   (only bought 1 contract? just sell it — banking the win is the play)
+🔄 MOMENTUM FLIPPED — SELL REMAINING..the move died, sell what's left
+🛑 STOP — SELL EVERYTHING.............down 30%. Sell. No hoping.
+⏰ CLOSE BEFORE EXPIRY................15 min to the bell, close it out
+
+Option prices in these texts come from a live quote when available
+(may be ~15 min delayed) or a clearly-labeled estimate — your broker
+shows the real number, the instruction is what matters.
 
 HOW TO TAKE THE TRADE ON ROBINHOOD (60 seconds)
 ------------------------------------------------
@@ -62,27 +81,38 @@ HOW TO TAKE THE TRADE ON ROBINHOOD (60 seconds)
 2. Tap "Trade" -> "Trade Options"
 3. Pick the EXPIRATION DATE from the text (top of screen)
 4. Pick CALL or PUT (matches the text)
-5. Find the STRIKE from the text (e.g. 7395)
-6. Tap it -> "Buy" -> enter how many contracts fit inside 10% of
-   your account -> swipe to submit at the ASK (or a nickel below)
-7. IMMEDIATELY set your exit:
-   - Set a LIMIT SELL at +15% above what you paid (the profit target)
-   - Watch the position: if it drops 60% from what you paid, sell.
-     Don't hope. Don't average down. Sell.
-8. Everything closes the SAME DAY. Do not hold 0DTE past the close —
-   it expires worthless at 4 PM if it's out of the money.
+5. Find the STRIKE from the text (e.g. 7300)
+6. Tap it -> "Buy" -> set a LIMIT order at the price from the text
+   -> enough contracts to fit the Size line -> submit.
+   If it doesn't fill in a minute or two, you may bump the limit a few
+   cents toward the Ask. If the option already ran far past the quoted
+   price, let it go. There's another trade tomorrow.
+7. Then just follow the bot's texts: sell half at +25%, sell the rest on
+   the MOMENTUM FLIPPED text, and if the STOP text comes — sell. Don't
+   hope. Don't average down. Sell.
+
+TEXTING THE BOT (commands)
+--------------------------
+/setaccount 25000  -> tells it your account size (sizes cards in dollars)
+/status            -> risk mode, account, open positions right now
+/risk red          -> override today's risk mode by hand
+/test              -> sends fake examples of all 5 alert types
+/help              -> the list above
 
 THE THREE RULES THAT KEEP YOU ALIVE
 ------------------------------------
 1. If you didn't get a text, there is no trade. Boredom is not a setup.
 2. The stop is the stop. One ignored stop can erase a week of wins.
-3. 10% of account max. A 70% win rate still loses 3 times out of 10 —
-   sometimes back to back. Size so that 3 losses in a row don't hurt.
+3. Size off the text (~3.3% of account). Losing streaks happen even when
+   nothing is wrong — size so that 5 losses in a row barely sting.
 
 HONESTY NOTES (read once)
 -------------------------
-- Win rates come from a real backtest over ~3 months of market data
-  using approximated option pricing. They are estimates, not promises.
+- Stats come from a real backtest over ~3 months of market data using
+  approximated option pricing, and the bot says exactly which rules were
+  backtested on every card. After 30 real tracked signals, the cards
+  switch to live results automatically.
+- Every Friday after the close it sends a scoreboard: what the new exit
+  rules actually did vs the old rules vs what the backtest claimed.
 - Past performance does not guarantee future results.
-- This is not financial advice. Every alert ends with "Your call."
-  because it genuinely is.
+- This is not financial advice. Your call.

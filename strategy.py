@@ -62,6 +62,16 @@ def _round_strike(spot: float, increment: float, up: bool = True) -> float:
     return float(spot // increment * increment)
 
 
+def momentum_pct(bars: pd.DataFrame, cfg: StrategyConfig):
+    """The 15-minute momentum measure. ONE definition used everywhere:
+    entry trigger here, and the live trail-exit check in the scanner.
+    Returns None if there aren't enough completed bars yet."""
+    if len(bars) < cfg.mom_bars + 1:
+        return None
+    return (float(bars["Close"].iloc[-1])
+            / float(bars["Close"].iloc[-(cfg.mom_bars + 1)]) - 1) * 100
+
+
 def detect_setup(ticker: str, bars: pd.DataFrame, now, cfg: StrategyConfig):
     """Return a Setup if conditions hold on the latest bar, else None.
 
@@ -70,12 +80,12 @@ def detect_setup(ticker: str, bars: pd.DataFrame, now, cfg: StrategyConfig):
     """
     if not (cfg.entry_start <= now.time() <= cfg.entry_end):
         return None
-    if len(bars) < cfg.mom_bars + 1:
+    mom = momentum_pct(bars, cfg)
+    if mom is None:
         return None  # momentum not readable yet
 
     px = float(bars["Close"].iloc[-1])
     day_open = float(bars["Open"].iloc[0])
-    mom = (px / float(bars["Close"].iloc[-(cfg.mom_bars + 1)]) - 1) * 100
     above_open = px > day_open
 
     # Core derived rule (validated, 79% in-sample): momentum up -> call.

@@ -4,6 +4,12 @@ out why each one worked or failed, and texts a plain-English summary.
 Runs after the close (scheduled 3:05 PM CT weekdays). If the bot sent no
 alerts, it still recaps the market and says why staying out was the call.
 
+Grading sources, most honest first:
+1. The position book (positions.json) — real tracked entries and exits with
+   the prices that were actually alerted.
+2. Legacy alerts_sent.jsonl records (pre-upgrade days) — replayed with the
+   same approximated pricing the old backtest used.
+
 Usage:
     python recap.py            # build + send today's recap
     python recap.py --dry-run  # print instead of texting
@@ -15,20 +21,21 @@ import sys
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from datetime import timedelta
-from pathlib import Path
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yfinance as yf
 
+import config
+import telegram
 from backtest import SLIPPAGE, bs_price, realized_vol
-from scanner import load_backtest, load_env, telegram_send
+from positions import PositionBook
+from scoreboard import load_report
 from strategy import StrategyConfig
 
 ET = ZoneInfo("America/New_York")
-HERE = Path(__file__).parent
-ALERTS_FILE = HERE / "alerts_sent.jsonl"
+ALERTS_FILE = config.ALERTS_JSONL
 
 
 def fetch_5m(yf_symbol):
@@ -58,9 +65,70 @@ def pct(a, b):
     return (a / b - 1) * 100
 
 
+def _t(hms: str) -> str:
+    """'10:42:15' -> '10:42 AM ET'"""
+    return datetime.strptime(hms, "%H:%M:%S").strftime("%I:%M %p ET").lstrip("0")
+
+
+def _minutes_between(a: str, b: str) -> int:
+    fmt = "%H:%M:%S"
+    return int((datetime.strptime(b, fmt) - datetime.strptime(a, fmt))
+               .total_seconds() / 60)
+
+
+def position_story(p):
+    """Grade a real tracked position. Returns (verdict, story)."""
+    est_note = ""
+    if p.entry_source == "estimate" or "estimat" in (p.last_mark_source or ""):
+        est_note = " (some prices were estimates from the stock move — your broker shows real fills)"
+
+    if p.state != "closed" or p.final_pnl_pct is None:
+        cur = p.last_mark_pct if p.last_mark_pct is not None else 0.0
+        return (f"STILL OPEN ({cur:+.0f}% so far)",
+                "This one doesn't expire today — I'm still watching it and "
+                "will text the exits as they come." + est_note)
+
+    total = p.final_pnl_pct
+    verdict = "RIGHT ✅" if total > 0 else "WRONG ❌"
+    reason = (p.final_exit or {}).get("reason", "")
+    exit_t = (p.final_exit or {}).get("time", p.time_et)
+
+    if reason == "stop":
+        mins = _minutes_between(p.time_et, exit_t)
+        if mins <= 30:
+            why = ("the move flipped against us almost right away — sometimes "
+                   "the first push is a fake-out")
+        else:
+            why = ("the move ran out of gas and the option bled — an option "
+                   "that goes nowhere loses value every minute (time decay)")
+        peaked = (f" It even peaked at {p.mfe_pct:+.0f}% first — a reminder "
+                  "the half-target matters." if p.mfe_pct >= 10 else "")
+        story = (f"It hit the {config.STOP_PCT:g}% stop at {_t(exit_t)}. "
+                 f"Why it failed: {why}. The stop did its job — it kept a bad "
+                 f"trade small.{peaked}")
+    elif reason == "momentum flip":
+        h = p.half_exit or {}
+        story = (f"We banked HALF at {h.get('pct', 0):+.0f}% at "
+                 f"{_t(h.get('time', exit_t))}, rode the rest until the "
+                 f"momentum died, and sold the remainder at "
+                 f"{(p.final_exit or {}).get('pct', 0):+.0f}% at {_t(exit_t)}. "
+                 f"Whole trade: {total:+.0f}%.")
+    elif "expir" in reason:
+        h_note = (f" (half was banked at {p.half_exit['pct']:+.0f}% earlier)"
+                  if p.half_exit else "")
+        story = (f"It ran into the closing bell and was closed at "
+                 f"{total:+.0f}%{h_note}. That's why the bot warns "
+                 f"{config.EXPIRY_WARN_MINUTES} minutes before expiry — "
+                 "0DTE options don't get a tomorrow.")
+    else:
+        story = f"Closed at {total:+.0f}% ({reason})."
+    return verdict, story + est_note
+
+
+# ---------- legacy grading (pre-upgrade alert records) ----------
+
 def grade_alert(rec, bars, daily_closes, bracket):
-    """Replay the option from alert time to close. Returns (verdict, story)."""
-    cfg = StrategyConfig()
+    """Replay an old-format alert with approximated pricing (old rules)."""
     session = pd.Timestamp(rec["date"]).date()
     day = bars[bars.index.date == session]
     alert_ts = pd.Timestamp(f"{rec['date']} {rec['time']}").tz_localize(ET)
@@ -76,13 +144,13 @@ def grade_alert(rec, bars, daily_closes, bracket):
         return None, None
 
     target, stop = bracket["target_pct"], bracket["stop_pct"]
-    best_ret, worst_ret = 0.0, 0.0
+    best_ret = 0.0
     outcome, outcome_time, final_ret = "time stop", after.index[-1], None
     for ts, row in after.iterrows():
         T = max((expiry - ts.to_pydatetime()).total_seconds(), 0) / (365 * 24 * 3600)
         prem = bs_price(float(row["Close"]), rec["strike"], T, sigma, right) * (1 - SLIPPAGE)
         ret = pct(prem, entry_prem)
-        best_ret, worst_ret = max(best_ret, ret), min(worst_ret, ret)
+        best_ret = max(best_ret, ret)
         final_ret = ret
         if ret <= stop:
             outcome, outcome_time, final_ret = "stop", ts, stop
@@ -91,10 +159,7 @@ def grade_alert(rec, bars, daily_closes, bracket):
             outcome, outcome_time, final_ret = "target", ts, target
             break
 
-    und_after = pct(float(after["Close"].iloc[-1]), rec["spot"])
-    went_our_way = und_after > 0 if right == "C" else und_after < 0
     t_str = outcome_time.strftime("%I:%M %p ET").lstrip("0")
-
     if outcome == "target":
         verdict = "RIGHT ✅"
         story = (f"It hit the +{target:g}% profit target at {t_str}. "
@@ -103,12 +168,10 @@ def grade_alert(rec, bars, daily_closes, bracket):
     elif outcome == "stop":
         verdict = "WRONG ❌"
         minutes = int((outcome_time - alert_ts).total_seconds() / 60)
-        if minutes <= 30:
-            why = ("the move flipped against us almost right away. "
-                   "Sometimes the first push up is a fake-out.")
-        else:
-            why = ("the move ran out of gas, and an option that goes nowhere "
-                   "loses value every minute (that's called time decay).")
+        why = ("the move flipped against us almost right away. Sometimes the "
+               "first push up is a fake-out.") if minutes <= 30 else \
+              ("the move ran out of gas, and an option that goes nowhere "
+               "loses value every minute (that's called time decay).")
         story = (f"It dropped to the {stop:g}% stop at {t_str}. Why it failed: {why} "
                  "The stop did its job — it kept a bad trade small.")
     else:
@@ -120,12 +183,9 @@ def grade_alert(rec, bars, daily_closes, bracket):
             verdict = "WRONG ❌ (slow loss)"
             story = (f"Never hit the stop, but bled to {final_ret:+.0f}% by the close. "
                      "The market went sideways and time decay ate the option. "
-                     + ("(It actually peaked at +"
-                        f"{best_ret:.0f}% during the day — a reminder of why "
-                        "taking the target fast matters.)" if best_ret >= 5 else ""))
-    if not went_our_way and outcome == "stop":
-        story += (f" Bigger picture: {rec['ticker']} finished the day moving against "
-                  "our direction, so the entry signal was simply early/wrong today.")
+                     + (f"(It actually peaked at +{best_ret:.0f}% during the day — "
+                        "a reminder of why taking profits fast matters.)"
+                        if best_ret >= 5 else ""))
     return verdict, story
 
 
@@ -147,38 +207,44 @@ def market_story(spx_day):
 
 def main():
     dry = "--dry-run" in sys.argv
-    load_env()
     cfg = StrategyConfig()
-    backtest = load_backtest()
+    backtest = load_report("backtest_results.json")
     bracket = (backtest or {}).get("bracket", {"target_pct": 15, "stop_pct": -60})
 
     spx = fetch_5m("^GSPC")
     session = max(set(spx.index.date))
     spx_day = spx[spx.index.date == session]
-    day_name = pd.Timestamp(session).strftime("%A %-m/%-d") if not sys.platform.startswith("win") \
-        else pd.Timestamp(session).strftime("%A %#m/%#d")
+    day_name = pd.Timestamp(session).strftime("%A %#m/%#d") if sys.platform.startswith("win") \
+        else pd.Timestamp(session).strftime("%A %-m/%-d")
 
     lines = [f"📋 DAILY RECAP — {day_name}", ""]
     lines.append("THE MARKET TODAY: " + market_story(spx_day))
     lines.append("")
 
-    alerts = todays_alerts(session)
-    if not alerts:
-        first_hr = spx_day[spx_day.index.time <= pd.Timestamp("10:30").time()]
-        drift = pct(float(first_hr["Close"].iloc[-1]), float(first_hr["Open"].iloc[0])) \
-            if len(first_hr) else 0.0
-        if drift < 0:
-            why_quiet = ("the morning was moving DOWN, and the only setups that "
-                         "pass our filter right now are call (up) setups")
-        else:
-            why_quiet = ("no setup cleared the 70% win-rate bar during the "
-                         "morning window")
-        lines.append(f"OUR TRADES TODAY: none. The bot stayed quiet because {why_quiet}. "
-                     "No text = no trade. Sitting out is a position too.")
-    else:
+    book = PositionBook()
+    pos_today = book.for_date(session)
+    graded = set()
+    if pos_today:
         lines.append("OUR ALERTS TODAY:")
+        for p in pos_today:
+            verdict, story = position_story(p)
+            t = datetime.strptime(p.time_et, "%H:%M:%S").strftime("%I:%M %p").lstrip("0")
+            lines.append("")
+            tag = "[PAPER] " if p.paper else ""
+            head = (f"{tag}{p.ticker} {p.strike:g} {p.direction.upper()} "
+                    f"(texted {t} ET): ")
+            head += verdict if verdict.startswith("STILL") else f"WE WERE {verdict}"
+            lines.append(head)
+            lines.append(story)
+            graded.add((p.ticker, p.direction))
+
+    legacy = [r for r in todays_alerts(session)
+              if (r["ticker"], r["direction"]) not in graded]
+    if legacy and not pos_today:
+        lines.append("OUR ALERTS TODAY:")
+    if legacy:
         daily_cache = {}
-        for rec in alerts:
+        for rec in legacy:
             yfs = cfg.watchlist.get(rec["ticker"], rec["ticker"])
             bars = spx if yfs == "^GSPC" else fetch_5m(yfs)
             if yfs not in daily_cache:
@@ -190,23 +256,38 @@ def main():
             verdict, story = grade_alert(rec, bars, daily_cache[yfs], bracket)
             if verdict is None:
                 continue
-            disp = "SPXW" if rec["ticker"] == "SPX" else rec["ticker"]
             t = pd.Timestamp(f"{rec['date']} {rec['time']}").strftime("%I:%M %p").lstrip("0")
             lines.append("")
-            lines.append(f"{disp} {rec['strike']:g} {rec['direction'].upper()} "
-                         f"(texted {t} ET): WE WERE {verdict}")
+            lines.append(f"{rec['ticker']} {rec['strike']:g} "
+                         f"{rec['direction'].upper()} (texted {t} ET): "
+                         f"WE WERE {verdict}")
             lines.append(story)
+
+    if not pos_today and not legacy:
+        first_hr = spx_day[spx_day.index.time <= pd.Timestamp("10:30").time()]
+        drift = pct(float(first_hr["Close"].iloc[-1]), float(first_hr["Open"].iloc[0])) \
+            if len(first_hr) else 0.0
+        if drift < 0:
+            why_quiet = ("the morning was moving DOWN, and the only setups that "
+                         "pass our filter right now are call (up) setups")
+        else:
+            why_quiet = ("no setup cleared the 70% win-rate bar during the "
+                         "morning window")
+        lines.append(f"OUR TRADES TODAY: none. The bot stayed quiet because {why_quiet}. "
+                     "No text = no trade. Sitting out is a position too.")
+
     lines.append("")
-    lines.append("Tomorrow: same plan. Wait for the text, take only what passes "
-                 "the filter, honor the exits.")
+    lines.append(f"Tomorrow: same plan. Wait for the text, sell half at "
+                 f"+{config.TP_HALF_PCT:g}%, sell the rest when I say the "
+                 f"momentum flipped, and honor the {config.STOP_PCT:g}% stop.")
     msg = "\n".join(lines)
     if dry:
         print(msg)
     else:
-        errors = telegram_send(msg)
+        errors = telegram.send(msg)
         print("Recap sent." if not errors else f"Errors: {errors}")
-        (HERE / "alerts.log").open("a", encoding="utf-8").write(
-            f"--- recap sent for {session}\n{msg}\n\n")
+        with config.ALERTS_LOG.open("a", encoding="utf-8") as f:
+            f.write(f"--- recap sent for {session}\n{msg}\n\n")
 
 
 if __name__ == "__main__":
