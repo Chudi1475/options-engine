@@ -66,6 +66,14 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text(encoding="utf-8-sig"))
         except (json.JSONDecodeError, OSError):
             return {}
+    boot = os.environ.get("BOOTSTRAP_STATE", "").strip()
+    if boot:  # first boot on a fresh volume: seed state (e.g. so a new cloud
+        try:  # deploy doesn't re-send reports the local bot already sent)
+            state = json.loads(boot)
+            save_state(state)
+            return state
+        except (json.JSONDecodeError, OSError):
+            pass
     return {}
 
 

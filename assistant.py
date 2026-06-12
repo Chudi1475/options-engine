@@ -139,9 +139,10 @@ def _load_trades() -> dict:
 def log_trade(chat_id: str, profit_dollars: float, ticker: str = "",
               note: str = "", date_str: str = None) -> dict:
     """Append one user-reported trade result to their personal ledger."""
-    from datetime import date as _date
-    entry = {
-        "date": date_str or str(_date.today()),
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _zi
+    entry = {  # ET date, so a 9 PM log doesn't land on tomorrow in the cloud
+        "date": date_str or str(_dt.now(_zi("America/New_York")).date()),
         "profit_dollars": round(float(profit_dollars), 2),
         "ticker": (ticker or "").upper(),
         "note": note or "",

@@ -573,7 +573,21 @@ class Service:
             self.notify(msg)
             print(f"{now:%H:%M:%S} breaking news alert: {title[:60]}")
 
-    # ---------- weekly ----------
+    # ---------- daily recap + weekly ----------
+
+    def maybe_recap(self, now: datetime):
+        """Send the daily 3:05 PM CT (16:05 ET) recap from inside the bot,
+        so the cloud needs no separate scheduled task."""
+        if self.dry or now.weekday() >= 5 or now.time() < WEEKLY_AT:
+            return
+        if config.state_get("recap_sent") == str(now.date()):
+            return
+        try:
+            import recap
+            recap.main()
+            config.state_set("recap_sent", str(now.date()))
+        except Exception as e:
+            print(f"{now:%H:%M:%S} recap failed (will retry): {e}")
 
     def maybe_weekly(self, now: datetime):
         # Friday after the close — with weekend catch-up if the bot was
@@ -612,6 +626,7 @@ class Service:
                 now = et_now()
                 self.reset_day(now)
                 if now.time() >= SESSION_END or now.weekday() >= 5:
+                    self.maybe_recap(now)
                     self.maybe_weekly(now)
                     print("Session over for today.")
                     return
@@ -624,6 +639,7 @@ class Service:
                     if now.time() >= MONITOR_START:
                         self.monitor_positions(now)
                     self.watch_news(now)
+                    self.maybe_recap(now)
                     self.maybe_weekly(now)
                 except Exception as e:
                     print(f"{now:%H:%M:%S} cycle error (continuing): {e}")
