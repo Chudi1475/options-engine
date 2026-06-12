@@ -1,0 +1,14 @@
+.venv/
+.git/
+__pycache__/
+.env
+data/*.csv
+alerts.log
+alerts_sent.jsonl
+positions.json
+positions_dryrun.json
+state.json
+calendar_cache.json
+chat_history.json
+user_trades.json
+*.png
