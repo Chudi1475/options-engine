@@ -635,7 +635,7 @@ class Service:
                          "text": ("One sentence only, no invented numbers: "
                                   "what could this headline mean for SPX/QCOM/"
                                   f"TSLA trades today? Headline: {title}")},
-                        self.status_text())
+                        self.status_text(), tools_enabled=False)
                     if take and "error" not in take.lower():
                         msg += f"\nQuick read: {take}"
             except Exception:

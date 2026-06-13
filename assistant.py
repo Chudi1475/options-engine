@@ -48,6 +48,18 @@ Writing style rules for chat replies:
 - Never state times, prices, or schedule facts you weren't given. Never
   lecture. Never pad.
 
+Reading the market — you HAVE real data tools, use them:
+- When asked what's happening now, what to watch, or whether a setup is
+  live, call market_now.
+- When asked what would have worked on a past day, or to break down a
+  session ("what would you have taken Friday to profit"), call analyze_day
+  with that date. Resolve "Friday"/"yesterday"/"last session" to a real
+  date yourself using the date in LIVE BOT STATE.
+- NEVER say "I don't have the data" before trying the tool. Only say a
+  setup didn't trigger if the tool actually says so. Never invent price
+  levels — quote only what the tool returns. Option prices from these
+  tools are approximated (say so when you give one).
+
 Scorekeeping — one of your main jobs:
 - ANY time the user reports how a trade went — text ("made $1,100 on the
   SPX call", "lost 400 today") or a screenshot of their broker P&L — call
@@ -97,6 +109,25 @@ TOOLS = [
         "description": ("The user's running personal record: wins, losses, "
                         "total P&L from everything they've logged."),
         "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "market_now",
+        "description": ("Live read on a ticker RIGHT NOW: price, today's move, "
+                        "15-min momentum, and whether a setup is triggering. "
+                        "Use for 'what's happening', 'any setups now'."),
+        "input_schema": {"type": "object", "properties": {
+            "ticker": {"type": "string", "description": "SPX, QCOM or TSLA"}}},
+    },
+    {
+        "name": "analyze_day",
+        "description": ("Replay one past trading day for one ticker through "
+                        "the real strategy: did a setup trigger, would the bot "
+                        "have alerted it, how would the trade have gone. Use for "
+                        "'what would have worked Friday', 'break down yesterday'."),
+        "input_schema": {"type": "object", "properties": {
+            "ticker": {"type": "string", "description": "SPX, QCOM or TSLA"},
+            "date": {"type": "string",
+                     "description": "the day as YYYY-MM-DD; omit for the last session"}}},
     },
 ]
 
@@ -188,6 +219,12 @@ def _run_tool(name: str, args: dict, chat_id: str) -> str:
             return json.dumps({"logged": entry, "score": score(chat_id)})
         if name == "get_score":
             return json.dumps(score(chat_id))
+        if name in ("market_now", "analyze_day"):
+            import market_tools
+            if name == "market_now":
+                return json.dumps(market_tools.market_now(args.get("ticker", "SPX")))
+            return json.dumps(market_tools.analyze_day(
+                args.get("ticker", "SPX"), args.get("date")))
     except Exception as e:
         return json.dumps({"error": str(e)})
     return json.dumps({"error": f"unknown tool {name}"})
@@ -222,8 +259,13 @@ def _file_blocks(item: dict):
                   "send text, a photo, a PDF, or a CSV/TXT file.")
 
 
-def respond(item: dict, context_text: str) -> str:
+def respond(item: dict, context_text: str, tools_enabled: bool = True) -> str:
     """Answer one message (text/photo/document) from an authorized chat."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _zi
+    now_et = _dt.now(_zi("America/New_York"))
+    context_text = (f"Right now it is {now_et:%A %Y-%m-%d %I:%M %p} ET.\n"
+                    + context_text)
     chat_id = item["chat_id"]
     blocks = []
     if item["kind"] in ("photo", "document"):
@@ -241,16 +283,17 @@ def respond(item: dict, context_text: str) -> str:
     messages = history + [{"role": "user", "content": blocks}]
     reply = ""
     try:
-        for _ in range(4):  # room for tool calls (log a trade, read the score)
+        for _ in range(5):  # room for tool calls (data lookups, scorekeeping)
+            payload = {"model": model(), "max_tokens": 800,
+                       "system": SYSTEM + "\n\nLIVE BOT STATE:\n" + context_text,
+                       "messages": messages}
+            if tools_enabled:
+                payload["tools"] = TOOLS
             r = requests.post(
                 API_URL,
                 headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"],
                          "anthropic-version": "2023-06-01"},
-                json={"model": model(), "max_tokens": 800,
-                      "system": SYSTEM + "\n\nLIVE BOT STATE:\n" + context_text,
-                      "tools": TOOLS,
-                      "messages": messages},
-                timeout=120)
+                json=payload, timeout=120)
             body = r.json()
             if r.status_code != 200:
                 err = body.get("error", {}).get("message", r.text[:200])
