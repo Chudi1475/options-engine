@@ -229,6 +229,8 @@ def help_card() -> str:
         "/risk green|yellow|red [reason] — override today's risk mode",
         "/status — risk mode, account, open positions right now",
         "/score — your personal win/loss record (I keep it for you)",
+        "/adduser — let another person in (owner only)",
+        "/users — see who has access (owner only)",
         "/test — fire a fake signal through every alert type",
         "/help — this list",
         "",

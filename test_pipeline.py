@@ -202,7 +202,8 @@ it = tg._parse_update({"message": {"chat": {"id": 123},
                                                 "mime_type": "text/csv"}}}, auth)
 check("tg: document parsed", it["kind"] == "document" and it["file_name"] == "trades.csv")
 it = tg._parse_update({"message": {"chat": {"id": 999}, "text": "/status"}}, auth)
-check("tg: unauthorized chat ignored", it is None)
+check("tg: unauthorized chat surfaced as 'unknown' (not processed)",
+      it["kind"] == "unknown" and it["chat_id"] == "999")
 it = tg._parse_update({"message": {"chat": {"id": 123}, "voice": {"file_id": "v"}}}, auth)
 check("tg: voice flagged unsupported", it["kind"] == "unsupported")
 

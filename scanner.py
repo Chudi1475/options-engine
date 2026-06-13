@@ -254,11 +254,13 @@ class Service:
     def handle_item(self, item: dict):
         """Commands run as commands; everything else (plain text, photos,
         files) goes to the bot's brain — or an honest hint if no AI key."""
+        if item["kind"] == "unknown":
+            return self.offer_add_user(item)
         if item["kind"] == "command":
             if item["cmd"] == "/score":
                 import assistant
                 return assistant.score_line(item["chat_id"])
-            return self.run_command(item["cmd"], item["args"])
+            return self.run_command(item["cmd"], item["args"], item["chat_id"])
         if item["kind"] == "unsupported":
             return ("I can read text, photos, PDFs and CSV/TXT files — "
                     "not voice or video yet.")
@@ -271,7 +273,40 @@ class Service:
                     "a human. Commands still work any time: /help")
         return assistant.respond(item, self.status_text())
 
-    def run_command(self, cmd: str, args: str):
+    def offer_add_user(self, item: dict):
+        """A stranger messaged the bot. Tell the owner(s) once, with a
+        one-tap way to add them. Never reply to or act on the stranger."""
+        cid, name = item["chat_id"], item.get("name", "someone")
+        pending = config.state_get("pending_chats", {})
+        if cid in pending or cid in telegram.chat_ids():
+            return None  # already flagged or already a member
+        pending[cid] = name
+        config.state_set("pending_chats", pending)
+        for owner in telegram.owner_ids():
+            telegram.send_to(owner,
+                f"👤 {name} (id {cid}) just messaged the bot.\n"
+                f"Want them to get every alert and be able to ask questions?\n"
+                f"Reply  /adduser {cid}  to let them in, or ignore to keep "
+                "them out.")
+        return None  # stranger gets nothing back
+
+    ADMIN_CMDS = {"/adduser", "/removeuser", "/users", "/risk", "/setaccount"}
+
+    def run_command(self, cmd: str, args: str, chat_id: str = ""):
+        if cmd in self.ADMIN_CMDS and not telegram.is_owner(chat_id):
+            return ("That's an owner-only command. You can use /status, "
+                    "/score, /help, or just talk to me.")
+        if cmd == "/adduser":
+            return self.cmd_adduser(args)
+        if cmd == "/removeuser":
+            return self.cmd_removeuser(args)
+        if cmd == "/users":
+            members = telegram.chat_ids()
+            owners = set(telegram.owner_ids())
+            lines = ["Who can use the bot:"]
+            for c in members:
+                lines.append(f"  {c}" + ("  (owner)" if c in owners else "  (added)"))
+            return "\n".join(lines)
         if cmd == "/setaccount":
             raw = args.replace(",", "").replace("$", "").strip()
             try:
@@ -308,6 +343,41 @@ class Service:
         if cmd in ("/help", "/start"):
             return cards.help_card()
         return None  # silently ignore unknown commands
+
+    def cmd_adduser(self, args: str):
+        pending = config.state_get("pending_chats", {})
+        target = args.strip() or (next(iter(pending), "") if pending else "")
+        if not target:
+            return ("Nobody's waiting to be added. Have them message the bot "
+                    "first, then I'll text you their ID — or use "
+                    "/adduser <their chat id>.")
+        extra = [str(x) for x in config.state_get("extra_chat_ids", [])]
+        if target in extra or target in telegram.owner_ids():
+            return f"{target} already has access."
+        extra.append(target)
+        config.state_set("extra_chat_ids", extra)
+        name = pending.pop(target, "your partner")
+        config.state_set("pending_chats", pending)
+        telegram.send_to(target,
+            "You're in! 🎯 This bot texts options setups in the morning and "
+            "walks you through the exits all day. Just talk to me like a "
+            "person — ask anything, send a chart screenshot, or tell me how "
+            "a trade went and I'll keep your record. Type /help to see more. "
+            "Nothing here is auto-traded — every alert ends 'Your call.'")
+        return f"✅ Added {name} (id {target}). They'll get every alert now."
+
+    def cmd_removeuser(self, args: str):
+        target = args.strip()
+        if not target:
+            return "Usage: /removeuser <chat id>. See IDs with /users."
+        if target in telegram.owner_ids():
+            return "Can't remove an owner."
+        extra = [str(x) for x in config.state_get("extra_chat_ids", [])]
+        if target not in extra:
+            return f"{target} isn't on the added list."
+        extra.remove(target)
+        config.state_set("extra_chat_ids", extra)
+        return f"Removed {target}. They won't get alerts anymore."
 
     def status_text(self) -> str:
         mode, reason = self.current_mode()

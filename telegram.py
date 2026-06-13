@@ -19,9 +19,26 @@ def _token() -> str:
     return tok
 
 
-def chat_ids() -> list:
+def owner_ids() -> list:
+    """The original owners from the env — they can run admin commands and
+    add/remove other people."""
     return [c.strip() for c in os.environ.get("TELEGRAM_CHAT_IDS", "").split(",")
             if c.strip()]
+
+
+def chat_ids() -> list:
+    """Everyone who gets alerts: the env owners PLUS anyone added at runtime
+    via /adduser (kept in state.json, survives restarts and lives on the
+    cloud volume)."""
+    ids = owner_ids()
+    for cid in config.state_get("extra_chat_ids", []):
+        if str(cid) not in ids:
+            ids.append(str(cid))
+    return ids
+
+
+def is_owner(chat_id) -> bool:
+    return str(chat_id) in owner_ids()
 
 
 def send_to(chat_id, text: str):
@@ -51,12 +68,19 @@ def send(text: str) -> list:
 
 
 def _parse_update(upd: dict, authorized: set):
-    """One Telegram update -> a message item, or None if it's not for us.
-    Kinds: command, text, photo, document, unsupported."""
+    """One Telegram update -> a message item, or None if it's not a message.
+    Kinds: command, text, photo, document, unsupported, unknown (a sender
+    not on the authorized list — surfaced so the owner can offer to add
+    them, but their message content is NOT processed)."""
     msg = upd.get("message") or {}
-    cid = str(msg.get("chat", {}).get("id", ""))
-    if cid not in authorized:
+    chat = msg.get("chat", {})
+    cid = str(chat.get("id", ""))
+    if not cid:
         return None
+    if cid not in authorized:
+        name = (f"{chat.get('first_name', '')} {chat.get('last_name', '')}".strip()
+                or chat.get("username") or "someone")
+        return {"chat_id": cid, "kind": "unknown", "name": name}
     text = (msg.get("text") or "").strip()
     if text.startswith("/"):
         parts = text.split(None, 1)
