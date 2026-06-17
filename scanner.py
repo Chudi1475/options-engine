@@ -450,12 +450,12 @@ class Service:
                 self.skipped_today.add(ticker)  # final decision for the day
                 continue
             try:
-                opened = self.open_position(setup, now)
+                did_open = self.open_position(setup, now)
             except Exception as e:
                 print(f"{now:%H:%M:%S} {ticker}: failed to open position: {e} "
                       "— will retry next cycle")
                 continue  # transient failure must not burn the day's alert
-            if opened:
+            if did_open:
                 self.skipped_today.add(ticker)
 
     def open_position(self, setup, now: datetime):
