@@ -127,22 +127,34 @@ class Service:
             # (Retries go to all chats, so a partial failure can duplicate a
             # message for whoever already got it. Duplicate beats missing.)
             pending = config.state_get("pending_sends", [])
-            pending.append(text)
-            config.state_set("pending_sends", pending[-20:])
+            pending.append({"text": text, "tries": 0})
+            config.state_set("pending_sends", pending[-50:])
             print(f"send failed, queued for retry: {errors}")
         return errors
 
+    MAX_SEND_RETRIES = 6
+
     def flush_pending(self):
-        """Retry alerts that failed to send on an earlier cycle."""
+        """Retry alerts that failed to send on an earlier cycle. A permanently
+        failing recipient (e.g. someone blocked the bot -> HTTP 403) must NOT
+        turn one alert into an endless duplicate storm to everyone else, so each
+        queued message is dropped after MAX_SEND_RETRIES attempts."""
         if self.dry:
             return
         pending = config.state_get("pending_sends", [])
         if not pending:
             return
         remaining = []
-        for text in pending:
-            if telegram.send("(retry) " + text):
-                remaining.append(text)
+        for item in pending:
+            if isinstance(item, str):  # migrate legacy string-only entries
+                item = {"text": item, "tries": 0}
+            if telegram.send("(retry) " + item["text"]):
+                item["tries"] = item.get("tries", 0) + 1
+                if item["tries"] < self.MAX_SEND_RETRIES:
+                    remaining.append(item)
+                else:
+                    print(f"dropping undeliverable alert after "
+                          f"{self.MAX_SEND_RETRIES} tries: {item['text'][:60]}")
         config.state_set("pending_sends", remaining)
 
     def reset_day(self, now: datetime):
@@ -197,11 +209,16 @@ class Service:
     def morning_report(self, now: datetime, include_gap: bool = True,
                        premarket: bool = False):
         today = now.date()
+        cached = config.state_get("risk_auto")
         # survives restarts: don't re-text the morning card after a reboot
         if (self.morning_sent_for != today
                 and config.state_get("morning_sent") == str(today)):
             self.morning_sent_for = today
-        cached = config.state_get("risk_auto")
+            # also restore the already-ANNOUNCED mode, so `prev` below isn't the
+            # default 'green' — otherwise a restart on a red/yellow day fires a
+            # bogus "UPDATE — RED" escalation for a mode that was already sent
+            if cached and cached.get("date") == str(today):
+                self.mode, self.mode_reason = cached["mode"], cached["reason"]
         if cached and cached.get("date") == str(today) \
                 and bool(cached.get("gap", False)) >= include_gap:
             mode, reason = cached["mode"], cached["reason"]
@@ -659,12 +676,19 @@ class Service:
         seen, seen_date = self._load_news_seen()
         first_seed = seen_date != str(now.date())
         fresh = [(o, t) for o, t in hot if t not in seen]
-        if fresh or first_seed:
-            seen = (seen + [t for _, t in fresh])[-300:]
-            self._save_news_seen(seen, str(now.date()))
-        if first_seed:
-            return  # day's first pass: seed silently, never replay old headlines
-        for outlet, title in fresh[:3]:
+        if first_seed:  # day's first pass: seed ALL current headlines silently
+            self._save_news_seen((seen + [t for _, t in fresh])[-300:],
+                                 str(now.date()))
+            return  # never replay headlines that predate startup
+        if not fresh:
+            return
+        # cap the SEND rate at 3/pass, but mark only what we actually send as
+        # seen — any extra fresh headlines stay un-seen and fire next pass (a
+        # multi-headline burst is exactly when we must not silently drop them)
+        to_send = fresh[:3]
+        self._save_news_seen((seen + [t for _, t in to_send])[-300:],
+                             str(now.date()))
+        for outlet, title in to_send:
             # 1) RAW alert goes out INSTANTLY — nothing slow runs before it
             self.notify(f"🚨 BREAKING — {outlet}: {title}")
             print(f"{now:%H:%M:%S} breaking news alert: {title[:60]}")
