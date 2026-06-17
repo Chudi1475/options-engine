@@ -88,8 +88,8 @@ def realized_vol(daily_closes: pd.Series, asof_date, window=20) -> float:
 
 
 def expiry_for(ticker: str, day: datetime) -> datetime:
-    if ticker == "SPX":
-        exp_day = day  # 0DTE
+    if ticker in ("SPX", "SPY"):
+        exp_day = day  # 0DTE (both have daily expirations)
     else:
         exp_day = day + timedelta(days=(4 - day.weekday()) % 7)  # this week's Friday
     return exp_day.replace(hour=16, minute=0, second=0)

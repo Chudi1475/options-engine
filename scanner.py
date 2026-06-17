@@ -417,6 +417,12 @@ class Service:
 
     # ---------- entries (signal logic UNCHANGED) ----------
 
+    # explicit allow-list: ONLY these setups ever alert, so a backtest re-run
+    # shifting the chosen bracket can never silently switch on a money-losing
+    # put. Validated calls (incl. SPY, mirroring SPX) + the one probationary
+    # put; every other put tested as a net loser.
+    ALLOWED_SETUPS = {"SPX:call", "SPY:call", "QCOM:call", "TSLA:put"}
+
     def gate_stats(self, setup):
         """The eligibility filter: backtested win rate of 70+ (rounded the
         same way every card displays it — 69.77% IS the '70%' the user sees)
@@ -427,8 +433,12 @@ class Service:
                   "Run backtest.py.")
             return None
         key = f"{setup.ticker}:{setup.direction}"
-        stats = self.backtest_old.get("per_setup", {}).get(key)
         now = et_now()
+        if key not in self.ALLOWED_SETUPS:
+            print(f"{now:%H:%M:%S} {key}: not on the alert allow-list "
+                  f"{sorted(self.ALLOWED_SETUPS)} — skipped.")
+            return None
+        stats = self.backtest_old.get("per_setup", {}).get(key)
         if stats is None:
             print(f"{now:%H:%M:%S} {setup.ticker} {setup.direction}: setup formed "
                   "but no backtest stats for it — skipped.")

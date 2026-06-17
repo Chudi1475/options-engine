@@ -23,6 +23,11 @@ TODAY = date(2026, 6, 11)
 BRACKET = {"target_pct": 15, "stop_pct": -60}
 ENTRY = 4.00
 
+# These scenarios were written against a -30% stop / +25% half; pin them so the
+# test validates the exit MECHANISM regardless of how the live config is tuned.
+config.STOP_PCT = -30.0
+config.TP_HALF_PCT = 25.0
+
 failures = []
 
 

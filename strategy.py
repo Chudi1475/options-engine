@@ -22,6 +22,7 @@ class StrategyConfig:
     # what to watch; yf_symbol is what we poll, trade_symbol what the card shows
     watchlist: dict = field(default_factory=lambda: {
         "SPX": "^GSPC",   # trade as SPXW 0DTE
+        "SPY": "SPY",     # 0DTE too (daily expirations); real-time via Alpaca
         "TSLA": "TSLA",
         "QCOM": "QCOM",
     })
@@ -36,7 +37,7 @@ class StrategyConfig:
     direction: str = "both"
     mom_bars: int = 3            # 15 minutes of 5m bars
     # KELECHI RULE: strike selection. Placeholder = first strike above spot.
-    strike_increment: dict = field(default_factory=lambda: {"SPX": 5.0})
+    strike_increment: dict = field(default_factory=lambda: {"SPX": 5.0, "SPY": 1.0})
     default_strike_increment: float = 2.5
     # exits (his stated framework — note the data shows he doesn't honor -30%)
     take_half_pct: float = 60.0
