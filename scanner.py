@@ -307,7 +307,7 @@ class Service:
                 "them out.")
         return None  # stranger gets nothing back
 
-    ADMIN_CMDS = {"/adduser", "/removeuser", "/users", "/risk", "/setaccount"}
+    ADMIN_CMDS = {"/adduser", "/removeuser", "/users", "/risk", "/setaccount", "/test"}
 
     def run_command(self, cmd: str, args: str, chat_id: str = ""):
         if cmd in self.ADMIN_CMDS and not telegram.is_owner(chat_id):
@@ -355,7 +355,7 @@ class Service:
         if cmd == "/status":
             return self.status_text()
         if cmd == "/test":
-            self.test_sequence()
+            self.test_sequence(chat_id)
             return None
         if cmd in ("/help", "/start"):
             return cards.help_card()
@@ -798,11 +798,13 @@ class Service:
                 t0 = time_mod.monotonic()
                 try:  # one bad cycle must never end the trading day
                     self.flush_pending()
-                    self.handle_commands()
+                    # money-critical FIRST: entries + exits must never wait on a
+                    # slow chat command (a photo/assistant reply can block secs)
                     if self.cfg.entry_start <= now.time() <= self.cfg.entry_end:
                         self.scan_entries(now)
                     if now.time() >= MONITOR_START:
                         self.monitor_positions(now)
+                    self.handle_commands()
                     self.maybe_recap(now)
                     self.maybe_weekly(now)
                 except Exception as e:
@@ -838,7 +840,7 @@ class Service:
 
     # ---------- /test ----------
 
-    def test_sequence(self):
+    def test_sequence(self, chat_id=None):
         """Fire a fake signal through the entire pipeline: entry card,
         sell-half, momentum-flip, stop, and expiry alerts. Nothing is
         persisted; every message is clearly labeled TEST."""
@@ -878,7 +880,11 @@ class Service:
         msgs.append(cards.expiry_card(pos, {"pct": -8.0, "source": src}))
         for i, msg in enumerate(msgs, 1):
             tagged = (f"🧪 TEST {i}/5 — EXAMPLE ONLY, NOT A REAL ALERT 🧪\n\n{msg}")
-            errors = self.notify(tagged)
+            if chat_id and not self.dry:   # /test from a chat: reply ONLY to them,
+                err = telegram.send_to(chat_id, tagged)   # never the whole group
+                errors = [err] if err else []
+            else:                          # CLI --test / dry-run: broadcast path
+                errors = self.notify(tagged)
             print(f"test {i}/5 {'sent' if not errors else errors}")
             if not self.dry:
                 time_mod.sleep(1.5)  # keep Telegram happy, preserve order

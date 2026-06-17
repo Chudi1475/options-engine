@@ -49,6 +49,11 @@ def nearest_listed_expiry(ticker: str, target: date):
     """Snap a computed expiry to one that actually trades. Holiday weeks move
     weeklies (e.g. Friday-holiday -> Thursday expiry). Returns the listed
     expiration closest to `target` within 3 days, else `target` unchanged."""
+    if ticker in ("SPX", "SPY"):
+        return target  # 0DTE: NEVER snap to another date — a 1-3 DTE contract
+                       # would break the strategy/stats/"expires today" card. If
+                       # today isn't listed, get_option_quote returns None and
+                       # the bot falls back to the clearly-labeled estimate.
     sym = CHAIN_SYMBOL.get(ticker, ticker)
     try:
         listed = [date.fromisoformat(e) for e in _expirations(sym)]
