@@ -44,6 +44,9 @@ MIN_WINRATE = _f("MIN_WINRATE", 70.0)        # never alert below this backtested
 LIVE_STATS_MIN_TOTAL = 30                    # closed signals before live stats replace the backtest
 LIVE_STATS_MIN_SETUP = 10                    # and at least this many for the specific setup
 POLL_SECONDS = int(_f("POLL_SECONDS", 15))   # main loop cadence
+NEWS_POLL_SECONDS = int(_f("NEWS_POLL_SECONDS", 12))  # breaking-news scan cadence
+                                             # (own thread; lower = faster but
+                                             # risks the free RSS feeds rate-limiting)
 EXPIRY_WARN_MINUTES = 15                     # "close before expiry" warning, minutes before 4 PM ET
 # -----------------------------------------------------------------
 
@@ -54,6 +57,8 @@ STATE_FILE = DATA_DIR / "state.json"
 POSITIONS_FILE = DATA_DIR / "positions.json"
 ALERTS_LOG = DATA_DIR / "alerts.log"
 ALERTS_JSONL = DATA_DIR / "alerts_sent.jsonl"
+NEWS_SEEN_FILE = DATA_DIR / "news_seen.json"  # breaking-news dedup (own file so
+                                              # the news thread never races state.json)
 
 
 def paper_mode() -> bool:

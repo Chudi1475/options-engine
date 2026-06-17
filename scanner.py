@@ -28,6 +28,7 @@ import sys
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # emoji on Windows console
 
+import threading
 import time as time_mod
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
@@ -111,7 +112,6 @@ class Service:
         self.morning_sent_for = None
         self.premarket_sent_for = None
         self.heartbeat = 0
-        self._news_next = 0.0  # next breaking-news check (monotonic)
 
     # ---------- plumbing ----------
 
@@ -605,43 +605,90 @@ class Service:
             self.notify(builders[ev["type"]](pos, ev))
             print(f"{now:%H:%M:%S} {pos.ticker}: {ev['type']} at {ev['pct']:+.1f}%")
 
-    # ---------- breaking news ----------
+    # ---------- breaking news (own thread, instant-send) ----------
 
-    def watch_news(self, now: datetime):
-        """Every ~2 minutes during the session: text the moment a NEW hot
-        headline hits the wires, with a one-line read from the brain.
-        Headlines already on the wires before startup are seeded silently
-        (the morning report covered those)."""
-        if time_mod.monotonic() < self._news_next:
+    def start_news_watch(self):
+        """Spin up the breaking-news watcher in its OWN thread so it fires the
+        instant a fresh headline lands instead of waiting on the ~15s trading
+        loop, and so a slow AI 'read' never delays the alert or the next trade
+        cycle. Safe to call repeatedly."""
+        t = getattr(self, "_news_thread", None)
+        if t and t.is_alive():
             return
-        self._news_next = time_mod.monotonic() + 120
-        hot = news.all_hot(self.cfg.watchlist, ttl=110)
-        seen = config.state_get("news_seen", [])
-        first_seed = config.state_get("news_seen_date") != str(now.date())
-        fresh = [(o, t) for o, t in hot if t not in seen]
-        if fresh:
-            seen = (seen + [t for _, t in fresh])[-300:]
-            config.state_set("news_seen", seen)
-        if first_seed:
-            config.state_set("news_seen_date", str(now.date()))
-            return  # seed silently — no replaying old headlines
-        for outlet, title in fresh[:3]:
-            msg = f"🚨 BREAKING — {outlet}: {title}"
+        self._news_stop = threading.Event()
+        self._news_thread = threading.Thread(
+            target=self._news_worker, name="news-watcher", daemon=True)
+        self._news_thread.start()
+
+    def stop_news_watch(self):
+        ev = getattr(self, "_news_stop", None)
+        if ev:
+            ev.set()
+
+    def _news_worker(self):
+        # tight loop: scan -> fire instantly -> sleep NEWS_POLL_SECONDS.
+        # only runs while a session is live (run_session owns the lifecycle).
+        while not self._news_stop.is_set():
             try:
-                import assistant
-                if assistant.enabled():
-                    take = assistant.respond(
-                        {"chat_id": "newsdesk", "kind": "text",
-                         "text": ("One sentence only, no invented numbers: "
-                                  "what could this headline mean for SPX/QCOM/"
-                                  f"TSLA trades today? Headline: {title}")},
-                        self.status_text(), tools_enabled=False)
-                    if take and "error" not in take.lower():
-                        msg += f"\nQuick read: {take}"
-            except Exception:
-                pass
-            self.notify(msg)
+                self._scan_news_once()
+            except Exception as e:
+                print(f"{et_now():%H:%M:%S} news watcher error (continuing): {e}")
+            self._news_stop.wait(max(3, config.NEWS_POLL_SECONDS))
+
+    def _load_news_seen(self):
+        try:
+            d = json.loads(config.NEWS_SEEN_FILE.read_text(encoding="utf-8-sig"))
+            return d.get("seen", []), d.get("date")
+        except (OSError, json.JSONDecodeError):
+            return [], None
+
+    def _save_news_seen(self, seen, day):
+        try:  # only the news thread writes this file -> no cross-thread race
+            config.NEWS_SEEN_FILE.write_text(
+                json.dumps({"seen": seen, "date": day}), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _scan_news_once(self):
+        """One pass: text the moment a NEW hot headline hits the wires.
+        Headlines already on the wires at the day's first pass are seeded
+        silently (the morning report covered those)."""
+        now = et_now()
+        ttl = max(5, config.NEWS_POLL_SECONDS - 2)  # refetch nearly every pass
+        hot = news.all_hot(self.cfg.watchlist, ttl=ttl)
+        seen, seen_date = self._load_news_seen()
+        first_seed = seen_date != str(now.date())
+        fresh = [(o, t) for o, t in hot if t not in seen]
+        if fresh or first_seed:
+            seen = (seen + [t for _, t in fresh])[-300:]
+            self._save_news_seen(seen, str(now.date()))
+        if first_seed:
+            return  # day's first pass: seed silently, never replay old headlines
+        for outlet, title in fresh[:3]:
+            # 1) RAW alert goes out INSTANTLY — nothing slow runs before it
+            self.notify(f"🚨 BREAKING — {outlet}: {title}")
             print(f"{now:%H:%M:%S} breaking news alert: {title[:60]}")
+            # 2) AI 'read' is a best-effort FOLLOW-UP — never blocks the alert
+            take = self._news_take(title)
+            if take:
+                self.notify(f"🧠 Quick read: {take}")
+
+    def _news_take(self, title: str):
+        try:
+            import assistant
+            if not assistant.enabled():
+                return None
+            take = assistant.respond(
+                {"chat_id": "newsdesk", "kind": "text",
+                 "text": ("One sentence only, no invented numbers: what could "
+                          "this headline mean for SPX/QCOM/TSLA trades today? "
+                          f"Headline: {title}")},
+                self.status_text(), tools_enabled=False)
+            if take and "error" not in take.lower():
+                return take
+        except Exception:
+            pass
+        return None
 
     # ---------- daily recap + weekly ----------
 
@@ -691,6 +738,7 @@ class Service:
         if now.weekday() < 5:
             self.morning_report(now)
         keep_awake(True)
+        self.start_news_watch()  # instant breaking-news alerts, own thread
         try:
             while True:
                 now = et_now()
@@ -708,7 +756,6 @@ class Service:
                         self.scan_entries(now)
                     if now.time() >= MONITOR_START:
                         self.monitor_positions(now)
-                    self.watch_news(now)
                     self.maybe_recap(now)
                     self.maybe_weekly(now)
                 except Exception as e:
@@ -718,6 +765,7 @@ class Service:
                 elapsed = time_mod.monotonic() - t0
                 time_mod.sleep(max(2.0, config.POLL_SECONDS - elapsed))
         finally:
+            self.stop_news_watch()
             keep_awake(False)
 
     def daemon(self):
