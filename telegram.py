@@ -41,6 +41,17 @@ def is_owner(chat_id) -> bool:
     return str(chat_id) in owner_ids()
 
 
+def primary_owner_id():
+    """The single owner who gets private heads-ups (Chudi), never the added
+    members. OWNER_CHAT_ID overrides; otherwise the first TELEGRAM_CHAT_IDS
+    entry. Returns None if nothing is configured."""
+    override = os.environ.get("OWNER_CHAT_ID", "").strip()
+    if override:
+        return override
+    owners = owner_ids()
+    return owners[0] if owners else None
+
+
 def send_to(chat_id, text: str):
     """Send to one chat. Returns an error string or None."""
     try:

@@ -79,6 +79,23 @@ Scorekeeping — one of your main jobs:
   question instead of guessing. NEVER log a number you aren't sure of.
 - When they ask "what's my record / score / how am I doing", call get_score.
 
+Tickers you're equipped for: SPX, QCOM, TSLA only.
+- If someone asks about ANY other stock or ETF (NVDA, SPY, AAPL, etc.),
+  don't fake a read and don't run market_now/analyze_day on it. Tell them
+  straight it's not on the bot's watchlist yet, and ask if they'd like it
+  added.
+- If they say yes (or clearly want it), call request_new_ticker with the
+  symbol, then tell them you flagged it for the boss and he'll decide.
+- If the OWNER himself is asking, skip the ping and just talk it through.
+
+Owner radar (you're the owner's private eyes):
+- When a MEMBER (not the owner) gives feedback, reports something broken,
+  complains, or suggests a change the owner should act on, call flag_owner
+  with a one-line summary. The member is NOT told; answer them normally too.
+- Don't flag routine stuff: questions you already answered, trade logs,
+  plain chat, or anything from the owner himself. Only real, actionable
+  signal the owner needs to fix or decide on.
+
 Hard rules:
 - NEVER invent statistics or prices. Only quote numbers from the LIVE BOT
   STATE block, the tools, or what the user sent. Missing a number? Say so.
@@ -138,6 +155,40 @@ TOOLS = [
             "ticker": {"type": "string", "description": "SPX, QCOM or TSLA"},
             "date": {"type": "string",
                      "description": "the day as YYYY-MM-DD; omit for the last session"}}},
+    },
+    {
+        "name": "request_new_ticker",
+        "description": ("Flag a stock/ETF the bot is NOT equipped for (anything "
+                        "other than SPX, QCOM, TSLA) that the user wants added. "
+                        "Pings the owner to approve. Call ONLY after the user "
+                        "says they'd like it added."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ticker": {"type": "string", "description": "the symbol, e.g. NVDA, SPY"},
+                "asked_by": {"type": "string",
+                             "description": "the requester's name if you know it, else empty"},
+            },
+            "required": ["ticker"],
+        },
+    },
+    {
+        "name": "flag_owner",
+        "description": ("Privately forward to the owner when a MEMBER gives "
+                        "feedback, reports a bug/problem, complains, or suggests "
+                        "a change the owner should fix. Owner-only; the member "
+                        "is never told. NOT for normal chat, questions, or "
+                        "trade logs."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string",
+                            "description": "one or two lines: what they said + what may need fixing"},
+                "category": {"type": "string",
+                             "description": "feedback | bug | request | complaint"},
+            },
+            "required": ["summary"],
+        },
     },
 ]
 
@@ -220,6 +271,46 @@ def score_line(chat_id: str) -> str:
             f"dollars across {s['entries']} logged trades.")
 
 
+SUPPORTED_TICKERS = ("SPX", "QCOM", "TSLA")
+
+
+def _request_ticker(ticker: str, chat_id: str, asked_by: str = "") -> str:
+    """Flag an unsupported ticker the user wants added; ping the owner ONLY."""
+    ticker = (ticker or "").upper().strip().lstrip("$")
+    if not ticker:
+        return json.dumps({"error": "no ticker given"})
+    who = (asked_by or "").strip() or f"chat {chat_id}"
+    pending = config.state_get("pending_tickers", {})
+    already = ticker in pending
+    pending[ticker] = {"asked_by": who, "chat_id": str(chat_id)}
+    config.state_set("pending_tickers", pending)
+    owner = telegram.primary_owner_id()
+    pinged = False
+    if owner:
+        err = telegram.send_to(
+            owner,
+            f"🆕 TICKER REQUEST\n{who} asked about {ticker}, which the bot "
+            f"isn't set up for yet.\nWant to add {ticker} to the watchlist? "
+            "Reply if you'd like to proceed.")
+        pinged = err is None
+    return json.dumps({"flagged": ticker, "owner_pinged": pinged,
+                       "already_pending": already})
+
+
+def _flag_owner(summary: str, chat_id: str, category: str = "feedback") -> str:
+    """Forward a member's feedback/issue to the owner ONLY (never the owner's
+    own messages, never the other members)."""
+    summary = (summary or "").strip()
+    if not summary:
+        return json.dumps({"error": "nothing to flag"})
+    owner = telegram.primary_owner_id()
+    if not owner or telegram.is_owner(chat_id) or str(chat_id) == str(owner):
+        return json.dumps({"skipped": "owner's own message or no owner set"})
+    err = telegram.send_to(
+        owner, f"📣 MEMBER {category.upper()} (chat {chat_id}):\n{summary}")
+    return json.dumps({"forwarded_to_owner": err is None})
+
+
 def _run_tool(name: str, args: dict, chat_id: str) -> str:
     try:
         if name == "log_trade_result":
@@ -229,6 +320,12 @@ def _run_tool(name: str, args: dict, chat_id: str) -> str:
             return json.dumps({"logged": entry, "score": score(chat_id)})
         if name == "get_score":
             return json.dumps(score(chat_id))
+        if name == "request_new_ticker":
+            return _request_ticker(args.get("ticker", ""), chat_id,
+                                   args.get("asked_by", ""))
+        if name == "flag_owner":
+            return _flag_owner(args.get("summary", ""), chat_id,
+                               args.get("category", "feedback"))
         if name in ("market_now", "analyze_day"):
             import market_tools
             if name == "market_now":
@@ -274,9 +371,13 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True) -> str:
     from datetime import datetime as _dt
     from zoneinfo import ZoneInfo as _zi
     now_et = _dt.now(_zi("America/New_York"))
-    context_text = (f"Right now it is {now_et:%A %Y-%m-%d %I:%M %p} ET.\n"
-                    + context_text)
     chat_id = item["chat_id"]
+    who_line = ("This chat IS the owner (Chudi) himself."
+                if telegram.is_owner(chat_id)
+                else "This chat is a MEMBER, not the owner.")
+    context_text = (f"Right now it is {now_et:%A %Y-%m-%d %I:%M %p} ET.\n"
+                    f"{who_line}\n"
+                    + context_text)
     blocks = []
     if item["kind"] in ("photo", "document"):
         file_blocks, err = _file_blocks(item)
