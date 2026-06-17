@@ -283,11 +283,12 @@ def main():
     msg = "\n".join(lines)
     if dry:
         print(msg)
-    else:
-        errors = telegram.send(msg)
-        print("Recap sent." if not errors else f"Errors: {errors}")
-        with config.ALERTS_LOG.open("a", encoding="utf-8") as f:
-            f.write(f"--- recap sent for {session}\n{msg}\n\n")
+        return []
+    errors = telegram.send(msg)
+    print("Recap sent." if not errors else f"Errors: {errors}")
+    with config.ALERTS_LOG.open("a", encoding="utf-8") as f:
+        f.write(f"--- recap sent for {session}\n{msg}\n\n")
+    return errors
 
 
 if __name__ == "__main__":

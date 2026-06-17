@@ -588,8 +588,12 @@ class Service:
             return
         sigma = self.sigma(pos.ticker)
         expiry_dt = datetime.combine(pos.expires_on(), time(16, 0), tzinfo=ET)
-        est = quotes.estimate_premium(spot, pos.strike, pos.right,
-                                      expiry_dt, now, sigma)
+        # sigma==0 means the vol download was throttled; a BS price with no vol
+        # collapses to pure intrinsic (all time value stripped) and reads as a
+        # huge phantom loss vs the entry estimate -> a FALSE stop. Treat it as
+        # "no estimate this cycle" so est can't become the mark or trip the stop.
+        est = (quotes.estimate_premium(spot, pos.strike, pos.right,
+                                       expiry_dt, now, sigma) if sigma > 0 else 0.0)
         # the estimate-based stop floor compares model-to-model: the BS
         # estimate now vs the BS estimate AT ENTRY. (Estimate vs a real quote
         # mid would read -30% on day one just from the vol-model gap.)
@@ -605,6 +609,12 @@ class Service:
         elif quote is not None and quote.mid > 0:
             mark, source = quote.mid, quote.source
         else:
+            return
+        # never drive stop/half off a BS estimate divided by a REAL-quote entry:
+        # the model-vs-quote gap reads as a fake -30%+ and fires a phantom SELL.
+        # If entered on a real quote but only an estimate is available now, skip
+        # this cycle rather than act on a biased number.
+        if source.startswith("estimat") and pos.entry_source == "quote":
             return
 
         flipped = False
@@ -725,8 +735,11 @@ class Service:
             return
         try:
             import recap
-            recap.main()
-            config.state_set("recap_sent", str(now.date()))
+            errs = recap.main()
+            if errs:  # telegram.send returns errors, it does NOT raise — so
+                print(f"{now:%H:%M:%S} recap send failed, will retry: {errs}")
+            else:     # only mark sent on real success, else it never retries
+                config.state_set("recap_sent", str(now.date()))
         except Exception as e:
             print(f"{now:%H:%M:%S} recap failed (will retry): {e}")
 

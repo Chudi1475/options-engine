@@ -8,9 +8,12 @@ survive restarts without touching this file.
 
 import json
 import os
+import threading
 from pathlib import Path
 
 REPO_DIR = Path(__file__).parent
+_STATE_LOCK = threading.RLock()  # serialize state.json read-modify-write across
+                                 # the main loop and the news-watcher thread
 
 
 def load_env():
@@ -83,14 +86,20 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    try:
-        tmp.replace(STATE_FILE)
-    except PermissionError:  # another process briefly reading the file
-        import time
-        time.sleep(0.2)
-        tmp.replace(STATE_FILE)
+    # unique temp per thread so two concurrent savers never clobber one shared
+    # tmp file (which would publish a torn state.json or raise FileNotFoundError)
+    with _STATE_LOCK:
+        tmp = STATE_FILE.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        try:
+            tmp.replace(STATE_FILE)
+        except PermissionError:  # another process briefly reading the file
+            import time
+            time.sleep(0.2)
+            try:
+                tmp.replace(STATE_FILE)
+            except (PermissionError, FileNotFoundError):
+                pass
 
 
 def state_get(key, default=None):
@@ -98,9 +107,10 @@ def state_get(key, default=None):
 
 
 def state_set(key, value) -> None:
-    s = load_state()
-    s[key] = value
-    save_state(s)
+    with _STATE_LOCK:  # load -> mutate -> save is one atomic critical section
+        s = load_state()
+        s[key] = value
+        save_state(s)
 
 
 def account_value():
