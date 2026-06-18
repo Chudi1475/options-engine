@@ -76,6 +76,17 @@ def _minutes_between(a: str, b: str) -> int:
                .total_seconds() / 60)
 
 
+def kelechi_tag(reason: str = "", banked_half: bool = False) -> str:
+    """A nod to the momentum style the bot trades — ONLY ever added to wins,
+    so a green day reads as 'we ran the playbook' instead of boilerplate. The
+    strategy IS the Kelechi momentum read (spot the 15-min turn, ride the
+    continuation, bank half, trail the flip), so a clean win earns the name."""
+    if reason == "momentum flip" or banked_half:
+        return (" Classic Kelechi-style trade — caught the momentum turn, "
+                "banked half into strength, and trailed the rest.")
+    return " Kelechi style — spotted the push early and rode the continuation."
+
+
 def position_story(p):
     """Grade a real tracked position. Returns (verdict, story)."""
     est_note = ""
@@ -122,7 +133,8 @@ def position_story(p):
                  "0DTE options don't get a tomorrow.")
     else:
         story = f"Closed at {total:+.0f}% ({reason})."
-    return verdict, story + est_note
+    tag = kelechi_tag(reason, banked_half=bool(p.half_exit)) if total > 0 else ""
+    return verdict, story + tag + est_note
 
 
 # ---------- legacy grading (pre-upgrade alert records) ----------
@@ -164,7 +176,7 @@ def grade_alert(rec, bars, daily_closes, bracket):
         verdict = "RIGHT ✅"
         story = (f"It hit the +{target:g}% profit target at {t_str}. "
                  "Why it worked: the move kept going after we spotted it — "
-                 "that's exactly what this setup bets on.")
+                 "that's exactly what this setup bets on." + kelechi_tag())
     elif outcome == "stop":
         verdict = "WRONG ❌"
         minutes = int((outcome_time - alert_ts).total_seconds() / 60)
@@ -178,7 +190,8 @@ def grade_alert(rec, bars, daily_closes, bracket):
         if final_ret is not None and final_ret > 0:
             verdict = "RIGHT ✅ (small win)"
             story = (f"Never hit the target, but ended the day up {final_ret:+.0f}%. "
-                     "The move was real, just slower than usual.")
+                     "The move was real, just slower than usual — Kelechi style, "
+                     "we still got paid.")
         else:
             verdict = "WRONG ❌ (slow loss)"
             story = (f"Never hit the stop, but bled to {final_ret:+.0f}% by the close. "
