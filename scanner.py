@@ -112,6 +112,10 @@ class Service:
         self.morning_sent_for = None
         self.premarket_sent_for = None
         self.heartbeat = 0
+        self._last_feed_ok = None       # last time a bars fetch returned data
+        self._health_last_stamp = 0.0   # monotonic; throttles the alive-stamp
+        self._feed_warned = False       # in-memory: feed-stale DM already sent
+        self._feed_none_warned = False  # in-memory: no-data-yet DM already sent
 
     # ---------- plumbing ----------
 
@@ -208,9 +212,12 @@ class Service:
         when entry scan and position monitoring both need the same ticker."""
         hit = self._bars_cache.get(yfs)
         if hit and (now - hit[0]).total_seconds() < config.POLL_SECONDS - 2:
-            return hit[1]
-        bars = self.feed.today_bars(yfs, now)
-        self._bars_cache[yfs] = (now, bars)
+            bars = hit[1]
+        else:
+            bars = self.feed.today_bars(yfs, now)
+            self._bars_cache[yfs] = (now, bars)
+        if bars is not None and not bars.empty:
+            self._last_feed_ok = now  # feeds the self-heartbeat's feed-dead check
         return bars
 
     def current_mode(self):
@@ -219,6 +226,137 @@ class Service:
         if override and override.get("date") == str(et_now().date()):
             return override["mode"], (override.get("reason") or "manual override")
         return self.mode, self.mode_reason
+
+    # ---------- self-heartbeat (owner-only health alerts) ----------
+    # The bot watches itself and DMs the OWNER (never members) the moment it
+    # goes silent, so a quiet failure is never mistaken for a quiet market.
+    # Pure monitoring — it never touches entries, exits, sizing, or alerts.
+
+    FEED_STALE_MIN = 10   # warn if no data fetch succeeds for this long in-session
+    DOWNTIME_MIN = 10     # warn on restart if silently down this long in-session
+
+    def _hb_owner(self, text: str):
+        """DM the OWNER only (never members) with an ops/health note."""
+        owner = telegram.primary_owner_id()
+        if not owner or self.dry:
+            return
+        try:
+            telegram.send_to(owner, text)
+        except Exception as e:
+            print(f"heartbeat DM failed: {e}")
+
+    def _hb_warned_once(self, key: str, day: str) -> bool:
+        """True if this warning already fired today; else mark it and return
+        False. Persisted, so a restart can't re-spam the same warning."""
+        if key in (config.state_get("hb_warned", {}) or {}).get(day, []):
+            return True
+
+        def upd(w):
+            w = w if isinstance(w, dict) else {}
+            fired = list(w.get(day, []))
+            if key not in fired:
+                fired.append(key)
+            return {day: fired}  # keep only today's flags
+        config.state_update("hb_warned", upd, default={})
+        return False
+
+    def health_stamp(self, now: datetime):
+        """Throttled 'I'm alive' stamp to state.json (~once a minute)."""
+        t = time_mod.monotonic()
+        if t - self._health_last_stamp < 55:
+            return
+        self._health_last_stamp = t
+        config.state_set("heartbeat", {"ts": now.isoformat(), "day": str(now.date())})
+
+    def check_downtime_on_start(self, now: datetime):
+        """On session start, if the last alive-stamp was earlier TODAY and the
+        gap spans market hours, the bot was silently down — tell the owner once.
+        A normal redeploy (a couple minutes) is under the threshold, so routine
+        deploys stay quiet."""
+        if self.dry or now.weekday() >= 5 or now.time() < MONITOR_START:
+            return
+        hb = config.state_get("heartbeat")
+        if not hb or hb.get("day") != str(now.date()):
+            return
+        try:
+            last = datetime.fromisoformat(hb["ts"])
+        except (ValueError, KeyError, TypeError):
+            return
+        gap = (now - last).total_seconds() / 60
+        if gap >= self.DOWNTIME_MIN and last.time() <= time(16, 0):
+            self._hb_owner(
+                f"⚠️ Heartbeat: I was down ~{gap:.0f} min "
+                f"({last:%I:%M}–{now:%I:%M %p} ET) during market hours. "
+                "Back up now — check for any missed alerts.")
+
+    def health_check(self, now: datetime):
+        """Once-a-cycle, in-session health checks. Owner-only DMs."""
+        if self.dry:
+            return
+        self.health_stamp(now)
+        if now.weekday() >= 5 or not (MONITOR_START <= now.time() <= time(16, 0)):
+            return
+        last_ok = self._last_feed_ok
+        if last_ok is None:  # no data has loaded at all this session
+            if now.time() >= time(10, 0) and not self._feed_none_warned:
+                self._feed_none_warned = True
+                self._hb_owner(
+                    "⚠️ Heartbeat: no market data has loaded yet this session — "
+                    "the feed may be down. No setups can fire until it recovers.")
+            return
+        self._feed_none_warned = False
+        stale = (now - last_ok).total_seconds() / 60
+        if stale >= self.FEED_STALE_MIN and not self._feed_warned:
+            self._feed_warned = True
+            self._hb_owner(
+                f"⚠️ Heartbeat: the data feed has returned nothing for ~{stale:.0f} "
+                "min during market hours. Setups/exits may be stalled — check it.")
+        elif stale < self.FEED_STALE_MIN and self._feed_warned:
+            self._feed_warned = False
+            self._hb_owner("✅ Heartbeat: data feed recovered.")
+
+    def health_eod(self, now: datetime):
+        """One owner-only end-of-session 'all clear', so silence is meaningful:
+        no close ping = something is wrong."""
+        if self.dry or now.weekday() >= 5 or now.time() < WEEKLY_AT:
+            return
+        today = str(now.date())
+        if self._hb_warned_once("eod", today):
+            return
+        n = len(self.book.for_date(now.date()))
+        feed = (f"OK (last {self._last_feed_ok:%I:%M %p})"
+                if self._last_feed_ok else "NO DATA seen")
+        warns = [k for k in (config.state_get("hb_warned", {}) or {}).get(today, [])
+                 if k != "eod"]
+        tail = ("  Heads-up today: " + ", ".join(warns)) if warns else ""
+        self._hb_owner(
+            f"✅ Heartbeat: session done. {n} alert{'s' if n != 1 else ''} sent, "
+            f"feed {feed}.{tail}  (Once-a-day check — no close ping from me means "
+            "something's wrong.)")
+
+    def health_text(self) -> str:
+        """/health — on-demand snapshot for the owner."""
+        now = et_now()
+        hb = config.state_get("heartbeat") or {}
+        last_ok = self._last_feed_ok
+        today = str(now.date())
+        open_n = sum(1 for p in self.book.positions if p.state != "closed")
+        warns = [w for w in (config.state_get("hb_warned", {}) or {}).get(today, [])
+                 if w != "eod"]
+        lines = [
+            "🩺 BOT HEALTH",
+            f"Now: {now:%a %I:%M %p ET}",
+            f"Last heartbeat: {hb.get('ts', 'n/a')}",
+            (f"Feed last OK: {last_ok:%I:%M %p ET}" if last_ok
+             else "Feed last OK: not yet this run"),
+            f"Morning card today: "
+            f"{'sent' if config.state_get('morning_sent') == today else 'NOT sent'}",
+            f"Alerts today: {len(self.book.for_date(now.date()))}",
+            f"Open positions: {open_n}",
+        ]
+        if warns:
+            lines.append("Warnings today: " + ", ".join(warns))
+        return "\n".join(lines)
 
     # ---------- morning ----------
 
@@ -266,6 +404,14 @@ class Service:
         self.notify(card)
         if not self.dry:  # dry-run must not set the live morning dedup key
             config.state_set("morning_sent", str(today))
+        # if the card went out AFTER the entry window opened, we came up late
+        # (likely a slow restart) — tell the owner so a missed open isn't silent.
+        if (not self.dry and now.weekday() < 5 and now.time() > self.cfg.entry_start
+                and not self._hb_warned_once("late_open", str(today))):
+            self._hb_owner(
+                f"⚠️ Heartbeat: morning card went out at {now:%I:%M %p} ET, after "
+                f"the {self.cfg.entry_start:%H:%M} entry window opened — I may have "
+                "missed early setups today.")
 
     # ---------- telegram commands ----------
 
@@ -324,7 +470,8 @@ class Service:
                 "them out.")
         return None  # stranger gets nothing back
 
-    ADMIN_CMDS = {"/adduser", "/removeuser", "/users", "/risk", "/setaccount", "/test"}
+    ADMIN_CMDS = {"/adduser", "/removeuser", "/users", "/risk", "/setaccount",
+                  "/test", "/health"}
 
     def run_command(self, cmd: str, args: str, chat_id: str = ""):
         if cmd in self.ADMIN_CMDS and not telegram.is_owner(chat_id):
@@ -371,6 +518,8 @@ class Service:
                     f"for today ({reason}). Effect: {effect}.")
         if cmd == "/status":
             return self.status_text()
+        if cmd == "/health":
+            return self.health_text()
         if cmd == "/test":
             self.test_sequence(chat_id)
             return None
@@ -845,6 +994,7 @@ class Service:
     def run_session(self):
         now = et_now()
         self.reset_day(now)
+        self.check_downtime_on_start(now)  # were we silently down mid-session?
         mode_src = "live alerts" if not self.dry else "dry-run"
         print(f"Scanner running ({mode_src}). Entry window "
               f"{self.cfg.entry_start}-{self.cfg.entry_end} ET, polling every "
@@ -866,6 +1016,7 @@ class Service:
                 if now.time() >= SESSION_END or now.weekday() >= 5:
                     self.maybe_recap(now)
                     self.maybe_weekly(now)
+                    self.health_eod(now)  # owner-only 'all clear' for the day
                     print("Session over for today.")
                     return
                 t0 = time_mod.monotonic()
@@ -880,6 +1031,7 @@ class Service:
                     self.handle_commands()
                     self.maybe_recap(now)
                     self.maybe_weekly(now)
+                    self.health_check(now)
                 except Exception as e:
                     print(f"{now:%H:%M:%S} cycle error (continuing): {e}")
                 # adaptive sleep: data-fetch time counts toward the cadence,
@@ -908,6 +1060,8 @@ class Service:
                 self.maybe_recap(now)   # catch-up: a recap missed/STALE during
                                         # the 16:05-16:12 window still goes out
                 self.maybe_weekly(now)  # weekend catch-up
+                self.health_eod(now)    # close ping even if a restart ended the
+                                        # session early (self-guards once/day)
                 self.handle_commands(timeout=45)  # long-poll, responsive + cheap
             except Exception as e:
                 print(f"daemon error (continuing): {e}")

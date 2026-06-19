@@ -229,6 +229,7 @@ def help_card() -> str:
         "/setaccount 25000 — set your account size (sizes cards in dollars)",
         "/risk green|yellow|red [reason] — override today's risk mode",
         "/status — risk mode, account, open positions right now",
+        "/health — bot self-check: feed, last heartbeat, today's alerts (owner)",
         "/score — your personal win/loss record (I keep it for you)",
         "/adduser — let another person in (owner only)",
         "/users — see who has access (owner only)",
