@@ -5,8 +5,8 @@ it answers with events to alert on.
 
 Exit system (constants in config.py):
 - SELL HALF when the option is +TP_HALF_PCT over entry mid
-- then trail the remaining half: exit when the same 15-min momentum measure
-  used for entry flips against the trade
+- then let the runner RUN: sell the remaining half when it gives back
+  RUNNER_GIVEBACK_PCT points from its peak (give-back trail)
 - hard stop: sell everything at STOP_PCT from entry mid, any time
 - "close before expiry" warning EXPIRY_WARN_MINUTES before the 4 PM ET close
 
@@ -115,8 +115,12 @@ def step(pos: Position, now: datetime, mark: float, mark_source: str,
         pos.last_mark = mark
         pos.last_mark_pct = eff
         pos.last_mark_source, pos.last_mark_time = mark_source, ts
-        pos.mfe_pct = eff if pos.mfe_pct is None else max(pos.mfe_pct, eff)
-        pos.mae_pct = eff if pos.mae_pct is None else min(pos.mae_pct, eff)
+        # peak/trough track ONLY comparable cycles, so the give-back trail below
+        # can't read a model-baseline eff against a quote-baseline peak and fake
+        # a give-back (or inflate the MFE).
+        if comparable:
+            pos.mfe_pct = pct if pos.mfe_pct is None else max(pos.mfe_pct, pct)
+            pos.mae_pct = pct if pos.mae_pct is None else min(pos.mae_pct, pct)
 
         stop_trigger = min(eff, est_pct) if est_pct is not None else eff
         if stop_trigger <= config.STOP_PCT:
@@ -128,18 +132,19 @@ def step(pos: Position, now: datetime, mark: float, mark_source: str,
             pos.half_exit = {"time": ts, "pct": pct, "mark": mark}
             pos.state = "half_sold"
             events.append({"type": "sell_half", "pct": pct, "source": mark_source})
-        elif pos.state == "half_sold":
-            # let the runner RUN (half is already banked at +25%): sell it only
-            # when it gives back RUNNER_GIVEBACK_PCT points from its peak. This
-            # captures the big continuation days the old momentum-flip trail was
-            # cutting short. `flipped` is kept for signature/back-compat only.
-            peak = pos.mfe_pct if pos.mfe_pct is not None else eff
-            if eff <= peak - config.RUNNER_GIVEBACK_PCT:
-                pos.final_exit = {"time": ts, "pct": eff, "mark": mark,
+        elif pos.state == "half_sold" and comparable:
+            # let the runner RUN (half already banked at +25%): sell it only when
+            # it gives back RUNNER_GIVEBACK_PCT points from its peak. Comparable
+            # cycles only, and pct-vs-pct-peak, so a cross-baseline (estimate-vs-
+            # quote) cycle can never manufacture a phantom give-back. This still
+            # captures the big continuation days the old flip trail cut short.
+            peak = pos.mfe_pct if pos.mfe_pct is not None else pct
+            if pct <= peak - config.RUNNER_GIVEBACK_PCT:
+                pos.final_exit = {"time": ts, "pct": pct, "mark": mark,
                                   "reason": "runner give-back"}
-                pos.final_pnl_pct = pos.weighted_final(eff)
+                pos.final_pnl_pct = pos.weighted_final(pct)
                 pos.state = "closed"
-                events.append({"type": "runner_trail", "pct": eff,
+                events.append({"type": "runner_trail", "pct": pct,
                                "total_pct": pos.final_pnl_pct, "source": mark_source})
 
     # old-rules shadow on the same prices (for the honest weekly comparison).

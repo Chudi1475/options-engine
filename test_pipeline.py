@@ -58,8 +58,9 @@ def mark(pct):
     return ENTRY * (1 + pct / 100)
 
 
-def feed(pos, when, pct, est_pct=None, flipped=False):
-    return poslib.step(pos, when, mark(pct), "test", est_pct, flipped, BRACKET)
+def feed(pos, when, pct, est_pct=None, flipped=False, comparable=True):
+    return poslib.step(pos, when, mark(pct), "test", est_pct, flipped, BRACKET,
+                       comparable=comparable)
 
 
 # --- scenario 1: half at +25, then let the runner run, exit on give-back ---
@@ -160,6 +161,18 @@ check("S9 expired position not monitored", all(x.id != p_old.id for x in watch)
 check("S9 force-settled with last known price", p_old.state == "closed"
       and "offline" in p_old.final_exit["reason"])
 test_path.unlink()
+
+# --- scenario 10: a non-comparable (estimate-only) cycle must NOT fake a give-back ---
+p = mk_pos()
+feed(p, at(10, 0), 26)            # half at +26 (comparable), peak 26
+feed(p, at(10, 5), 80)            # comparable, peak 80
+evs = feed(p, at(10, 10), 30, est_pct=30.0, comparable=False)  # cross-source read
+check("S10 no give-back on a non-comparable cycle",
+      evs == [] and p.state == "half_sold")
+check("S10 peak not moved by a non-comparable cycle", abs(p.mfe_pct - 80) < 0.01)
+evs = feed(p, at(10, 15), 38)     # comparable: 80-38=42 >= 40 -> give-back
+check("S10 give-back fires on the next comparable cycle",
+      [e["type"] for e in evs] == ["runner_trail"])
 
 # --- sizing math ---
 alloc = config.suggested_alloc_pct(1.0)

@@ -103,6 +103,48 @@ def all_hot(watchlist: dict, ttl=CACHE_SECONDS) -> list:
     return out
 
 
+def _cached2(key, fn, ttl=CACHE_SECONDS):
+    """Like _cached but also returns fetched_ok=False when the live fetch raised
+    and we fell back to stale/empty. Shares the same cache keys as _cached, so a
+    healthy fetch here warms the regular path too. A fresh cache hit counts ok."""
+    hit = _cache.get(key)
+    if hit and time_mod.time() - hit[0] < ttl:
+        return hit[1], True
+    try:
+        val = fn()
+    except Exception:
+        return (hit[1] if hit else []), False
+    _cache[key] = (time_mod.time(), val)
+    return val, True
+
+
+def all_hot_healthy(watchlist: dict, ttl=CACHE_SECONDS):
+    """Same hot (outlet, title) list as all_hot, PLUS all_ok=False if ANY feed's
+    live fetch failed (fell back to stale/empty). The breaking-news seeder uses
+    this so the day is only marked seeded once every feed has truly fetched —
+    otherwise a feed that recovers later replays its pre-startup headlines as
+    false BREAKING alerts."""
+    feeds = []
+    for name, url in MARKET_FEEDS:
+        titles, ok = _cached2(f"m:{name}", lambda u=url: _fetch_titles(u), ttl)
+        feeds.append((name, titles, ok))
+    outlet, url = TICKER_FEED
+    for tk in watchlist:
+        if tk == "SPX":
+            continue
+        titles, ok = _cached2(f"t:{tk}",
+                              lambda s=tk: _fetch_titles(url.format(sym=s)), ttl)
+        feeds.append((outlet, titles, ok))
+    out, seen, all_ok = [], set(), True
+    for outlet, titles, ok in feeds:
+        all_ok = all_ok and ok
+        for t in titles:
+            if t and t not in seen and HOT_WORDS.search(t):
+                seen.add(t)
+                out.append((outlet, t))
+    return out, all_ok
+
+
 def next_earnings(ticker: str):
     """Next scheduled earnings date for a stock, or None (indexes have none)."""
     if ticker.startswith("^") or ticker == "SPX":

@@ -109,8 +109,8 @@ Hard rules:
   a few sentences unless they ask for detail.
 - Chart screenshots: describe what you actually see (trend, levels,
   candles) and connect it to the bot's strategy: 15-minute momentum turns,
-  morning entry window 9:45-10:30 ET, sell half +25%, momentum-flip trail,
-  -70% stop.
+  morning entry window 9:45-10:30 ET, sell half +25%, then let the runner run
+  and sell it when it gives back ~40 points from its peak, -70% stop.
 - The bot's commands are /setaccount /risk /status /score /test /help —
   point to them when relevant."""
 

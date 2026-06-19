@@ -46,7 +46,7 @@ import telegram
 from backtest import expiry_for, realized_vol
 from data_feed import DataFeed
 from positions import Position, PositionBook
-from strategy import Setup, StrategyConfig, detect_setup, momentum_pct
+from strategy import Setup, StrategyConfig, detect_setup
 
 ET = ZoneInfo("America/New_York")
 SESSION_END = time(16, 12)      # loop exits after settle + weekly are done
@@ -120,7 +120,11 @@ class Service:
             print(f"\n{text}\n")
             log_alert(text, ["dry-run, not sent"])
             return []
-        errors = telegram.send(text)
+        try:
+            errors = telegram.send(text)
+        except RuntimeError as e:  # e.g. no chat IDs configured — fail LOUD and
+            print(f"send failed ({e}) — queueing for retry")  # queue, don't drop
+            errors = [str(e)]
         log_alert(text, errors)
         if errors:
             # a network blip must not eat a STOP text — queue it for retry.
@@ -260,7 +264,8 @@ class Service:
         if config.paper_mode():
             card += "\n[PAPER MODE is ON — cards are practice, not trades.]"
         self.notify(card)
-        config.state_set("morning_sent", str(today))
+        if not self.dry:  # dry-run must not set the live morning dedup key
+            config.state_set("morning_sent", str(today))
 
     # ---------- telegram commands ----------
 
@@ -585,7 +590,8 @@ class Service:
         # recoverable — instead of an alerted-but-untracked one that would
         # re-fire a duplicate BUY next cycle and never get exit alerts.
         self.book.add(pos)
-        record_alert(setup, now, display)
+        if not self.dry:  # dry-run must not poison the shared legacy-alert log
+            record_alert(setup, now, display)
         errors = self.notify(card)  # sends the moment it's recorded
         print(f"{now:%H:%M:%S} alert sent: {setup.ticker} {setup.strike:g} "
               f"{setup.direction} entry ${entry_mid:.2f} ({entry_source})"
@@ -730,15 +736,15 @@ class Service:
         silently (the morning report covered those)."""
         now = et_now()
         ttl = max(5, config.NEWS_POLL_SECONDS - 2)  # refetch nearly every pass
-        hot = news.all_hot(self.cfg.watchlist, ttl=ttl)
+        hot, all_ok = news.all_hot_healthy(self.cfg.watchlist, ttl=ttl)
         seen, seen_date = self._load_news_seen()
         first_seed = seen_date != str(now.date())
         fresh = [(o, t) for o, t in hot if t not in seen]
         if first_seed:  # day's first pass: seed ALL current headlines silently
-            if not hot:
-                # a failed/empty fetch must NOT mark the day seeded — otherwise
-                # when the feeds recover, this morning's real (pre-startup)
-                # headlines look 'fresh' and fire as false BREAKING alerts.
+            if not all_ok:
+                # only seed once EVERY feed has truly fetched. A partial fetch
+                # (some feeds down) must NOT mark the day seeded, or a recovering
+                # feed's real pre-startup headlines later fire as false BREAKING.
                 return
             self._save_news_seen((seen + [t for _, t in fresh])[-300:],
                                  str(now.date()))
@@ -831,8 +837,8 @@ class Service:
             return
         errors = self.notify(scoreboard.weekly_report(
             self.book, self.backtest_old, self.backtest_new, now.date()))
-        if not errors:  # only mark sent when it actually went out
-            config.state_set("weekly_sent", key)
+        if not errors and not self.dry:  # only mark sent when it really went out
+            config.state_set("weekly_sent", key)            # (and never in dry)
 
     # ---------- main loops ----------
 
@@ -844,8 +850,8 @@ class Service:
               f"{self.cfg.entry_start}-{self.cfg.entry_end} ET, polling every "
               f"{config.POLL_SECONDS}s. Watchlist: {', '.join(self.cfg.watchlist)}. "
               f"Min win rate {config.MIN_WINRATE:.0f}%. Exits: half at "
-              f"+{config.TP_HALF_PCT:g}%, momentum-flip trail, stop "
-              f"{config.STOP_PCT:g}%. Being picky — no forced trades.")
+              f"+{config.TP_HALF_PCT:g}%, give-back {config.RUNNER_GIVEBACK_PCT:g} "
+              f"off peak, stop {config.STOP_PCT:g}%. Being picky — no forced trades.")
         if self.backtest_old is None:
             print("WARNING: reports/backtest_results.json missing — the bot "
                   "will not send entry alerts without real backtest stats.")
@@ -899,6 +905,8 @@ class Service:
                         self.run_session()
                         continue
                 self.flush_pending()
+                self.maybe_recap(now)   # catch-up: a recap missed/STALE during
+                                        # the 16:05-16:12 window still goes out
                 self.maybe_weekly(now)  # weekend catch-up
                 self.handle_commands(timeout=45)  # long-poll, responsive + cheap
             except Exception as e:
