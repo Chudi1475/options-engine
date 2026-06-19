@@ -27,6 +27,7 @@ ENTRY = 4.00
 # test validates the exit MECHANISM regardless of how the live config is tuned.
 config.STOP_PCT = -30.0
 config.TP_HALF_PCT = 25.0
+config.RUNNER_GIVEBACK_PCT = 40.0
 
 failures = []
 
@@ -61,7 +62,7 @@ def feed(pos, when, pct, est_pct=None, flipped=False):
     return poslib.step(pos, when, mark(pct), "test", est_pct, flipped, BRACKET)
 
 
-# --- scenario 1: half at +25, then momentum flip ---
+# --- scenario 1: half at +25, then let the runner run, exit on give-back ---
 p = mk_pos()
 evs = feed(p, at(10, 0), 10)
 check("S1 no event at +10%", evs == [] and p.state == "open")
@@ -71,13 +72,14 @@ check("S1 state half_sold", p.state == "half_sold")
 check("S1 old shadow took +15 target", p.old_rules["status"] == "closed"
       and p.old_rules["exit_reason"] == "old target"
       and abs(p.old_rules["exit_pct"] - 26) < 0.01)
-evs = feed(p, at(10, 10), 30, flipped=False)
-check("S1 no flip exit while momentum holds", evs == [])
-check("S1 MFE tracked", abs(p.mfe_pct - 30) < 0.01)
-evs = feed(p, at(10, 30), 18, flipped=True)
-check("S1 momentum_flip fires", [e["type"] for e in evs] == ["momentum_flip"])
-check("S1 weighted final 0.5*26 + 0.5*18 = 22",
-      abs(p.final_pnl_pct - 22.0) < 0.01, f"got {p.final_pnl_pct}")
+evs = feed(p, at(10, 10), 70)
+check("S1 runner runs (no give-back near the peak)", evs == [])
+check("S1 MFE tracked", abs(p.mfe_pct - 70) < 0.01)
+evs = feed(p, at(10, 30), 28)
+check("S1 runner give-back fires (peak 70 -> 28 = 42 back >= 40)",
+      [e["type"] for e in evs] == ["runner_trail"])
+check("S1 weighted final 0.5*26 + 0.5*28 = 27",
+      abs(p.final_pnl_pct - 27.0) < 0.01, f"got {p.final_pnl_pct}")
 
 # --- scenario 2: straight stop; old shadow keeps running after ---
 p = mk_pos()
@@ -124,12 +126,14 @@ p = mk_pos()
 evs = feed(p, at(10, 0), 10, flipped=True)
 check("S6 flip before half target does nothing", evs == [] and p.state == "open")
 
-# --- scenario 7: put direction mirrors ---
+# --- scenario 7: put direction mirrors (give-back trail) ---
 p = mk_pos(direction="put")
-feed(p, at(10, 0), 26)
-evs = feed(p, at(10, 10), 12, flipped=True)
-check("S7 put trail exit works", p.state == "closed"
-      and abs(p.final_pnl_pct - 19.0) < 0.01)
+feed(p, at(10, 0), 26)            # half at +26, peak 26
+feed(p, at(10, 5), 60)            # runner runs, peak 60
+evs = feed(p, at(10, 10), 18)     # 60 - 18 = 42 >= 40 -> give-back
+check("S7 put runner give-back works", p.state == "closed"
+      and [e["type"] for e in evs] == ["runner_trail"]
+      and abs(p.final_pnl_pct - 22.0) < 0.01)
 
 # --- scenario 8: persistence round-trip ---
 test_path = config.DATA_DIR / "positions_test.json"
@@ -184,8 +188,8 @@ for fn, ev in ((cards.half_card, {"pct": 27.0, "source": "q"}),
                (cards.expiry_card, {"pct": -8.0, "source": "q"})):
     check(f"{fn.__name__} renders", "Your call." in fn(p, ev))
 p.half_exit = {"time": "10:05:00", "pct": 27.0, "mark": 5.08}
-check("flip_card renders", "Your call." in
-      cards.flip_card(p, {"pct": 18.0, "total_pct": 22.5, "source": "q"}))
+check("trail_card renders", "Your call." in
+      cards.trail_card(p, {"pct": 18.0, "total_pct": 22.5, "source": "q"}))
 for m in ("green", "yellow", "red"):
     check(f"morning card renders ({m})", "RISK MODE" in
           cards.morning_card(m, "reason here", TODAY))

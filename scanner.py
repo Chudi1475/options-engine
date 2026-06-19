@@ -5,7 +5,7 @@ NEVER places orders. Every alert is a suggestion ending "Your call."
 What runs when (all times ET):
     9:45-10:30   entry window — detect_setup() fires the entry cards
     9:45-16:00   every open position is checked each cycle:
-                 SELL HALF at +25% -> trail until momentum flips -> stop -30%
+                 SELL HALF at +25% -> let the runner run (give-back trail) -> stop
     15:45        "close before expiry" warning for anything expiring today
     16:00        expiring positions are settled for the scoreboard
     Fri 16:05    weekly scoreboard report
@@ -666,15 +666,11 @@ class Service:
         if not comparable and est_pct is None and not near_expiry:
             return
 
-        flipped = False
-        if pos.state == "half_sold" and bars is not None and not bars.empty:
-            mom = momentum_pct(bars, self.cfg)
-            if mom is not None:
-                flipped = mom < 0 if pos.direction == "call" else mom > 0
-
-        events = poslib.step(pos, now, mark, source, est_pct, flipped,
+        # runner exit is now a give-back trail (positions.step), not a momentum
+        # flip, so we no longer need the 15-min momentum read here.
+        events = poslib.step(pos, now, mark, source, est_pct, False,
                              self.old_bracket, comparable=comparable)
-        builders = {"sell_half": cards.half_card, "momentum_flip": cards.flip_card,
+        builders = {"sell_half": cards.half_card, "runner_trail": cards.trail_card,
                     "stop": cards.stop_card, "expiry_warn": cards.expiry_card}
         # send/queue the exit alert BEFORE persisting the closed state: a crash
         # in between then re-evaluates next cycle (at worst a duplicate) instead
@@ -945,8 +941,8 @@ class Service:
             cards.half_card(pos, {"pct": 27.3, "source": src}),
         ]
         pos.half_exit = {"time": "10:05:00", "pct": 27.3, "mark": 5.60}
-        msgs.append(cards.flip_card(pos, {"pct": 18.0, "total_pct": 22.7,
-                                          "source": src}))
+        msgs.append(cards.trail_card(pos, {"pct": 18.0, "total_pct": 22.7,
+                                           "source": src}))
         msgs.append(cards.stop_card(pos, {"pct": -31.2, "source": src}))
         msgs.append(cards.expiry_card(pos, {"pct": -8.0, "source": src}))
         for i, msg in enumerate(msgs, 1):

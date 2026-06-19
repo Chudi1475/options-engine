@@ -136,8 +136,9 @@ def weekly_report(book: PositionBook, backtest_old, backtest_new,
                 "(how high trades got before we left)")
         add("")
         new_total = sum(p.final_pnl_pct for p in week)
-        add(f"NEW exit rules (half at +{config.TP_HALF_PCT:g} → ride till "
-            f"momentum flips → stop {config.STOP_PCT:g}):")
+        add(f"NEW exit rules (half at +{config.TP_HALF_PCT:g} → let the runner "
+            f"give back {config.RUNNER_GIVEBACK_PCT:g} off peak → stop "
+            f"{config.STOP_PCT:g}):")
         add(f"  this week: {new_total:+.0f}% (adding up each trade's %)")
         both = [p for p in week if p.old_rules.get("exit_pct") is not None]
         if both:

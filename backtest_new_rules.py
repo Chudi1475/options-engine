@@ -1,8 +1,9 @@
 """Backtest of the NEW exit system on the exact same entries as backtest.py:
 
     sell HALF at +TP_HALF_PCT (+25%)
-    -> trail the remaining half until the 15-min momentum measure flips
-    -> hard stop at STOP_PCT (-30%) any time
+    -> let the runner RUN; sell it when it gives back RUNNER_GIVEBACK_PCT
+       points from its peak
+    -> hard stop at STOP_PCT any time
     -> close at session end / expiry
 
 Same honesty rules as backtest.py: approximated Black-Scholes pricing
@@ -46,16 +47,20 @@ def momentum_at(day_bars: pd.DataFrame, ts, mom_bars: int):
 
 def simulate_new_exits(bars_all, entry_ts, entry_prem, strike, right,
                        sigma, expiry, cfg):
-    """Walk forward bar by bar applying the new exit framework."""
+    """Walk forward bar by bar applying the live exit framework: sell HALF at
+    +25%, then let the runner RUN and sell it only when it gives back
+    RUNNER_GIVEBACK_PCT points from its peak; hard stop; time stop."""
     future = bars_all[(bars_all.index > entry_ts)
                       & (bars_all.index <= pd.Timestamp(expiry))]
-    legs, remaining, half_taken, last = [], CONTRACTS, False, None
+    legs, remaining, half_taken, last, peak = [], CONTRACTS, False, None, None
+    give = config.RUNNER_GIVEBACK_PCT
     for ts, row in future.iterrows():
         S = float(row["Close"])
         prem_net = bs_price(S, strike, years_to_expiry(ts.to_pydatetime(), expiry),
                             sigma, right) * (1 - SLIPPAGE)
         ret = (prem_net / entry_prem - 1) * 100
         last = (ts, prem_net)
+        peak = ret if peak is None else max(peak, ret)
         if ret <= config.STOP_PCT:
             legs.append((ts, prem_net, remaining, f"stop {config.STOP_PCT:g}%"))
             return legs
@@ -64,14 +69,10 @@ def simulate_new_exits(bars_all, entry_ts, entry_prem, strike, right,
             legs.append((ts, prem_net, half, f"half +{config.TP_HALF_PCT:g}%"))
             remaining -= half
             half_taken = True
-            continue  # the flip check starts on the NEXT bar
-        if half_taken:
-            day_bars = bars_all[bars_all.index.date == ts.date()]
-            mom = momentum_at(day_bars, ts, cfg.mom_bars)
-            if mom is not None and ((right == "C" and mom < 0)
-                                    or (right == "P" and mom > 0)):
-                legs.append((ts, prem_net, remaining, "momentum flip"))
-                return legs
+            continue  # start trailing the runner on the NEXT bar
+        if half_taken and ret <= peak - give:
+            legs.append((ts, prem_net, remaining, f"give-back {give:g} off peak"))
+            return legs
     if last is not None and remaining > 0:
         legs.append((last[0], last[1], remaining, "time stop"))
     return legs
@@ -152,7 +153,8 @@ def main():
              "1.5% each way + $1.30/contract/side included. Same entries as "
              "backtest.py; only the exits differ:", "",
              f"- sell half at **+{config.TP_HALF_PCT:g}%**",
-             "- trail the rest until the **15-min momentum flips** against the trade",
+             f"- let the runner RUN, sell it when it **gives back "
+             f"{config.RUNNER_GIVEBACK_PCT:g} points** from its peak",
              f"- hard stop **{config.STOP_PCT:g}%**",
              "- close at session end / expiry", ""]
     lines += fmt(overall, "All trades")
@@ -180,7 +182,8 @@ def main():
     (REPORTS_DIR / "backtest_new_rules.json").write_text(json.dumps({
         "pricing": "approximated (Black-Scholes, realized vol)",
         "rules": {"tp_half_pct": config.TP_HALF_PCT, "stop_pct": config.STOP_PCT,
-                  "trail": "momentum flip (15-min measure)"},
+                  "runner_giveback_pct": config.RUNNER_GIVEBACK_PCT,
+                  "trail": f"give-back {config.RUNNER_GIVEBACK_PCT:g} off peak"},
         "overall": overall,
         "per_setup": per_setup,
     }, indent=2), encoding="utf-8")

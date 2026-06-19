@@ -117,12 +117,12 @@ def position_story(p):
         story = (f"It hit the {config.STOP_PCT:g}% stop at {_t(exit_t)}. "
                  f"Why it failed: {why}. The stop did its job — it kept a bad "
                  f"trade small.{peaked}")
-    elif reason == "momentum flip":
+    elif reason in ("momentum flip", "runner give-back"):
         h = p.half_exit or {}
         story = (f"We banked HALF at {h.get('pct', 0):+.0f}% at "
-                 f"{_t(h.get('time', exit_t))}, rode the rest until the "
-                 f"momentum died, and sold the remainder at "
-                 f"{(p.final_exit or {}).get('pct', 0):+.0f}% at {_t(exit_t)}. "
+                 f"{_t(h.get('time', exit_t))}, let the rest RUN, and sold the "
+                 f"remainder at {(p.final_exit or {}).get('pct', 0):+.0f}% at "
+                 f"{_t(exit_t)} once it gave back from its peak. "
                  f"Whole trade: {total:+.0f}%.")
     elif "expir" in reason:
         h_note = (f" (half was banked at {p.half_exit['pct']:+.0f}% earlier)"
@@ -298,8 +298,9 @@ def main(require_date=None):
 
     lines.append("")
     lines.append(f"Tomorrow: same plan. Wait for the text, sell half at "
-                 f"+{config.TP_HALF_PCT:g}%, sell the rest when I say the "
-                 f"momentum flipped, and honor the {config.STOP_PCT:g}% stop.")
+                 f"+{config.TP_HALF_PCT:g}%, let the rest run and sell when I say "
+                 f"it gave back from its peak, and honor the "
+                 f"{config.STOP_PCT:g}% stop.")
     msg = "\n".join(lines)
     if dry:
         print(msg)

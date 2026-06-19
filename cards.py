@@ -145,7 +145,8 @@ def entry_card(setup, pos, quote, stats: dict, risk_mode: str,
     lines.append("")
     lines.append("EXIT PLAN — I'll text you each step:")
     lines.append(f"1️⃣ SELL HALF at +{config.TP_HALF_PCT:g}%")
-    lines.append("2️⃣ momentum flips → I text you → sell the rest")
+    lines.append("2️⃣ let the rest RUN — I text you to sell when it gives back "
+                 "from its peak")
     lines.append(f"3️⃣ STOP: {config.STOP_PCT:g}% → sell everything")
     if expiry == today:
         lines.append(f"4️⃣ expires today → I warn you "
@@ -172,11 +173,11 @@ def half_card(pos, ev: dict) -> str:
     ])
 
 
-def flip_card(pos, ev: dict) -> str:
+def trail_card(pos, ev: dict) -> str:
     half_pct = pos.half_exit["pct"] if pos.half_exit else 0.0
     return "\n".join([
-        f"{_paper(pos)}🔄 MOMENTUM FLIPPED — SELL REMAINING",
-        f"{contract_str(pos)}: the 15-min momentum just turned against the trade.",
+        f"{_paper(pos)}🔄 LOCK IN THE RUNNER — SELL REMAINING",
+        f"{contract_str(pos)}: the runner gave back enough off its peak — bank it.",
         f"Remaining half is at {ev['pct']:+.0f}% ({ev['source']}).",
         f"Whole trade: about {ev['total_pct']:+.0f}% "
         f"(half banked at {half_pct:+.0f}%, half here).",

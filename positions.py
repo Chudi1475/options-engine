@@ -128,13 +128,19 @@ def step(pos: Position, now: datetime, mark: float, mark_source: str,
             pos.half_exit = {"time": ts, "pct": pct, "mark": mark}
             pos.state = "half_sold"
             events.append({"type": "sell_half", "pct": pct, "source": mark_source})
-        elif pos.state == "half_sold" and flipped:
-            pos.final_exit = {"time": ts, "pct": eff, "mark": mark,
-                              "reason": "momentum flip"}
-            pos.final_pnl_pct = pos.weighted_final(eff)
-            pos.state = "closed"
-            events.append({"type": "momentum_flip", "pct": eff,
-                           "total_pct": pos.final_pnl_pct, "source": mark_source})
+        elif pos.state == "half_sold":
+            # let the runner RUN (half is already banked at +25%): sell it only
+            # when it gives back RUNNER_GIVEBACK_PCT points from its peak. This
+            # captures the big continuation days the old momentum-flip trail was
+            # cutting short. `flipped` is kept for signature/back-compat only.
+            peak = pos.mfe_pct if pos.mfe_pct is not None else eff
+            if eff <= peak - config.RUNNER_GIVEBACK_PCT:
+                pos.final_exit = {"time": ts, "pct": eff, "mark": mark,
+                                  "reason": "runner give-back"}
+                pos.final_pnl_pct = pos.weighted_final(eff)
+                pos.state = "closed"
+                events.append({"type": "runner_trail", "pct": eff,
+                               "total_pct": pos.final_pnl_pct, "source": mark_source})
 
     # old-rules shadow on the same prices (for the honest weekly comparison).
     # Only advance it on a comparable mark — a cross-source ratio would rig it.

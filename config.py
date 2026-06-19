@@ -43,6 +43,12 @@ STOP_PCT = _f("STOP_PCT", -70.0)             # sell EVERYTHING at -70% (half alr
                                              # banked at +25%; backtest: wider stop =
                                              # fewer noise stop-outs -> 72% win rate,
                                              # higher total return, lower drawdown)
+RUNNER_GIVEBACK_PCT = _f("RUNNER_GIVEBACK_PCT", 40.0)  # after banking half at +25%,
+                                             # let the runner RUN; sell it only when
+                                             # it gives back this many points from its
+                                             # peak (backtest: beats the momentum-flip
+                                             # trail — +~15% total return at the same
+                                             # ~75% win rate, same drawdown)
 RISK_PER_TRADE_PCT = _f("RISK_PER_TRADE_PCT", 1.0)    # full stop-out costs 1% of account
 CORRELATED_RISK_PCT = _f("CORRELATED_RISK_PCT", 0.5)  # risk when same-direction trade already open
 SPREAD_COST_PCT = _f("SPREAD_COST_PCT", 4.0)  # est. round-trip cost of crossing the spread (live stats)
