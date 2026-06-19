@@ -129,9 +129,11 @@ def weekly_report(book: PositionBook, backtest_old, backtest_new,
             f"{sum(1 for p in week if p.final_pnl_pct <= 0)} losses)")
         add(f"Average win: {s['avg_win_pct']:+.0f}% | "
             f"Average loss: {s['avg_loss_pct']:+.0f}%")
-        avg_peak = sum(p.mfe_pct for p in week) / len(week)
-        add(f"Average peak before exit: {avg_peak:+.0f}% "
-            "(how high trades got before we left)")
+        peaks = [p.mfe_pct for p in week if p.mfe_pct is not None]
+        if peaks:
+            avg_peak = sum(peaks) / len(peaks)
+            add(f"Average peak before exit: {avg_peak:+.0f}% "
+                "(how high trades got before we left)")
         add("")
         new_total = sum(p.final_pnl_pct for p in week)
         add(f"NEW exit rules (half at +{config.TP_HALF_PCT:g} → ride till "

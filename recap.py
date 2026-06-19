@@ -218,7 +218,7 @@ def market_story(spx_day):
             f"High of the day came at {hi_t} ET, low at {lo_t} ET.")
 
 
-def main():
+def main(require_date=None):
     dry = "--dry-run" in sys.argv
     cfg = StrategyConfig()
     backtest = load_report("backtest_results.json")
@@ -226,6 +226,13 @@ def main():
 
     spx = fetch_5m("^GSPC")
     session = max(set(spx.index.date))
+    # don't grade/suppress the wrong day: if the caller wants today's recap but
+    # yfinance hasn't published today's session yet, bail so the caller retries
+    # later instead of texting a stale-day recap and marking today done.
+    if require_date is not None and str(session) != str(require_date) and not dry:
+        print(f"recap: latest session data is {session}, not {require_date} — "
+              "yfinance not caught up; skipping so we don't grade the wrong day.")
+        return "STALE"
     spx_day = spx[spx.index.date == session]
     day_name = pd.Timestamp(session).strftime("%A %#m/%#d") if sys.platform.startswith("win") \
         else pd.Timestamp(session).strftime("%A %-m/%-d")

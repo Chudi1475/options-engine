@@ -126,9 +126,13 @@ class Service:
             # a network blip must not eat a STOP text — queue it for retry.
             # (Retries go to all chats, so a partial failure can duplicate a
             # message for whoever already got it. Duplicate beats missing.)
-            pending = config.state_get("pending_sends", [])
-            pending.append({"text": text, "tries": 0})
-            config.state_set("pending_sends", pending[-50:])
+            # Atomic append: the news thread and main loop both enqueue here, so
+            # a plain get-then-set would let one thread's queued alert clobber
+            # the other's during an outage.
+            config.state_update(
+                "pending_sends",
+                lambda cur: ((cur or []) + [{"text": text, "tries": 0}])[-50:],
+                default=[])
             print(f"send failed, queued for retry: {errors}")
         return errors
 
@@ -144,18 +148,26 @@ class Service:
         pending = config.state_get("pending_sends", [])
         if not pending:
             return
-        remaining = []
+        n = len(pending)
+        keep = []  # originals still failing and under the retry cap
         for item in pending:
             if isinstance(item, str):  # migrate legacy string-only entries
                 item = {"text": item, "tries": 0}
             if telegram.send("(retry) " + item["text"]):
                 item["tries"] = item.get("tries", 0) + 1
                 if item["tries"] < self.MAX_SEND_RETRIES:
-                    remaining.append(item)
+                    keep.append(item)
                 else:
                     print(f"dropping undeliverable alert after "
                           f"{self.MAX_SEND_RETRIES} tries: {item['text'][:60]}")
-        config.state_set("pending_sends", remaining)
+        # Atomically replace ONLY the items we just processed (the first n).
+        # Anything the news thread enqueued meanwhile is at cur[n:] and is kept,
+        # so a concurrent enqueue is never overwritten/lost.
+        def _merge(cur):
+            cur = cur or []
+            extra = cur[n:] if len(cur) >= n else []
+            return (keep + extra)[-50:]
+        config.state_update("pending_sends", _merge, default=[])
 
     def reset_day(self, now: datetime):
         if self.day != now.date():
@@ -473,8 +485,17 @@ class Service:
                 continue
             if setup is None:
                 continue
+            # A setup whose DIRECTION isn't the one we trade for this ticker
+            # (e.g. an early SPX:put on a weak open, before the tape turns up to
+            # the SPX:call we actually trade) is NOT a decision for the day —
+            # momentum routinely flips to the allowed side later in the window.
+            # Just wait and re-check next cycle; do NOT burn the ticker.
+            if f"{setup.ticker}:{setup.direction}" not in self.ALLOWED_SETUPS:
+                continue
             if self.gate_stats(setup) is None:
-                self.skipped_today.add(ticker)  # final decision for the day
+                # allowed direction, but it failed the win-rate/expectancy bar:
+                # THAT is final for the day.
+                self.skipped_today.add(ticker)
                 continue
             try:
                 did_open = self.open_position(setup, now)
@@ -559,9 +580,13 @@ class Service:
                 pass
         card = cards.entry_card(setup, pos, quote, display, mode, mode_reason,
                                 expiry_date, now.date(), news_lines=news_lines)
-        errors = self.notify(card)  # sends the moment it's seen
-        record_alert(setup, now, display)
+        # persist FIRST, then alert. A crash in between then leaves a tracked
+        # (still-monitored) position that merely missed its entry card —
+        # recoverable — instead of an alerted-but-untracked one that would
+        # re-fire a duplicate BUY next cycle and never get exit alerts.
         self.book.add(pos)
+        record_alert(setup, now, display)
+        errors = self.notify(card)  # sends the moment it's recorded
         print(f"{now:%H:%M:%S} alert sent: {setup.ticker} {setup.strike:g} "
               f"{setup.direction} entry ${entry_mid:.2f} ({entry_source})"
               + (f" errors: {errors}" if errors else ""))
@@ -613,18 +638,32 @@ class Service:
                                         pos.expires_on())
         # mark preference: real bid/ask > fresh estimate > stale last trade
         if quote is not None and quote.bid > 0:
-            mark, source = quote.mid, quote.source
+            mark, source, usable = quote.mid, quote.source, True
         elif est > 0:
-            mark, source = est, "estimated from the stock move"
+            mark, source, usable = est, "estimated from the stock move", True
         elif quote is not None and quote.mid > 0:
-            mark, source = quote.mid, quote.source
+            mark, source, usable = quote.mid, quote.source, True
         else:
-            return
-        # never drive stop/half off a BS estimate divided by a REAL-quote entry:
-        # the model-vs-quote gap reads as a fake -30%+ and fires a phantom SELL.
-        # If entered on a real quote but only an estimate is available now, skip
-        # this cycle rather than act on a biased number.
-        if source.startswith("estimat") and pos.entry_source == "quote":
+            # no fresh option price this cycle (0DTE chains routinely go bid-less
+            # near the bell). Fall back to the last known price so the time-based
+            # 'close before expiry' warning + 16:00 settle can still fire.
+            mark = pos.last_mark if pos.last_mark is not None else pos.entry_mid
+            source, usable = "last known price (no live quote)", False
+
+        # Is this mark priced the same WAY as entry (quote-vs-quote / est-vs-est)?
+        # A BS estimate over a real-quote entry (or vice versa) reads as a fake
+        # ±30% and would fire a phantom exit. When the source TYPE differs (or we
+        # only have a stale fallback), step() leans on the model-to-model est_pct
+        # for the stop and refuses to trip the +25% half off the bad number.
+        mark_is_est = source.startswith("estimat")
+        entry_is_est = (pos.entry_source != "quote")
+        comparable = usable and (mark_is_est == entry_is_est)
+
+        near_expiry = (pos.expires_on() == now.date()
+                       and now.time() >= poslib.WARN_T)
+        # nothing trustworthy to act on (no comparable mark AND no model signal)
+        # and not at the bell -> skip the cycle rather than act on a biased number
+        if not comparable and est_pct is None and not near_expiry:
             return
 
         flipped = False
@@ -634,13 +673,16 @@ class Service:
                 flipped = mom < 0 if pos.direction == "call" else mom > 0
 
         events = poslib.step(pos, now, mark, source, est_pct, flipped,
-                             self.old_bracket)
-        self.book.save()
+                             self.old_bracket, comparable=comparable)
         builders = {"sell_half": cards.half_card, "momentum_flip": cards.flip_card,
                     "stop": cards.stop_card, "expiry_warn": cards.expiry_card}
+        # send/queue the exit alert BEFORE persisting the closed state: a crash
+        # in between then re-evaluates next cycle (at worst a duplicate) instead
+        # of recording 'closed' with the STOP/SELL text never sent.
         for ev in events:
             self.notify(builders[ev["type"]](pos, ev))
             print(f"{now:%H:%M:%S} {pos.ticker}: {ev['type']} at {ev['pct']:+.1f}%")
+        self.book.save()
 
     # ---------- breaking news (own thread, instant-send) ----------
 
@@ -697,6 +739,11 @@ class Service:
         first_seed = seen_date != str(now.date())
         fresh = [(o, t) for o, t in hot if t not in seen]
         if first_seed:  # day's first pass: seed ALL current headlines silently
+            if not hot:
+                # a failed/empty fetch must NOT mark the day seeded — otherwise
+                # when the feeds recover, this morning's real (pre-startup)
+                # headlines look 'fresh' and fire as false BREAKING alerts.
+                return
             self._save_news_seen((seen + [t for _, t in fresh])[-300:],
                                  str(now.date()))
             return  # never replay headlines that predate startup
@@ -728,8 +775,15 @@ class Service:
                           "this headline mean for SPX/QCOM/TSLA trades today? "
                           f"Headline: {title}")},
                 self.status_text(), tools_enabled=False)
-            if take and "error" not in take.lower():
-                return take
+            # only forward a genuine model answer. assistant.respond returns
+            # several failure strings that DON'T contain 'error' ("My brain
+            # couldn't connect…", "came back empty…") — those must never reach
+            # members as a "Quick read".
+            if take:
+                low = take.lower()
+                if ("error" not in low and not low.startswith("my brain")
+                        and "came back empty" not in low):
+                    return take
         except Exception:
             pass
         return None
@@ -741,15 +795,32 @@ class Service:
         so the cloud needs no separate scheduled task."""
         if self.dry or now.weekday() >= 5 or now.time() < WEEKLY_AT:
             return
-        if config.state_get("recap_sent") == str(now.date()):
+        today = str(now.date())
+        if config.state_get("recap_sent") == today:
             return
         try:
             import recap
-            errs = recap.main()
-            if errs:  # telegram.send returns errors, it does NOT raise — so
-                print(f"{now:%H:%M:%S} recap send failed, will retry: {errs}")
-            else:     # only mark sent on real success, else it never retries
-                config.state_set("recap_sent", str(now.date()))
+            errs = recap.main(require_date=today)
+            if errs == "STALE":
+                # yfinance hasn't published today's session yet — don't send a
+                # wrong-day recap and don't mark sent; just retry next pass.
+                print(f"{now:%H:%M:%S} recap data not caught up to {today} yet; will retry")
+                return
+            if not errs:
+                config.state_set("recap_sent", today)
+                return
+            # delivery errors: retry a BOUNDED number of times, then mark sent so
+            # one permanently-unreachable member can't re-broadcast the full
+            # recap to everyone else every cycle for the next 7 minutes.
+            tries = config.state_get("recap_tries", {})
+            n = (tries.get(today, 0) if isinstance(tries, dict) else 0) + 1
+            if n >= 2:
+                config.state_set("recap_sent", today)
+                print(f"{now:%H:%M:%S} recap had delivery errors after {n} tries; "
+                      f"marking done to avoid duplicates: {errs}")
+            else:
+                config.state_set("recap_tries", {today: n})
+                print(f"{now:%H:%M:%S} recap send had errors, will retry once: {errs}")
         except Exception as e:
             print(f"{now:%H:%M:%S} recap failed (will retry): {e}")
 

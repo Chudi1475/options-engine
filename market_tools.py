@@ -135,7 +135,8 @@ def analyze_day(ticker="SPX", date_str=None):
             "final_exit_pct": (p.final_exit or {}).get("pct"),
             "final_reason": (p.final_exit or {}).get("reason"),
             "whole_trade_pct": p.final_pnl_pct,
-            "peak_pct": round(p.mfe_pct), "worst_pct": round(p.mae_pct),
+            "peak_pct": round(p.mfe_pct) if p.mfe_pct is not None else None,
+            "worst_pct": round(p.mae_pct) if p.mae_pct is not None else None,
             "note": "REAL tracked numbers from that day, not an estimate.",
         }
         return overview

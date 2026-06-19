@@ -14,11 +14,14 @@ never promise profits, plain language, "Your call."
 import base64
 import json
 import os
+import threading
 
 import requests
 
 import config
 import telegram
+
+_HISTORY_LOCK = threading.Lock()  # serialize chat_history.json writes
 
 API_URL = "https://api.anthropic.com/v1/messages"
 HISTORY_FILE = config.DATA_DIR / "chat_history.json"
@@ -80,8 +83,8 @@ Scorekeeping — one of your main jobs:
   question instead of guessing. NEVER log a number you aren't sure of.
 - When they ask "what's my record / score / how am I doing", call get_score.
 
-Tickers you're equipped for: SPX, QCOM, TSLA only.
-- If someone asks about ANY other stock or ETF (NVDA, SPY, AAPL, etc.),
+Tickers you're equipped for: SPX, SPY, QCOM, TSLA only.
+- If someone asks about ANY other stock or ETF (NVDA, AAPL, AMD, etc.),
   don't fake a read and don't run market_now/analyze_day on it. Tell them
   straight it's not on the bot's watchlist yet, and ask if they'd like it
   added.
@@ -107,7 +110,7 @@ Hard rules:
 - Chart screenshots: describe what you actually see (trend, levels,
   candles) and connect it to the bot's strategy: 15-minute momentum turns,
   morning entry window 9:45-10:30 ET, sell half +25%, momentum-flip trail,
-  -30% stop.
+  -70% stop.
 - The bot's commands are /setaccount /risk /status /score /test /help —
   point to them when relevant."""
 
@@ -144,7 +147,7 @@ TOOLS = [
                         "15-min momentum, and whether a setup is triggering. "
                         "Use for 'what's happening', 'any setups now'."),
         "input_schema": {"type": "object", "properties": {
-            "ticker": {"type": "string", "description": "SPX, QCOM or TSLA"}}},
+            "ticker": {"type": "string", "description": "SPX, SPY, QCOM or TSLA"}}},
     },
     {
         "name": "analyze_day",
@@ -153,14 +156,14 @@ TOOLS = [
                         "have alerted it, how would the trade have gone. Use for "
                         "'what would have worked Friday', 'break down yesterday'."),
         "input_schema": {"type": "object", "properties": {
-            "ticker": {"type": "string", "description": "SPX, QCOM or TSLA"},
+            "ticker": {"type": "string", "description": "SPX, SPY, QCOM or TSLA"},
             "date": {"type": "string",
                      "description": "the day as YYYY-MM-DD; omit for the last session"}}},
     },
     {
         "name": "request_new_ticker",
         "description": ("Flag a stock/ETF the bot is NOT equipped for (anything "
-                        "other than SPX, QCOM, TSLA) that the user wants added. "
+                        "other than SPX, SPY, QCOM, TSLA) that the user wants added. "
                         "Pings the owner to approve. Call ONLY after the user "
                         "says they'd like it added."),
         "input_schema": {
@@ -212,12 +215,21 @@ def _load_history() -> dict:
 
 
 def _save_turn(chat_id: str, user_text: str, reply: str):
-    hist = _load_history()
-    turns = hist.get(chat_id, [])
-    turns += [{"role": "user", "content": user_text},
-              {"role": "assistant", "content": reply}]
-    hist[chat_id] = turns[-MAX_TURNS * 2:]
-    HISTORY_FILE.write_text(json.dumps(hist, indent=1), encoding="utf-8")
+    # the news-watcher thread calls respond() with chat_id 'newsdesk' for one-off
+    # headline reads — not a real conversation, so don't persist it (this also
+    # keeps that thread off chat_history.json entirely). The lock + atomic
+    # temp-replace stop a concurrent member chat from tearing/clobbering the file.
+    if chat_id == "newsdesk":
+        return
+    with _HISTORY_LOCK:
+        hist = _load_history()
+        turns = hist.get(chat_id, [])
+        turns += [{"role": "user", "content": user_text},
+                  {"role": "assistant", "content": reply}]
+        hist[chat_id] = turns[-MAX_TURNS * 2:]
+        tmp = HISTORY_FILE.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(hist, indent=1), encoding="utf-8")
+        tmp.replace(HISTORY_FILE)
 
 
 def _load_trades() -> dict:
@@ -272,7 +284,7 @@ def score_line(chat_id: str) -> str:
             f"dollars across {s['entries']} logged trades.")
 
 
-SUPPORTED_TICKERS = ("SPX", "QCOM", "TSLA")
+SUPPORTED_TICKERS = ("SPX", "SPY", "QCOM", "TSLA")
 
 
 def _request_ticker(ticker: str, chat_id: str, asked_by: str = "") -> str:

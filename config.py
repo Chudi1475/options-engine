@@ -93,15 +93,24 @@ def save_state(state: dict) -> None:
     # tmp file (which would publish a torn state.json or raise FileNotFoundError)
     with _STATE_LOCK:
         tmp = STATE_FILE.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
         try:
-            tmp.replace(STATE_FILE)
-        except PermissionError:  # another process briefly reading the file
-            import time
-            time.sleep(0.2)
+            tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
             try:
                 tmp.replace(STATE_FILE)
-            except (PermissionError, FileNotFoundError):
+            except (PermissionError, FileNotFoundError):  # mid-read, or the
+                import time                                # volume hiccuped
+                time.sleep(0.2)
+                try:
+                    tmp.replace(STATE_FILE)
+                except (PermissionError, FileNotFoundError) as e:
+                    # don't fail silently — a lost write of a dedup key
+                    # (recap_sent/morning_sent) would duplicate a report
+                    print(f"save_state: could NOT persist state.json: {e}")
+        finally:
+            try:  # never leave an orphan temp file on a failed publish
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
                 pass
 
 
@@ -113,6 +122,18 @@ def state_set(key, value) -> None:
     with _STATE_LOCK:  # load -> mutate -> save is one atomic critical section
         s = load_state()
         s[key] = value
+        save_state(s)
+
+
+def state_update(key, fn, default=None) -> None:
+    """Atomic read-modify-write of one state key: fn(current) -> new value, with
+    the whole get->modify->set under one lock. Use this (not state_get then
+    state_set) whenever two threads mutate the same key — e.g. the main loop and
+    the news-watcher both touching pending_sends — so neither loses the other's
+    update."""
+    with _STATE_LOCK:
+        s = load_state()
+        s[key] = fn(s.get(key, default))
         save_state(s)
 
 
@@ -133,5 +154,5 @@ def account_value():
 
 def suggested_alloc_pct(risk_pct: float) -> float:
     """% of account to put in so a full stop-out costs exactly risk_pct.
-    risk 1% / stop 30% -> ~3.3% of account."""
+    Derived from the live STOP_PCT — e.g. risk 1% / stop 70% -> ~1.43%."""
     return risk_pct / (abs(STOP_PCT) / 100.0)
