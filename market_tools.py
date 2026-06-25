@@ -330,7 +330,7 @@ def macro_read(symbol="gold"):
         "event_warning": event_warning,
         "upcoming_events": events[:4],
         "source": "yfinance, ~15-min delayed (gold = COMEX futures GC=F)",
-        "note": "Read-only market context, NOT a setup from our strategy and NOT "
-                "financial advice. Give an honest read, flag any event_warning, "
+        "disclaimer": "Read-only market context, NOT a setup from our strategy and "
+                "NOT financial advice. Give an honest read, flag any event_warning, "
                 "and end with 'Your call.'",
     }

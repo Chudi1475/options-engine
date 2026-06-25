@@ -529,6 +529,13 @@ class Service:
             return None
         if cmd in ("/calls", "/opt", "/option", "/puts"):
             return self.calls_text(args)
+        if cmd == "/gold":
+            return self.macro_text("gold")
+        if cmd in ("/fx", "/forex"):
+            if args.strip():
+                return self.macro_text(args)
+            return ("Which pair? I read EUR/USD, GBP/USD, USD/JPY, AUD/USD, "
+                    "USD/CAD, USD/CHF.  e.g.  /fx eurusd   (or /gold for gold)")
         if cmd == "/requests":
             import intake
             return intake.list_text()
@@ -555,8 +562,14 @@ class Service:
         if arg.strip():
             t = arg.strip().upper().lstrip("$")
             if t not in self.cfg.watchlist:
-                return (f"{t} isn't on the watchlist. I track {', '.join(wl)} "
-                        "only — ask me to add it and I'll flag it for the boss.")
+                # gold / forex aren't options tickers — give the macro read
+                # instead of a flat rejection (so /calls gold just works)
+                r = market_tools.macro_read(arg)
+                if not r.get("error"):
+                    return cards.macro_line(r)
+                return (f"{t} isn't one I cover. Options setups: {', '.join(wl)}. "
+                        "Or ask about gold or a forex pair (EUR/USD, USD/JPY...), "
+                        "or /gold and /fx.")
             tickers = [t]
         else:
             tickers = wl
@@ -575,6 +588,12 @@ class Service:
         lines.append("BUY = the entry. Sells come as live exit texts. "
                      "/status shows open trades.")
         return "\n".join(lines)
+
+    def macro_text(self, arg: str):
+        """A read on gold or a forex pair (price, day move, momentum, trend,
+        and any high-impact news coming). Used by /gold, /fx, and /calls."""
+        import market_tools
+        return cards.macro_line(market_tools.macro_read(arg))
 
     def cmd_request_status(self, cmd: str, args: str):
         """/approve|/reject|/done <id> [note] — move a request and tell the
