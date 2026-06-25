@@ -549,6 +549,17 @@ class Service:
             return intake.reqfrom_command(args)
         if cmd in ("/help", "/start"):
             return cards.help_card()
+        # bare-symbol shortcut: /spx /qcom /gold /usdjpy /eurusd ... just work.
+        # macro_read returns an error (no network) for anything it doesn't cover,
+        # so an unknown command still falls through to None below.
+        sym = cmd.lstrip("/")
+        if sym.upper() in self.cfg.watchlist:
+            return self.calls_text(sym)
+        if sym:
+            import market_tools
+            r = market_tools.macro_read(sym)
+            if not r.get("error"):
+                return cards.macro_line(r)
         return None  # silently ignore unknown commands
 
     def calls_text(self, arg: str = ""):
