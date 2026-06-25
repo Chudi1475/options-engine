@@ -40,6 +40,27 @@ MACRO_SYMBOLS = {
     "usdchf": ("USD/CHF", "CHF=X", 4), "chf": ("USD/CHF", "CHF=X", 4),
 }
 
+# Popular, heavily-traded stocks + ETFs available as READ-ONLY /command lookups
+# (e.g. /aapl, /calls nvda, "how's apple"). These are NOT alert tickers — the
+# scanner only ever alerts on StrategyConfig.watchlist, so listing them here
+# gives quick reads without ever texting anyone about them. {TICKER: (disp, yf, dp)}
+LOOKUP_STOCKS = {t: (t, t, 2) for t in (
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "AVGO", "NFLX", "AMD", "TSM",
+    "PLTR", "COIN", "MSTR", "SMCI", "SOFI", "BABA", "UBER", "DIS", "JPM", "BAC",
+    "BA", "INTC", "MU", "LLY", "QQQ", "IWM", "DIA", "GLD", "SLV", "ARKK",
+)}
+
+# friendly name -> ticker so a chat like "how's nvidia" resolves
+STOCK_ALIASES = {
+    "apple": "AAPL", "microsoft": "MSFT", "nvidia": "NVDA", "amazon": "AMZN",
+    "google": "GOOGL", "alphabet": "GOOGL", "meta": "META", "facebook": "META",
+    "broadcom": "AVGO", "netflix": "NFLX", "palantir": "PLTR", "coinbase": "COIN",
+    "microstrategy": "MSTR", "supermicro": "SMCI", "alibaba": "BABA",
+    "uber": "UBER", "disney": "DIS", "jpmorgan": "JPM", "boeing": "BA",
+    "intel": "INTC", "micron": "MU", "lilly": "LLY", "nasdaq": "QQQ",
+    "russell": "IWM", "dow": "DIA", "silver": "SLV",
+}
+
 
 def _flatten(df):
     if df is not None and hasattr(df.columns, "levels"):
@@ -254,18 +275,14 @@ def market_now(ticker="SPX"):
     return out
 
 
-def macro_read(symbol="gold"):
-    """Read-only context on GOLD or a major FOREX pair: price, day move, 15-min
-    momentum, recent high/low, and trend vs the 20-day average. Honest real
-    numbers only (yfinance, ~15-min delayed). NOT one of our options setups and
-    NOT financial advice — it's market context the brain turns into an honest
-    read. Forex/gold trade nearly 24h, so there's no 'market closed' gate."""
-    key = (symbol or "").lower().replace("/", "").replace(" ", "").replace("$", "").strip()
-    info = MACRO_SYMBOLS.get(key)
-    if not info:
-        return {"error": f"'{symbol}' isn't one I read yet. I cover gold and the "
-                "major FX pairs: EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, USD/CHF."}
-    disp, yfs, dec = info
+def _norm(symbol: str) -> str:
+    return (symbol or "").lower().replace("/", "").replace(" ", "").replace("$", "").strip()
+
+
+def _do_read(disp, yfs, dec, kind, event_ccy, source):
+    """Shared read engine for gold / forex / a lookup stock: price, day move,
+    15-min momentum, recent high/low, 20-day trend, plus high-impact news for
+    the given currencies. Real numbers only (yfinance, ~15-min delayed)."""
     try:
         d1 = _flatten(yf.download(yfs, period="1mo", interval="1d",
                                   progress=False, auto_adjust=False))
@@ -300,14 +317,13 @@ def macro_read(symbol="gold"):
 
     sma20 = float(closes_d.tail(20).mean()) if len(closes_d) >= 5 else None
 
-    # event awareness: gold + forex move hardest around scheduled news, so pull
-    # the high-impact releases for THIS instrument's currencies (reuses the same
+    # event awareness: these markets move hardest around scheduled news, so pull
+    # the high-impact releases for the relevant currencies (reuses the same
     # cached ForexFactory feed the risk gate uses).
     events, event_warning = [], None
     try:
         import risk_gate
-        events = risk_gate.upcoming_events(
-            risk_gate.MACRO_CCY.get(yfs, ["USD"]), within_hours=24)
+        events = risk_gate.upcoming_events(event_ccy, within_hours=24)
     except Exception:
         events = []
     if events:
@@ -319,7 +335,7 @@ def macro_read(symbol="gold"):
                          "it can wait until the dust settles.")
 
     return {
-        "instrument": disp, "symbol": yfs,
+        "instrument": disp, "symbol": yfs, "kind": kind,
         "price": round(price, dec),
         "prior_close": round(prior_close, dec) if prior_close is not None else None,
         "day_move_pct": round((price / prior_close - 1) * 100, 2) if prior_close else None,
@@ -329,8 +345,46 @@ def macro_read(symbol="gold"):
         "vs_20day_avg": (None if not sma20 else "above" if price > sma20 else "below"),
         "event_warning": event_warning,
         "upcoming_events": events[:4],
-        "source": "yfinance, ~15-min delayed (gold = COMEX futures GC=F)",
+        "source": source,
         "disclaimer": "Read-only market context, NOT a setup from our strategy and "
                 "NOT financial advice. Give an honest read, flag any event_warning, "
                 "and end with 'Your call.'",
     }
+
+
+def macro_read(symbol="gold"):
+    """Read-only context on GOLD or a major FOREX pair. NOT a setup and NOT
+    advice. Gold/forex trade ~24h, so there's no 'market closed' gate."""
+    info = MACRO_SYMBOLS.get(_norm(symbol))
+    if not info:
+        return {"error": f"'{symbol}' isn't a gold/forex symbol I read. I cover "
+                "gold and EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, USD/CHF."}
+    disp, yfs, dec = info
+    kind = "gold" if yfs == "GC=F" else "forex"
+    import risk_gate
+    return _do_read(disp, yfs, dec, kind, risk_gate.MACRO_CCY.get(yfs, ["USD"]),
+                    "yfinance, ~15-min delayed (gold = COMEX futures GC=F)")
+
+
+def stock_read(symbol):
+    """Read-only context on one of the popular lookup stocks/ETFs (AAPL, NVDA,
+    QQQ, ...). Same honest read as macro_read; watches USD high-impact news
+    (Fed/CPI/NFP) since that's what moves US equities. These are NOT alert
+    tickers — only the core watchlist ever triggers a text."""
+    key = _norm(symbol)
+    info = LOOKUP_STOCKS.get(STOCK_ALIASES.get(key, key).upper())
+    if not info:
+        return {"error": f"'{symbol}' isn't on my stock/ETF lookup list."}
+    disp, yfs, dec = info
+    return _do_read(disp, yfs, dec, "stock", ["USD"], "yfinance, ~15-min delayed")
+
+
+def any_read(symbol):
+    """First successful read across gold/forex then the stock/ETF list, else a
+    helpful error. Used by the /commands and the chat brain."""
+    for fn in (macro_read, stock_read):
+        r = fn(symbol)
+        if not r.get("error"):
+            return r
+    return {"error": f"'{symbol}' isn't one I cover. Try a major stock/ETF "
+            "(AAPL, NVDA, QQQ...), gold, or a forex pair (EUR/USD, USD/JPY...)."}

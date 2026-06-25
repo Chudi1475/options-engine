@@ -78,10 +78,11 @@ def macro_line(r: dict) -> str:
     if r.get("note"):
         return f"{r.get('instrument', 'that')}: {r['note']}"
     disp = r.get("instrument", "?")
-    is_gold = disp == "Gold"
+    kind = r.get("kind") or ("gold" if disp == "Gold" else "forex")
+    icon = {"gold": "🪙", "forex": "💱", "stock": "📊"}.get(kind, "📊")
     price = r.get("price")
-    price_str = f"${price:,.2f}" if is_gold else f"{price}"
-    parts = [f"{'🪙' if is_gold else '💱'} {disp}  {price_str}"]
+    price_str = f"{price}" if kind == "forex" else f"${price:,.2f}"
+    parts = [f"{icon} {disp}  {price_str}"]
     if r.get("day_move_pct") is not None:
         parts.append(f"{r['day_move_pct']:+.2f}% today")
     if r.get("momentum_15min_pct") is not None:
@@ -282,6 +283,7 @@ def help_card() -> str:
         "/status — risk mode, account, open positions right now",
         "/calls [ticker] — live call/put setup per stock (BUY type, strike, expiry)",
         "/gold · /fx [pair] — read on gold or a forex pair (price, momentum, news)",
+        "/<ticker> — quick read on a popular stock/ETF (e.g. /aapl /nvda /qqq)",
         "/health — bot self-check: feed, last heartbeat, today's alerts (owner)",
         "/score — your personal win/loss record (I keep it for you)",
         "/adduser — let another person in (owner only)",

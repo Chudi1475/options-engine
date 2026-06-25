@@ -530,10 +530,10 @@ class Service:
         if cmd in ("/calls", "/opt", "/option", "/puts"):
             return self.calls_text(args)
         if cmd == "/gold":
-            return self.macro_text("gold")
+            return self.read_text("gold")
         if cmd in ("/fx", "/forex"):
             if args.strip():
-                return self.macro_text(args)
+                return self.read_text(args)
             return ("Which pair? I read EUR/USD, GBP/USD, USD/JPY, AUD/USD, "
                     "USD/CAD, USD/CHF.  e.g.  /fx eurusd   (or /gold for gold)")
         if cmd == "/requests":
@@ -557,7 +557,7 @@ class Service:
             return self.calls_text(sym)
         if sym:
             import market_tools
-            r = market_tools.macro_read(sym)
+            r = market_tools.any_read(sym)
             if not r.get("error"):
                 return cards.macro_line(r)
         return None  # silently ignore unknown commands
@@ -573,14 +573,12 @@ class Service:
         if arg.strip():
             t = arg.strip().upper().lstrip("$")
             if t not in self.cfg.watchlist:
-                # gold / forex aren't options tickers — give the macro read
-                # instead of a flat rejection (so /calls gold just works)
-                r = market_tools.macro_read(arg)
+                # not an options ticker — gold/forex/lookup-stock get a read
+                # instead of a flat rejection (so /calls gold, /calls aapl work)
+                r = market_tools.any_read(arg)
                 if not r.get("error"):
                     return cards.macro_line(r)
-                return (f"{t} isn't one I cover. Options setups: {', '.join(wl)}. "
-                        "Or ask about gold or a forex pair (EUR/USD, USD/JPY...), "
-                        "or /gold and /fx.")
+                return cards.macro_line(r)  # any_read's error is already helpful
             tickers = [t]
         else:
             tickers = wl
@@ -600,11 +598,12 @@ class Service:
                      "/status shows open trades.")
         return "\n".join(lines)
 
-    def macro_text(self, arg: str):
-        """A read on gold or a forex pair (price, day move, momentum, trend,
-        and any high-impact news coming). Used by /gold, /fx, and /calls."""
+    def read_text(self, arg: str):
+        """A read on gold, a forex pair, or a popular stock/ETF (price, day move,
+        momentum, trend, and any high-impact news coming). Used by /gold, /fx,
+        bare-symbol commands like /aapl, and /calls."""
         import market_tools
-        return cards.macro_line(market_tools.macro_read(arg))
+        return cards.macro_line(market_tools.any_read(arg))
 
     def cmd_request_status(self, cmd: str, args: str):
         """/approve|/reject|/done <id> [note] — move a request and tell the
