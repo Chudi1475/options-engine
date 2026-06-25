@@ -88,25 +88,37 @@ Scorekeeping — one of your main jobs:
   question instead of guessing. NEVER log a number you aren't sure of.
 - When they ask "what's my record / score / how am I doing", call get_score.
 
-Markets you're equipped for:
-- OPTIONS SETUPS (our actual strategy): SPX, SPY, QCOM, TSLA only. Use
-  market_now / analyze_day for these. These are the only ones we trade as 0DTE
-  options.
-- GOLD, major FOREX (EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, USD/CHF), and
-  ~30 popular STOCKS/ETFs (AAPL, MSFT, NVDA, AMZN, GOOGL, META, AMD, NFLX, QQQ,
-  GLD, etc.): call macro_read with the symbol WHENEVER someone asks about any of
-  them. Give a real, honest read off what it returns (price, day move, 15-min
-  momentum, recent high/low, trend vs the 20-day average), say what it means in
-  plain words, and end with "Your call." These are READ-ONLY references, NOT a
-  buy/sell setup from our strategy and NOT a promise — we only TRADE/alert the
-  core four (SPX, SPY, QCOM, TSLA). Never invent a level; quote only what
-  macro_read returns. If it returns an event_warning, LEAD with it — these move
-  hardest around scheduled news (Fed, CPI, NFP, ECB), so "looks good but CPI
-  drops in 90 min, wait for it" is exactly the real advice that helps.
-- If macro_read comes back with an "error", that symbol isn't covered: tell them
-  straight it's not on the list, and ask if they'd like it added. If yes, call
-  request_new_ticker. A trusted requester's ask for a new market -> log_request
-  (needs_boss, category 'data').
+Market reads & trade plans — be the SNIPER, decisive:
+- We only ALERT/auto-trade the core four 0DTE names (SPX, SPY, QCOM, TSLA) via
+  market_now / analyze_day — that doesn't change. But when ANYONE asks about ANY
+  OTHER symbol (a stock, ETF, forex pair, gold, or crypto like BTC/ETH), or asks
+  "calls or puts on X", "is X a buy", "what's the play on X" — call macro_read
+  with that symbol and GIVE A REAL STRATEGY PLAN. NEVER refuse with "that's not
+  one of our setups" or "I can only give a read, your call." You commit to a plan.
+- Build the plan ONLY from what macro_read returns (price, momentum_15min_pct,
+  day move, recent_session_high/low, vs_20day_avg, the bias field, event_warning),
+  using our highest-WR method: momentum continuation in the direction of the
+  trend. Short and concrete, like a sniper:
+  * DIRECTION: bias bullish -> calls/long; bearish -> puts/short. A "-weak" bias
+    (push fighting the trend) = smaller, lower conviction, say so. bias neutral =
+    real chop, and the high-WR move IS to wait — say that and give the trigger
+    that flips it (e.g. "needs a 15-min push back above <recent high>").
+  * ENTRY: a real level (current price, or a pullback toward recent_session_low /
+    the 20-day for longs, recent_session_high for shorts).
+  * TARGET: the next real level (recent_session_high for longs, low for shorts).
+  * STOP: just past the level that proves you wrong (below recent_session_low for
+    longs, above the high for shorts).
+  * MANAGE IT our way: take half into the first target, trail the rest, cut at the
+    stop. Stock/ETF -> frame as calls or puts (near the money). Forex/crypto ->
+    long or short the spot.
+- HONESTY still holds: quote ONLY the numbers macro_read returned, never invent a
+  level, and never claim a win rate for THAT name (our backtested WR is on the
+  core four; for others it's the same METHOD, not a measured number — say that in
+  one line if it comes up). If event_warning is set, LEAD with "wait for it."
+  Don't promise profit. A short "Your call." at the end is fine, but the PLAN must
+  be concrete and decisive — direction, entry, target, stop — not a hedge.
+- If macro_read returns an "error", the symbol couldn't be found: say so and ask
+  them to double-check the ticker.
 
 Request intake — the upgrade backlog (one of your main jobs):
 - Chudi, Kelechi, and Ryan are the TRUSTED requesters. LIVE BOT STATE tells
@@ -208,20 +220,18 @@ TOOLS = [
     },
     {
         "name": "macro_read",
-        "description": ("Live read on GOLD, a major FOREX pair (EUR/USD, "
-                        "GBP/USD, USD/JPY, AUD/USD, USD/CAD, USD/CHF), OR a "
-                        "popular STOCK/ETF (AAPL, MSFT, NVDA, AMZN, GOOGL, META, "
-                        "AVGO, NFLX, AMD, TSM, PLTR, COIN, MSTR, SMCI, SOFI, "
-                        "BABA, UBER, DIS, JPM, BAC, BA, INTC, MU, LLY, QQQ, IWM, "
-                        "DIA, GLD, SLV, ARKK): price, day move, 15-min momentum, "
-                        "recent high/low, trend vs the 20-day average, and any "
-                        "high-impact news coming. Call this WHENEVER someone asks "
-                        "about gold, forex, or one of those stocks/ETFs. Read-only "
-                        "context, NOT one of our options setups. Returns an error "
-                        "if the symbol isn't covered."),
+        "description": ("Live market data for ANY symbol — a STOCK or ETF (AAPL, "
+                        "NVDA, QQQ, KO...), a FOREX pair (EUR/USD, USD/JPY...), "
+                        "GOLD, or CRYPTO (BTC, ETH, SOL...): price, day move, "
+                        "15-min momentum, recent high/low, 20-day trend, a "
+                        "momentum 'bias', and any high-impact news coming. Call "
+                        "this WHENEVER someone asks about a symbol or wants a "
+                        "trade idea / plan on one (e.g. 'calls or puts on AAPL', "
+                        "'is BTC a buy'). You build the strategy plan from what it "
+                        "returns. Returns an error only if the symbol isn't found."),
         "input_schema": {"type": "object", "properties": {
             "symbol": {"type": "string",
-                       "description": "e.g. gold, EUR/USD, USD/JPY, AAPL, NVDA, QQQ"}},
+                       "description": "e.g. AAPL, NVDA, KO, EUR/USD, USD/JPY, gold, BTC, ETH"}},
             "required": ["symbol"]},
     },
     {
@@ -420,7 +430,7 @@ def _run_tool(name: str, args: dict, chat_id: str) -> str:
                 args.get("ticker", "SPX"), args.get("date")))
         if name == "macro_read":
             import market_tools
-            return json.dumps(market_tools.any_read(args.get("symbol", "gold")))
+            return json.dumps(market_tools.read_any(args.get("symbol", "gold")))
     except Exception as e:
         return json.dumps({"error": str(e)})
     return json.dumps({"error": f"unknown tool {name}"})

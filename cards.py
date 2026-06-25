@@ -79,7 +79,7 @@ def macro_line(r: dict) -> str:
         return f"{r.get('instrument', 'that')}: {r['note']}"
     disp = r.get("instrument", "?")
     kind = r.get("kind") or ("gold" if disp == "Gold" else "forex")
-    icon = {"gold": "🪙", "forex": "💱", "stock": "📊"}.get(kind, "📊")
+    icon = {"gold": "🪙", "forex": "💱", "stock": "📊", "crypto": "🟠"}.get(kind, "📊")
     price = r.get("price")
     price_str = f"{price}" if kind == "forex" else f"${price:,.2f}"
     parts = [f"{icon} {disp}  {price_str}"]
@@ -89,10 +89,21 @@ def macro_line(r: dict) -> str:
         parts.append(f"15m mom {r['momentum_15min_pct']:+.2f}%")
     if r.get("vs_20day_avg"):
         parts.append(f"{r['vs_20day_avg']} 20d avg")
-    line = "  ·  ".join(parts)
+    line = "  ·  ".join(parts) + "\n" + _lean(kind, r.get("bias"))
     if r.get("event_warning"):
         line += f"\n{r['event_warning']}"
     return line + "\nYour call."
+
+
+def _lean(kind: str, bias: str) -> str:
+    """One-line directional lean from the read's momentum/trend bias."""
+    if not bias or bias == "neutral":
+        return "⚪ chop, no clean lean — wait for a 15-min push to pick a side"
+    bull = bias.startswith("bull")
+    weak = bias.endswith("weak")
+    side = ("CALLS" if bull else "PUTS") if kind == "stock" else ("LONG" if bull else "SHORT")
+    qual = " (counter-trend, lighter)" if weak else " (with the trend)"
+    return f"{'📈' if bull else '📉'} lean: {side}{qual}"
 
 
 def size_lines(risk_pct: float, mid: float, correlated: bool):
@@ -283,7 +294,8 @@ def help_card() -> str:
         "/status — risk mode, account, open positions right now",
         "/calls [ticker] — live call/put setup per stock (BUY type, strike, expiry)",
         "/gold · /fx [pair] — read on gold or a forex pair (price, momentum, news)",
-        "/<ticker> — quick read on a popular stock/ETF (e.g. /aapl /nvda /qqq)",
+        "/<symbol> — read + lean on ANY stock, ETF, fx, gold, or crypto "
+        "(e.g. /aapl /nvda /btc /eth) — or just ask me for a plan on it",
         "/health — bot self-check: feed, last heartbeat, today's alerts (owner)",
         "/score — your personal win/loss record (I keep it for you)",
         "/adduser — let another person in (owner only)",

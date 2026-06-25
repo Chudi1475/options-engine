@@ -451,8 +451,27 @@ class Service:
                     "(get one at console.anthropic.com) and I'll answer "
                     "questions, read chart screenshots, and read files like "
                     "a human. Commands still work any time: /help")
-        telegram.send_chat_action(item["chat_id"])  # 'typing…' so it feels live
-        return assistant.respond(item, self.status_text())
+        return self._respond_with_typing(item)
+
+    def _respond_with_typing(self, item: dict):
+        """Run the brain while a background thread keeps the 'Sniper is typing…'
+        indicator alive (Telegram's typing status expires after ~5s, so refresh
+        it every 4s until the reply is ready)."""
+        import threading
+        import assistant
+        chat_id = item["chat_id"]
+        stop = threading.Event()
+
+        def _beat():
+            while not stop.is_set():
+                telegram.send_chat_action(chat_id)
+                stop.wait(4)
+
+        threading.Thread(target=_beat, daemon=True).start()
+        try:
+            return assistant.respond(item, self.status_text())
+        finally:
+            stop.set()
 
     def offer_add_user(self, item: dict):
         """A stranger messaged the bot. Tell the owner(s) once, with a
@@ -557,9 +576,10 @@ class Service:
             return self.calls_text(sym)
         if sym:
             import market_tools
-            r = market_tools.any_read(sym)
-            if not r.get("error"):
-                return cards.macro_line(r)
+            if market_tools.resolve(sym):  # plausible symbol (no network yet)
+                r = market_tools.read_any(sym)
+                if not r.get("error") and not r.get("note"):
+                    return cards.macro_line(r)  # stay silent on a failed fetch
         return None  # silently ignore unknown commands
 
     def calls_text(self, arg: str = ""):

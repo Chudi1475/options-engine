@@ -6,6 +6,7 @@ of saying "I don't have the data." Same engine the live scanner uses, same
 honest approximated option pricing (labeled), no made-up levels.
 """
 
+import re
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -279,10 +280,46 @@ def _norm(symbol: str) -> str:
     return (symbol or "").lower().replace("/", "").replace(" ", "").replace("$", "").strip()
 
 
-def _do_read(disp, yfs, dec, kind, event_ccy, source):
-    """Shared read engine for gold / forex / a lookup stock: price, day move,
-    15-min momentum, recent high/low, 20-day trend, plus high-impact news for
-    the given currencies. Real numbers only (yfinance, ~15-min delayed)."""
+# crypto the bot can read (yfinance COIN-USD). alias -> base symbol.
+CRYPTO = {
+    "btc": "BTC", "bitcoin": "BTC", "eth": "ETH", "ethereum": "ETH",
+    "sol": "SOL", "solana": "SOL", "doge": "DOGE", "dogecoin": "DOGE",
+    "xrp": "XRP", "ripple": "XRP", "ada": "ADA", "cardano": "ADA",
+    "bnb": "BNB", "ltc": "LTC", "litecoin": "LTC", "link": "LINK",
+    "avax": "AVAX", "dot": "DOT", "matic": "MATIC", "shib": "SHIB",
+    "trx": "TRX", "ton": "TON", "sui": "SUI", "near": "NEAR",
+}
+
+_TICKER_RE = re.compile(r"[A-Z]{1,6}([.\-][A-Z]{1,3})?$")
+
+
+def resolve(symbol):
+    """Map ANY user symbol -> (display, yf_symbol, decimals, kind). Handles gold,
+    forex, crypto, the curated stock list, and any plausible stock/ETF ticker.
+    Returns None if it doesn't even look like a symbol (so /typos stay silent)."""
+    raw = (symbol or "").strip()
+    key = _norm(raw)
+    if not key:
+        return None
+    if key in MACRO_SYMBOLS:
+        disp, yfs, dec = MACRO_SYMBOLS[key]
+        return (disp, yfs, dec, "gold" if yfs == "GC=F" else "forex")
+    base = CRYPTO.get(key) or (CRYPTO.get(key[:-3]) if key.endswith("usd") else None)
+    if base:
+        return (f"{base}/USD", f"{base}-USD", 2, "crypto")
+    tkr = STOCK_ALIASES.get(key, raw.upper().lstrip("$").strip())
+    if tkr in LOOKUP_STOCKS:
+        disp, yfs, dec = LOOKUP_STOCKS[tkr]
+        return (disp, yfs, dec, "stock")
+    if _TICKER_RE.match(tkr):
+        return (tkr, tkr, 2, "stock")
+    return None
+
+
+def _do_read(disp, yfs, dec, kind, source):
+    """Shared read engine for any symbol: price, day move, 15-min momentum,
+    recent high/low, 20-day trend, a momentum/trend BIAS, plus high-impact
+    news. Real numbers only (yfinance, ~15-min delayed)."""
     try:
         d1 = _flatten(yf.download(yfs, period="1mo", interval="1d",
                                   progress=False, auto_adjust=False))
@@ -316,16 +353,29 @@ def _do_read(disp, yfs, dec, kind, event_ccy, source):
             lo = round(float(day_bars["Low"].min()), dec)
 
     sma20 = float(closes_d.tail(20).mean()) if len(closes_d) >= 5 else None
+    above = sma20 is not None and price > sma20
 
-    # event awareness: these markets move hardest around scheduled news, so pull
-    # the high-impact releases for the relevant currencies (reuses the same
-    # cached ForexFactory feed the risk gate uses).
-    events, event_warning = [], None
+    # momentum-continuation bias (our highest-WR posture): take a 15-min push
+    # that agrees with the 20-day trend; flat momentum = chop = wait. The
+    # "-weak" tags mark a push that fights the trend (lower conviction).
+    bias = "neutral"
+    if mom15 is not None and sma20 is not None:
+        if mom15 > 0.05:
+            bias = "bullish" if above else "bullish-weak"
+        elif mom15 < -0.05:
+            bias = "bearish" if not above else "bearish-weak"
+
+    # event awareness: forex uses both pair currencies; everything else watches
+    # USD high-impact prints (Fed/CPI/NFP move stocks, gold and crypto too).
+    event_ccy, events = ["USD"], []
     try:
         import risk_gate
+        if kind == "forex":
+            event_ccy = risk_gate.MACRO_CCY.get(yfs, ["USD"])
         events = risk_gate.upcoming_events(event_ccy, within_hours=24)
     except Exception:
         events = []
+    event_warning = None
     if events:
         nxt = events[0]
         m = nxt["mins_away"]
@@ -342,49 +392,38 @@ def _do_read(disp, yfs, dec, kind, event_ccy, source):
         "momentum_15min_pct": mom15,
         "recent_session_high": hi, "recent_session_low": lo,
         "twentyday_avg": round(sma20, dec) if sma20 else None,
-        "vs_20day_avg": (None if not sma20 else "above" if price > sma20 else "below"),
+        "vs_20day_avg": (None if sma20 is None else "above" if above else "below"),
+        "bias": bias,
         "event_warning": event_warning,
         "upcoming_events": events[:4],
         "source": source,
-        "disclaimer": "Read-only market context, NOT a setup from our strategy and "
-                "NOT financial advice. Give an honest read, flag any event_warning, "
-                "and end with 'Your call.'",
+        "disclaimer": "Build a concrete PLAN (direction, entry, target, stop) from "
+                "these REAL numbers using our momentum method; lead with any "
+                "event_warning; quote only these levels, never invent one or a "
+                "win rate; end with 'Your call.'",
     }
 
 
-def macro_read(symbol="gold"):
-    """Read-only context on GOLD or a major FOREX pair. NOT a setup and NOT
-    advice. Gold/forex trade ~24h, so there's no 'market closed' gate."""
-    info = MACRO_SYMBOLS.get(_norm(symbol))
+def read_any(symbol):
+    """Universal read for ANY symbol: stock, ETF, forex, gold, or crypto."""
+    info = resolve(symbol)
     if not info:
-        return {"error": f"'{symbol}' isn't a gold/forex symbol I read. I cover "
-                "gold and EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, USD/CHF."}
-    disp, yfs, dec = info
-    kind = "gold" if yfs == "GC=F" else "forex"
-    import risk_gate
-    return _do_read(disp, yfs, dec, kind, risk_gate.MACRO_CCY.get(yfs, ["USD"]),
-                    "yfinance, ~15-min delayed (gold = COMEX futures GC=F)")
+        return {"error": f"'{symbol}' doesn't look like a symbol I can read. Try a "
+                "stock/ETF ticker, gold, a forex pair, or a coin (BTC, ETH, SOL...)."}
+    disp, yfs, dec, kind = info
+    src = "yfinance, ~15-min delayed" + (" (gold = COMEX futures GC=F)" if yfs == "GC=F" else "")
+    return _do_read(disp, yfs, dec, kind, src)
 
 
-def stock_read(symbol):
-    """Read-only context on one of the popular lookup stocks/ETFs (AAPL, NVDA,
-    QQQ, ...). Same honest read as macro_read; watches USD high-impact news
-    (Fed/CPI/NFP) since that's what moves US equities. These are NOT alert
-    tickers — only the core watchlist ever triggers a text."""
+def known_symbol(symbol):
+    """Cheap membership check (no network) for the bare /<symbol> command guard."""
     key = _norm(symbol)
-    info = LOOKUP_STOCKS.get(STOCK_ALIASES.get(key, key).upper())
-    if not info:
-        return {"error": f"'{symbol}' isn't on my stock/ETF lookup list."}
-    disp, yfs, dec = info
-    return _do_read(disp, yfs, dec, "stock", ["USD"], "yfinance, ~15-min delayed")
+    if key in MACRO_SYMBOLS or key in CRYPTO or (key.endswith("usd") and key[:-3] in CRYPTO):
+        return True
+    return STOCK_ALIASES.get(key, (symbol or "").upper().lstrip("$").strip()) in LOOKUP_STOCKS
 
 
-def any_read(symbol):
-    """First successful read across gold/forex then the stock/ETF list, else a
-    helpful error. Used by the /commands and the chat brain."""
-    for fn in (macro_read, stock_read):
-        r = fn(symbol)
-        if not r.get("error"):
-            return r
-    return {"error": f"'{symbol}' isn't one I cover. Try a major stock/ETF "
-            "(AAPL, NVDA, QQQ...), gold, or a forex pair (EUR/USD, USD/JPY...)."}
+# back-compat aliases (older callers / tests)
+any_read = read_any
+macro_read = read_any
+stock_read = read_any
