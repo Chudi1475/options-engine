@@ -24,6 +24,22 @@ ET = ZoneInfo("America/New_York")
 _cfg = StrategyConfig()
 _feed = DataFeed()
 
+# Gold + major forex the bot can give an honest READ on (not options setups —
+# we don't trade these as 0DTE options). Each: alias -> (display, yf symbol,
+# price decimals). yfinance has no working spot-gold symbol (XAUUSD=X is dead),
+# so gold uses COMEX futures GC=F. FX uses Yahoo's =X pairs.
+MACRO_SYMBOLS = {
+    "gold": ("Gold", "GC=F", 2), "xau": ("Gold", "GC=F", 2),
+    "xauusd": ("Gold", "GC=F", 2), "gc": ("Gold", "GC=F", 2),
+    "eurusd": ("EUR/USD", "EURUSD=X", 4), "eur": ("EUR/USD", "EURUSD=X", 4),
+    "gbpusd": ("GBP/USD", "GBPUSD=X", 4), "gbp": ("GBP/USD", "GBPUSD=X", 4),
+    "cable": ("GBP/USD", "GBPUSD=X", 4),
+    "usdjpy": ("USD/JPY", "JPY=X", 2), "jpy": ("USD/JPY", "JPY=X", 2),
+    "audusd": ("AUD/USD", "AUDUSD=X", 4), "aud": ("AUD/USD", "AUDUSD=X", 4),
+    "usdcad": ("USD/CAD", "CAD=X", 4), "cad": ("USD/CAD", "CAD=X", 4),
+    "usdchf": ("USD/CHF", "CHF=X", 4), "chf": ("USD/CHF", "CHF=X", 4),
+}
+
 
 def _flatten(df):
     if df is not None and hasattr(df.columns, "levels"):
@@ -236,3 +252,63 @@ def market_now(ticker="SPX"):
         else:
             out["live_setup"] = None
     return out
+
+
+def macro_read(symbol="gold"):
+    """Read-only context on GOLD or a major FOREX pair: price, day move, 15-min
+    momentum, recent high/low, and trend vs the 20-day average. Honest real
+    numbers only (yfinance, ~15-min delayed). NOT one of our options setups and
+    NOT financial advice — it's market context the brain turns into an honest
+    read. Forex/gold trade nearly 24h, so there's no 'market closed' gate."""
+    key = (symbol or "").lower().replace("/", "").replace(" ", "").replace("$", "").strip()
+    info = MACRO_SYMBOLS.get(key)
+    if not info:
+        return {"error": f"'{symbol}' isn't one I read yet. I cover gold and the "
+                "major FX pairs: EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, USD/CHF."}
+    disp, yfs, dec = info
+    try:
+        d1 = _flatten(yf.download(yfs, period="1mo", interval="1d",
+                                  progress=False, auto_adjust=False))
+        m5 = _flatten(yf.download(yfs, period="2d", interval="5m",
+                                  progress=False, auto_adjust=False))
+    except Exception as e:
+        return {"note": f"couldn't pull {disp} data right now ({e})."}
+    if d1 is None or d1.empty:
+        return {"note": f"no recent data for {disp} right now."}
+
+    closes_d = d1["Close"].dropna()
+    have_5m = m5 is not None and not m5.empty and not m5["Close"].dropna().empty
+    price = float(m5["Close"].dropna().iloc[-1]) if have_5m else float(closes_d.iloc[-1])
+    prior_close = float(closes_d.iloc[-2]) if len(closes_d) >= 2 else None
+
+    mom15 = None
+    if have_5m:
+        c = m5["Close"].dropna()
+        if len(c) >= 4:  # 15 min = 3 bars back
+            mom15 = round((price / float(c.iloc[-4]) - 1) * 100, 2)
+
+    hi = lo = None
+    if have_5m:
+        try:
+            last_day = max(m5.index.date)
+            day_bars = m5[[d == last_day for d in m5.index.date]]
+        except Exception:
+            day_bars = m5
+        if not day_bars.empty:
+            hi = round(float(day_bars["High"].max()), dec)
+            lo = round(float(day_bars["Low"].min()), dec)
+
+    sma20 = float(closes_d.tail(20).mean()) if len(closes_d) >= 5 else None
+    return {
+        "instrument": disp, "symbol": yfs,
+        "price": round(price, dec),
+        "prior_close": round(prior_close, dec) if prior_close is not None else None,
+        "day_move_pct": round((price / prior_close - 1) * 100, 2) if prior_close else None,
+        "momentum_15min_pct": mom15,
+        "recent_session_high": hi, "recent_session_low": lo,
+        "twentyday_avg": round(sma20, dec) if sma20 else None,
+        "vs_20day_avg": (None if not sma20 else "above" if price > sma20 else "below"),
+        "source": "yfinance, ~15-min delayed (gold = COMEX futures GC=F)",
+        "note": "Read-only market context, NOT a setup from our strategy and NOT "
+                "financial advice. Give an honest read and end with 'Your call.'",
+    }

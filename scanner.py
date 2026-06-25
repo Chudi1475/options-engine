@@ -467,11 +467,14 @@ class Service:
                 f"👤 {name} (id {cid}) just messaged the bot.\n"
                 f"Want them to get every alert and be able to ask questions?\n"
                 f"Reply  /adduser {cid}  to let them in, or ignore to keep "
-                "them out.")
+                "them out.\n"
+                f"If it's Kelechi or Ryan, use  /reqfrom add {cid} <name>  so "
+                "their asks hit the upgrade backlog too.")
         return None  # stranger gets nothing back
 
     ADMIN_CMDS = {"/adduser", "/removeuser", "/users", "/risk", "/setaccount",
-                  "/test", "/health"}
+                  "/test", "/health", "/requests", "/approve", "/reject",
+                  "/done", "/reqfrom", "/backlog"}
 
     def run_command(self, cmd: str, args: str, chat_id: str = ""):
         if cmd in self.ADMIN_CMDS and not telegram.is_owner(chat_id):
@@ -523,9 +526,71 @@ class Service:
         if cmd == "/test":
             self.test_sequence(chat_id)
             return None
+        if cmd in ("/calls", "/opt", "/option", "/puts"):
+            return self.calls_text(args)
+        if cmd == "/requests":
+            import intake
+            return intake.list_text()
+        if cmd == "/backlog":
+            import intake
+            return intake.backlog_md()
+        if cmd in ("/approve", "/reject", "/done"):
+            return self.cmd_request_status(cmd, args)
+        if cmd == "/reqfrom":
+            import intake
+            return intake.reqfrom_command(args)
         if cmd in ("/help", "/start"):
             return cards.help_card()
         return None  # silently ignore unknown commands
+
+    def calls_text(self, arg: str = ""):
+        """/calls [ticker] — a compact, scannable read of the live call/put
+        setup for each watched ticker, in STOCK -> BUY CALL/PUT -> strike ->
+        expiry -> win-rate order. Real-time; only the 4 supported tickers."""
+        import market_tools
+        from backtest import expiry_for
+        now = et_now()
+        wl = list(self.cfg.watchlist)
+        if arg.strip():
+            t = arg.strip().upper().lstrip("$")
+            if t not in self.cfg.watchlist:
+                return (f"{t} isn't on the watchlist. I track {', '.join(wl)} "
+                        "only — ask me to add it and I'll flag it for the boss.")
+            tickers = [t]
+        else:
+            tickers = wl
+        lines = ["📊 LIVE SETUPS · calls & puts (real-time read):"]
+        for t in tickers:
+            try:
+                mn = market_tools.market_now(t)
+                try:
+                    exp = expiry_for(t, now)
+                except Exception:
+                    exp = None
+                lines.append(cards.option_line(t, mn, exp))
+            except Exception as e:
+                lines.append(f"{t}: couldn't read right now ({e})")
+        lines.append("")
+        lines.append("BUY = the entry. Sells come as live exit texts. "
+                     "/status shows open trades.")
+        return "\n".join(lines)
+
+    def cmd_request_status(self, cmd: str, args: str):
+        """/approve|/reject|/done <id> [note] — move a request and tell the
+        person who asked."""
+        import intake
+        parts = args.split(None, 1)
+        if not parts or not parts[0].lstrip("#").isdigit():
+            return f"Usage: {cmd} <id> [note]   (see open ones with /requests)"
+        rid = int(parts[0].lstrip("#"))
+        note = parts[1].strip() if len(parts) > 1 else ""
+        status = {"/approve": "approved", "/reject": "rejected",
+                  "/done": "done"}[cmd]
+        entry, ok = intake.set_status(rid, status, note)
+        if not ok:
+            return f"No request #{rid}. Use /requests to see open ones."
+        notified = intake.notify_asker(entry, status, note)
+        return intake.confirm_line(entry, status, notified)
 
     def cmd_adduser(self, args: str):
         pending = config.state_get("pending_chats", {})
@@ -975,6 +1040,28 @@ class Service:
         except Exception as e:
             print(f"{now:%H:%M:%S} recap failed (will retry): {e}")
 
+    def maybe_request_digest(self, now: datetime):
+        """After the close, send Chudi one rollup of every request that came in
+        today (plus anything still open). Self-guards to once per day, same
+        16:05 ET window as the recap."""
+        if self.dry or now.weekday() >= 5 or now.time() < WEEKLY_AT:
+            return
+        today = str(now.date())
+        if config.state_get("request_digest_sent") == today:
+            return
+        try:
+            import intake
+            msg = intake.digest()
+            owner = telegram.primary_owner_id()
+            if msg and owner:
+                err = telegram.send_to(owner, msg)
+                if err:
+                    print(f"{now:%H:%M:%S} request digest send error: {err}")
+                    return  # don't mark sent — retry next pass
+            config.state_set("request_digest_sent", today)
+        except Exception as e:
+            print(f"{now:%H:%M:%S} request digest failed (will retry): {e}")
+
     def maybe_weekly(self, now: datetime):
         # Friday after the close — with weekend catch-up if the bot was
         # offline at 16:05 (daemon mode picks it up later)
@@ -1015,6 +1102,7 @@ class Service:
                 self.reset_day(now)
                 if now.time() >= SESSION_END or now.weekday() >= 5:
                     self.maybe_recap(now)
+                    self.maybe_request_digest(now)
                     self.maybe_weekly(now)
                     self.health_eod(now)  # owner-only 'all clear' for the day
                     print("Session over for today.")
@@ -1030,6 +1118,7 @@ class Service:
                         self.monitor_positions(now)
                     self.handle_commands()
                     self.maybe_recap(now)
+                    self.maybe_request_digest(now)
                     self.maybe_weekly(now)
                     self.health_check(now)
                 except Exception as e:
@@ -1059,6 +1148,7 @@ class Service:
                 self.flush_pending()
                 self.maybe_recap(now)   # catch-up: a recap missed/STALE during
                                         # the 16:05-16:12 window still goes out
+                self.maybe_request_digest(now)  # catch-up the request rollup too
                 self.maybe_weekly(now)  # weekend catch-up
                 self.health_eod(now)    # close ping even if a restart ended the
                                         # session early (self-guards once/day)

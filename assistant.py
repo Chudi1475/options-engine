@@ -19,6 +19,7 @@ import threading
 import requests
 
 import config
+import intake
 import telegram
 
 _HISTORY_LOCK = threading.Lock()  # serialize chat_history.json writes
@@ -83,22 +84,41 @@ Scorekeeping — one of your main jobs:
   question instead of guessing. NEVER log a number you aren't sure of.
 - When they ask "what's my record / score / how am I doing", call get_score.
 
-Tickers you're equipped for: SPX, SPY, QCOM, TSLA only.
-- If someone asks about ANY other stock or ETF (NVDA, AAPL, AMD, etc.),
-  don't fake a read and don't run market_now/analyze_day on it. Tell them
-  straight it's not on the bot's watchlist yet, and ask if they'd like it
-  added.
-- If they say yes (or clearly want it), call request_new_ticker with the
-  symbol, then tell them you flagged it for the boss and he'll decide.
-- If the OWNER himself is asking, skip the ping and just talk it through.
+Markets you're equipped for:
+- OPTIONS SETUPS (our actual strategy): SPX, SPY, QCOM, TSLA only. Use
+  market_now / analyze_day for these. These are the only ones we trade as 0DTE
+  options.
+- GOLD and major FOREX (EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, USD/CHF):
+  call macro_read WHENEVER someone asks about gold or a forex pair. Give a real,
+  honest read off what it returns (price, day move, 15-min momentum, the recent
+  high/low, trend vs the 20-day average), say what it means in plain words, and
+  end with "Your call." Be clear it's a market READ for context, NOT a buy/sell
+  setup from our strategy and NOT a promise — we don't trade these as options.
+  Never invent a level; quote only what macro_read returns.
+- ANY OTHER stock/ETF (NVDA, AAPL, AMD...): no data wired up, so do NOT fake a
+  read. Tell them straight it's not on the watchlist, and ask if they'd like it
+  added. If yes, call request_new_ticker for a single symbol. A trusted
+  requester's ask for a new market -> log_request (needs_boss, category 'data').
 
-Owner radar (you're the owner's private eyes):
-- When a MEMBER (not the owner) gives feedback, reports something broken,
-  complains, or suggests a change the owner should act on, call flag_owner
-  with a one-line summary. The member is NOT told; answer them normally too.
-- Don't flag routine stuff: questions you already answered, trade logs,
-  plain chat, or anything from the owner himself. Only real, actionable
-  signal the owner needs to fix or decide on.
+Request intake — the upgrade backlog (one of your main jobs):
+- Chudi, Kelechi, and Ryan are the TRUSTED requesters. LIVE BOT STATE tells
+  you if THIS chat is one of them. When a trusted requester asks the bot to
+  do, add, change, or fix something, OR asks for something the bot can't do
+  yet, log it with log_request so the bot keeps getting better. Buckets:
+  - can_do_now: you already handled it (a setting, a lookup, scorekeeping) or
+    it's clearly within the bot's powers. Do it, then log it as can_do_now.
+  - needs_boss: a real feature/change/new market a human must build or approve
+    (e.g. add forex or gold, a new alert type, a behavior change). Tell them
+    "that's buildable, flagging it for the boss," then log it. Chudi is pinged.
+  - cannot: out of scope or against the rules (placing orders, guaranteeing
+    profit, anything dishonest). Tell them straight you can't, then log it so
+    we still see what people keep wanting.
+- ALWAYS tell the requester the verdict in plain language, and answer their
+  question to the best of your ability in the same breath. Pass asked_by with
+  their name (Chudi/Kelechi/Ryan) when you know it.
+- Do NOT log: trade results (use log_trade_result), plain chat, hype, or a
+  question you fully answered with no gap. Only real, actionable signal.
+- If the asker is NOT a trusted requester, chat normally and do NOT log.
 
 Hard rules:
 - NEVER invent statistics or prices. Only quote numbers from the LIVE BOT
@@ -111,8 +131,10 @@ Hard rules:
   candles) and connect it to the bot's strategy: 15-minute momentum turns,
   morning entry window 9:45-10:30 ET, sell half +25%, then let the runner run
   and sell it when it gives back ~40 points from its peak, -70% stop.
-- The bot's commands are /setaccount /risk /status /score /test /help —
-  point to them when relevant."""
+- Member commands: /setaccount /risk /status /score /calls /test /help.
+  /calls [ticker] shows the live call/put setup per stock (BUY type, strike,
+  expiry, win rate). Owner-only request controls: /requests /approve /reject
+  /done /reqfrom /backlog. Point to them when relevant."""
 
 TOOLS = [
     {
@@ -177,21 +199,43 @@ TOOLS = [
         },
     },
     {
-        "name": "flag_owner",
-        "description": ("Privately forward to the owner when a MEMBER gives "
-                        "feedback, reports a bug/problem, complains, or suggests "
-                        "a change the owner should fix. Owner-only; the member "
-                        "is never told. NOT for normal chat, questions, or "
-                        "trade logs."),
+        "name": "macro_read",
+        "description": ("Live read on GOLD or a major FOREX pair (EUR/USD, "
+                        "GBP/USD, USD/JPY, AUD/USD, USD/CAD, USD/CHF): price, "
+                        "day move, 15-min momentum, recent high/low, and trend "
+                        "vs the 20-day average. Call this WHENEVER someone asks "
+                        "about gold or forex. Read-only context for an honest "
+                        "take, NOT one of our options setups."),
+        "input_schema": {"type": "object", "properties": {
+            "symbol": {"type": "string",
+                       "description": "e.g. gold, XAU, EUR/USD, GBPUSD, USD/JPY"}},
+            "required": ["symbol"]},
+    },
+    {
+        "name": "log_request",
+        "description": ("Record an actionable ask from a TRUSTED requester "
+                        "(Chudi, Kelechi, or Ryan) into the upgrade backlog so "
+                        "the bot keeps getting better. Pick the bucket: "
+                        "'can_do_now' if you already handled it or it's within "
+                        "the bot's powers; 'needs_boss' if it's a real "
+                        "feature/change/new market a human must build or "
+                        "approve; 'cannot' if it's out of scope or against the "
+                        "rules. Do NOT call for trade logs, plain chat, or a "
+                        "question you already fully answered."),
         "input_schema": {
             "type": "object",
             "properties": {
                 "summary": {"type": "string",
-                            "description": "one or two lines: what they said + what may need fixing"},
+                            "description": "one line: what they want, in their words"},
+                "bucket": {"type": "string",
+                           "enum": ["can_do_now", "needs_boss", "cannot"],
+                           "description": "can_do_now | needs_boss | cannot"},
                 "category": {"type": "string",
-                             "description": "feedback | bug | request | complaint"},
+                             "description": "feature | bug | feedback | data | ticker | other"},
+                "asked_by": {"type": "string",
+                             "description": "the requester's name if known: Chudi, Kelechi, or Ryan"},
             },
-            "required": ["summary"],
+            "required": ["summary", "bucket"],
         },
     },
 ]
@@ -306,22 +350,36 @@ def _request_ticker(ticker: str, chat_id: str, asked_by: str = "") -> str:
             f"isn't set up for yet.\nWant to add {ticker} to the watchlist? "
             "Reply if you'd like to proceed.")
         pinged = err is None
+    # mirror trusted requesters' ticker asks onto the upgrade backlog too, so
+    # the daily digest shows them. Only the FIRST time per ticker ('already'
+    # dedups repeats, same as the owner ping), and use the real requester name
+    # (who_label) not the 'chat <id>' fallback built for the owner DM. ping=False
+    # because request_new_ticker already pinged the owner above.
+    if intake.is_requester(chat_id) and not already:
+        try:
+            intake.add_request(chat_id, intake.who_label(chat_id),
+                               f"add {ticker} to the watchlist",
+                               "needs_boss", "ticker", ping=False)
+        except Exception:
+            pass
     return json.dumps({"flagged": ticker, "owner_pinged": pinged,
                        "already_pending": already})
 
 
-def _flag_owner(summary: str, chat_id: str, category: str = "feedback") -> str:
-    """Forward a member's feedback/issue to the owner ONLY (never the owner's
-    own messages, never the other members)."""
+def _log_request(summary: str, chat_id: str, bucket: str = "needs_boss",
+                 category: str = "other", asked_by: str = "") -> str:
+    """Record a trusted requester's ask in the upgrade backlog (intake.py).
+    Only Chudi, Kelechi, and Ryan are logged for now; everyone else is
+    answered normally but never queued."""
     summary = (summary or "").strip()
     if not summary:
-        return json.dumps({"error": "nothing to flag"})
-    owner = telegram.primary_owner_id()
-    if not owner or telegram.is_owner(chat_id) or str(chat_id) == str(owner):
-        return json.dumps({"skipped": "owner's own message or no owner set"})
-    err = telegram.send_to(
-        owner, f"📣 MEMBER {category.upper()} (chat {chat_id}):\n{summary}")
-    return json.dumps({"forwarded_to_owner": err is None})
+        return json.dumps({"error": "nothing to log"})
+    if not intake.is_requester(chat_id):
+        return json.dumps({"skipped": "not a trusted requester; not logged"})
+    who = (asked_by or "").strip() or intake.who_label(chat_id)
+    entry = intake.add_request(chat_id, who, summary, bucket, category)
+    return json.dumps({"logged": {"id": entry["id"], "bucket": entry["bucket"],
+                                  "status": entry["status"]}})
 
 
 def _run_tool(name: str, args: dict, chat_id: str) -> str:
@@ -336,15 +394,20 @@ def _run_tool(name: str, args: dict, chat_id: str) -> str:
         if name == "request_new_ticker":
             return _request_ticker(args.get("ticker", ""), chat_id,
                                    args.get("asked_by", ""))
-        if name == "flag_owner":
-            return _flag_owner(args.get("summary", ""), chat_id,
-                               args.get("category", "feedback"))
+        if name == "log_request":
+            return _log_request(args.get("summary", ""), chat_id,
+                                args.get("bucket", "needs_boss"),
+                                args.get("category", "other"),
+                                args.get("asked_by", ""))
         if name in ("market_now", "analyze_day"):
             import market_tools
             if name == "market_now":
                 return json.dumps(market_tools.market_now(args.get("ticker", "SPX")))
             return json.dumps(market_tools.analyze_day(
                 args.get("ticker", "SPX"), args.get("date")))
+        if name == "macro_read":
+            import market_tools
+            return json.dumps(market_tools.macro_read(args.get("symbol", "gold")))
     except Exception as e:
         return json.dumps({"error": str(e)})
     return json.dumps({"error": f"unknown tool {name}"})
@@ -388,8 +451,14 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True) -> str:
     who_line = ("This chat IS the owner (Chudi) himself."
                 if telegram.is_owner(chat_id)
                 else "This chat is a MEMBER, not the owner.")
+    if intake.is_requester(chat_id):
+        req_line = (f"This chat is a TRUSTED REQUESTER ({intake.who_label(chat_id)})"
+                    " — log their actionable asks with log_request.")
+    else:
+        req_line = ("This chat is NOT a trusted requester — chat normally, do "
+                    "NOT log requests.")
     context_text = (f"Right now it is {now_et:%A %Y-%m-%d %I:%M %p} ET.\n"
-                    f"{who_line}\n"
+                    f"{who_line}\n{req_line}\n"
                     + context_text)
     blocks = []
     if item["kind"] in ("photo", "document"):

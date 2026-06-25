@@ -43,6 +43,33 @@ def contract_str(pos) -> str:
     return f"{disp_ticker(pos.ticker)} {pos.strike:g} {pos.direction.upper()}"
 
 
+def option_line(ticker: str, mn: dict, expiry=None) -> str:
+    """One compact, scannable line for a ticker's live read, in the order:
+    STOCK -> action+type (BUY CALL / BUY PUT) -> strike -> expiry -> win rate.
+    `mn` is a market_tools.market_now() result; expiry is a date or None."""
+    disp = disp_ticker(ticker)
+    if mn.get("error"):
+        return f"{disp}: not on the watchlist"
+    if mn.get("note"):  # market closed / no data yet
+        return f"{disp}: {mn['note'].rstrip('.').lower()}"
+    setup = mn.get("live_setup")
+    price = mn.get("price")
+    pstr = f"${price:g}" if price is not None else "?"
+    if not setup:
+        if not mn.get("in_entry_window"):
+            return f"{disp}  no setup yet (entry window is 9:45-10:30 ET, {pstr})"
+        mom = mn.get("momentum_15min_pct")
+        mtxt = f"{mom:+.2f}%" if mom is not None else "n/a"
+        return f"{disp}  no live setup ({pstr}, 15m momentum {mtxt})"
+    arrow = "📈" if setup["direction"] == "call" else "📉"
+    typ = setup["direction"].upper()
+    wr = setup.get("win_rate")
+    wtxt = f"{wr:g}%" if wr is not None else "n/a"
+    flag = "✅ alert-worthy" if setup.get("would_alert") else "⚪ below the bar"
+    exp = f"  exp {expiry_str(expiry, date.today())}" if expiry else ""
+    return f"{disp}  {arrow} BUY {typ}  {setup['strike']:g}{exp}  · {wtxt} {flag}"
+
+
 def size_lines(risk_pct: float, mid: float, correlated: bool):
     """Risk-based sizing: a full stop-out costs exactly risk_pct of the
     account. Returns (lines, suggested_dollars_or_None)."""
@@ -229,12 +256,20 @@ def help_card() -> str:
         "/setaccount 25000 — set your account size (sizes cards in dollars)",
         "/risk green|yellow|red [reason] — override today's risk mode",
         "/status — risk mode, account, open positions right now",
+        "/calls [ticker] — live call/put setup per stock (BUY type, strike, expiry)",
         "/health — bot self-check: feed, last heartbeat, today's alerts (owner)",
         "/score — your personal win/loss record (I keep it for you)",
         "/adduser — let another person in (owner only)",
         "/users — see who has access (owner only)",
         "/test — fire a fake signal through every alert type",
         "/help — this list",
+        "",
+        "Owner request controls:",
+        "/requests — see open asks from Chudi/Kelechi/Ryan",
+        "/approve <id> [note] · /reject <id> [note] · /done <id> — close one out "
+        "(I text the person back)",
+        "/backlog — open build items, ready to paste into Claude Code",
+        "/reqfrom add <id> <name> — bring Kelechi/Ryan online (asks + alerts)",
         "",
         "You can also just TALK to me — ask anything, or send a chart "
         "screenshot / PDF / CSV and I'll read it and answer like a human.",
