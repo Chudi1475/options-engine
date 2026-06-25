@@ -29,7 +29,7 @@ import sys
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -127,6 +127,50 @@ def calendar_check(today: date):
             mode = _worse(mode, "yellow")
             reasons.append(f"{title} at {when} ET")
     return mode, reasons
+
+
+# which currencies move each instrument the bot gives reads on — so a gold or
+# forex read can warn about the scheduled news that actually whips that market
+MACRO_CCY = {
+    "GC=F": ["USD"],                 # gold: Fed / inflation / the dollar
+    "EURUSD=X": ["USD", "EUR"],
+    "GBPUSD=X": ["USD", "GBP"],
+    "JPY=X": ["USD", "JPY"],
+    "AUDUSD=X": ["USD", "AUD"],
+    "CAD=X": ["USD", "CAD"],
+    "CHF=X": ["USD", "CHF"],
+}
+
+
+def upcoming_events(currencies, within_hours: int = 24, high_only: bool = True):
+    """Scheduled releases for the given currencies between now and
+    now+within_hours, soonest first. Reuses the cached ForexFactory feed.
+    Returns [{when, title, currency, impact, mins_away}]."""
+    now = datetime.now(ET)
+    horizon = now + timedelta(hours=within_hours)
+    want = {c.upper() for c in currencies}
+    out = []
+    for ev in fetch_calendar():
+        try:
+            when = datetime.fromisoformat(ev["date"]).astimezone(ET)
+        except (KeyError, ValueError, TypeError):
+            continue
+        if when < now or when > horizon:
+            continue
+        if (ev.get("country") or "").upper() not in want:
+            continue
+        impact = (ev.get("impact") or "").lower()
+        if high_only and impact != "high":
+            continue
+        out.append({
+            "when": when.strftime("%a %I:%M %p ET").replace(" 0", " "),
+            "title": ev.get("title", "scheduled release"),
+            "currency": ev.get("country"),
+            "impact": impact,
+            "mins_away": int((when - now).total_seconds() / 60),
+        })
+    out.sort(key=lambda e: e["mins_away"])
+    return out
 
 
 def market_stress_check(include_gap: bool):

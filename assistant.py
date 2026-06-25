@@ -27,7 +27,7 @@ _HISTORY_LOCK = threading.Lock()  # serialize chat_history.json writes
 API_URL = "https://api.anthropic.com/v1/messages"
 HISTORY_FILE = config.DATA_DIR / "chat_history.json"
 TRADES_FILE = config.DATA_DIR / "user_trades.json"
-MAX_TURNS = 12          # rolling memory per chat
+MAX_TURNS = 24          # rolling memory per chat (deeper = smoother back-and-forth)
 MAX_TEXT_FILE = 20000   # chars of a text/CSV file passed to the model
 
 IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
@@ -62,6 +62,10 @@ Writing style rules for chat replies:
 - Short messages. Lowercase is fine. Emojis are fine in moderation.
 - Never state times, prices, or schedule facts you weren't given. Never
   lecture. Never pad.
+- This is a CONTINUOUS conversation with Chudi, Kelechi, or Ryan — you keep the
+  last several messages in mind. Follow the thread, reference what was just
+  said, answer follow-ups in context, and keep the back-and-forth flowing like
+  a real chat. Don't reset or reintroduce yourself each message.
 
 Reading the market — you HAVE real data tools, use them:
 - When asked what's happening now, what to watch, or whether a setup is
@@ -94,7 +98,10 @@ Markets you're equipped for:
   high/low, trend vs the 20-day average), say what it means in plain words, and
   end with "Your call." Be clear it's a market READ for context, NOT a buy/sell
   setup from our strategy and NOT a promise — we don't trade these as options.
-  Never invent a level; quote only what macro_read returns.
+  Never invent a level; quote only what macro_read returns. If it returns an
+  event_warning, LEAD with it — gold and forex whip hardest around scheduled
+  news (Fed, CPI, NFP, ECB), so "great setup but CPI drops in 90 min, wait for
+  it" is exactly the kind of real advice that helps.
 - ANY OTHER stock/ETF (NVDA, AAPL, AMD...): no data wired up, so do NOT fake a
   read. Tell them straight it's not on the watchlist, and ask if they'd like it
   added. If yes, call request_new_ticker for a single symbol. A trusted

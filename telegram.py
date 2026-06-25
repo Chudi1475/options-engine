@@ -65,6 +65,17 @@ def send_to(chat_id, text: str):
     return None
 
 
+def send_chat_action(chat_id, action: str = "typing"):
+    """Best-effort 'typing…' indicator so a chat feels alive while the brain
+    thinks. Never raises — a hiccup here must never block the actual reply."""
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{_token()}/sendChatAction",
+            json={"chat_id": chat_id, "action": action}, timeout=5)
+    except requests.RequestException:
+        pass
+
+
 def send(text: str) -> list:
     """Send to every configured chat. Returns a list of error strings."""
     ids = chat_ids()

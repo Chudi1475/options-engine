@@ -299,6 +299,25 @@ def macro_read(symbol="gold"):
             lo = round(float(day_bars["Low"].min()), dec)
 
     sma20 = float(closes_d.tail(20).mean()) if len(closes_d) >= 5 else None
+
+    # event awareness: gold + forex move hardest around scheduled news, so pull
+    # the high-impact releases for THIS instrument's currencies (reuses the same
+    # cached ForexFactory feed the risk gate uses).
+    events, event_warning = [], None
+    try:
+        import risk_gate
+        events = risk_gate.upcoming_events(
+            risk_gate.MACRO_CCY.get(yfs, ["USD"]), within_hours=24)
+    except Exception:
+        events = []
+    if events:
+        nxt = events[0]
+        m = nxt["mins_away"]
+        tleft = f"{m}m" if m < 60 else f"{m // 60}h{m % 60:02d}m"
+        event_warning = (f"⚠️ {nxt['title']} ({nxt['currency']}) in {tleft} "
+                         f"({nxt['when']}), high impact. Expect a sharp move; "
+                         "it can wait until the dust settles.")
+
     return {
         "instrument": disp, "symbol": yfs,
         "price": round(price, dec),
@@ -308,7 +327,10 @@ def macro_read(symbol="gold"):
         "recent_session_high": hi, "recent_session_low": lo,
         "twentyday_avg": round(sma20, dec) if sma20 else None,
         "vs_20day_avg": (None if not sma20 else "above" if price > sma20 else "below"),
+        "event_warning": event_warning,
+        "upcoming_events": events[:4],
         "source": "yfinance, ~15-min delayed (gold = COMEX futures GC=F)",
         "note": "Read-only market context, NOT a setup from our strategy and NOT "
-                "financial advice. Give an honest read and end with 'Your call.'",
+                "financial advice. Give an honest read, flag any event_warning, "
+                "and end with 'Your call.'",
     }

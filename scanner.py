@@ -451,6 +451,7 @@ class Service:
                     "(get one at console.anthropic.com) and I'll answer "
                     "questions, read chart screenshots, and read files like "
                     "a human. Commands still work any time: /help")
+        telegram.send_chat_action(item["chat_id"])  # 'typing…' so it feels live
         return assistant.respond(item, self.status_text())
 
     def offer_add_user(self, item: dict):
