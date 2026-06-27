@@ -134,7 +134,8 @@ def analyze_day(ticker="SPX", date_str=None):
     day, err = _resolve_day(date_str)
     if err:
         return {"note": err}
-    if day > date.today() or day.weekday() >= 5:
+    if day > datetime.now(ET).date() or day.weekday() >= 5:  # ET today, not the
+        # container's UTC date (which is already tomorrow after ~8pm ET)
         return {"note": f"{day} is not a completed trading day, so there's no "
                 "real data to analyze. The market is closed weekends."}
     yfs = _cfg.watchlist[ticker]

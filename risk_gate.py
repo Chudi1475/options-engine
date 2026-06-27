@@ -93,7 +93,9 @@ def fetch_calendar() -> list:
             cache = json.loads(CALENDAR_CACHE.read_text(encoding="utf-8-sig"))
         except (json.JSONDecodeError, OSError):
             cache = {}
-    today = str(date.today())
+    today = str(datetime.now(ET).date())  # ET, not the container's UTC date, so
+    # the once-a-day cache rolls at ET midnight like every consumer (else it
+    # re-fetches the rate-limited feed all evening)
     if cache.get("fetched_on") == today:
         return cache.get("events", [])
     try:

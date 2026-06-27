@@ -20,10 +20,19 @@ on top of this.
 import re
 import time as time_mod
 import xml.etree.ElementTree as ETree
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 import yfinance as yf
+
+ET = ZoneInfo("America/New_York")
+
+
+def _today():
+    """Today in ET. The deploy container runs UTC, so _today() there is
+    already tomorrow after ~8pm ET and would drop a same-day earnings date."""
+    return datetime.now(ET).date()
 
 MARKET_FEEDS = [
     ("CNBC", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
@@ -166,7 +175,7 @@ def next_earnings(ticker: str):
                 dates = [d.date() for d in df.index]
             except Exception:
                 return []
-        today = date.today()
+        today = _today()
         future = sorted(d for d in dates if d >= today)
         return future[:1]
 
@@ -178,7 +187,7 @@ def earnings_inside(ticker: str, expiry: date):
     """(blocked, earnings_date): does an earnings report land inside this
     option's life? If yes, the trade is a coin flip on the report — skip."""
     e = next_earnings(ticker)
-    if e is not None and date.today() <= e <= expiry:
+    if e is not None and _today() <= e <= expiry:
         return True, e
     return False, e
 
@@ -190,8 +199,8 @@ def morning_lines(watchlist: dict) -> list:
         if ticker == "SPX":
             continue
         e = next_earnings(ticker)
-        if e is not None and (e - date.today()).days <= 7:
-            when = "TODAY" if e == date.today() else e.strftime("%a %m/%d")
+        if e is not None and (e - _today()).days <= 7:
+            when = "TODAY" if e == _today() else e.strftime("%a %m/%d")
             lines.append(f"📅 {ticker} earnings {when} — alerts whose option "
                          "lives through it get skipped.")
     flagged = hot_headlines()
