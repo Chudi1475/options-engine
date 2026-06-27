@@ -317,15 +317,27 @@ def resolve(symbol):
     return None
 
 
+# A 15-min push only counts as a real signal if it CLEARS the symbol's own
+# noise: the move must be at least MOM_ATR_MULT times one bar's typical range
+# (ATR as a % of price), and at least MOM_FLOOR_PCT in absolute terms. Below
+# that it's chop, and the honest answer is "no clean trade, watch <level>".
+# This stops a dead/overnight tape from dressing a sub-noise wiggle (e.g. a
+# -0.07% blip) up as a SELL with a noise-tight stop.
+MOM_ATR_MULT = 1.0
+MOM_FLOOR_PCT = 0.08
+
+
 def _adaptive_dec(price, kind, dec):
     """Crypto spans BTC (~$100k) to SHIB (~$0.00002); a flat 2 dp rounds the
-    cheap coins to 0.0 and prints a false price. Pick decimals from the price
-    magnitude for crypto so sub-dollar coins keep real digits; everything else
-    keeps its declared precision."""
+    cheap coins to 0.0 (false price) and gives $1-5 coins like XRP/ADA stops too
+    coarse to scalp. Pick decimals from the price magnitude for crypto;
+    everything else keeps its declared precision."""
     if kind != "crypto" or price is None:
         return dec
-    if price >= 1:
+    if price >= 1000:
         return 2
+    if price >= 1:
+        return 4
     if price >= 0.01:
         return 5
     return 8
@@ -380,32 +392,33 @@ def plan_levels(price, bias, atr, hi, lo, dec, kind):
         struct = lo
         use_struct = struct is not None and 0.3 * atr <= (price - struct) <= 1.5 * atr
         stop = (struct - pad) if use_struct else (price - atr)
-        risk = price - stop
-        target1 = price + risk        # 1R: bank half, stop to entry
-        target = price + 2 * risk     # 2R: let the runner go
         direction = "BUY"
     else:
         struct = hi
         use_struct = struct is not None and 0.3 * atr <= (struct - price) <= 1.5 * atr
         stop = (struct + pad) if use_struct else (price + atr)
-        risk = stop - price
-        target1 = price - risk
-        target = price - 2 * risk
         direction = "SELL"
-    # validate the DISPLAYED (rounded) levels, not the raw ones: a stop a
-    # fraction of a tick from price rounds to risk 0.00, and a SELL on a cheap,
-    # very volatile name can push the 2R target to/under 0. Either is a nonsense
-    # ticket, so bail to None and let the read fall through to the honest
-    # "no clean trade, watch <level>" path.
-    e, s = round(price, dec), round(stop, dec)
-    t1, t2, rk = round(target1, dec), round(target, dec), round(risk, dec)
-    if rk <= 0 or s == e or t2 <= 0 or t1 <= 0:
+    # Derive EVERYTHING from the rounded entry + rounded stop, so the displayed
+    # risk and the 1R/2R targets always reconcile ("entry +/- 2 * risk_shown"
+    # exactly equals TP2 on the card, no penny drift). Validate the displayed
+    # values: a stop a fraction of a tick away rounds to risk 0.00, and a SELL on
+    # a cheap, volatile name could push the 2R target to/under 0. Either is a
+    # nonsense ticket, so bail to None and fall through to the honest
+    # "no clean trade, watch <level>" read.
+    e = round(price, dec)
+    s = round(stop, dec)
+    rk = round(abs(e - s), dec)
+    if rk <= 0 or s == e:
+        return None
+    t1 = round(e + rk, dec) if bull else round(e - rk, dec)
+    t2 = round(e + 2 * rk, dec) if bull else round(e - 2 * rk, dec)
+    if t1 <= 0 or t2 <= 0:
         return None
     return {
         "direction": direction,
         "entry": e, "stop": s,
         "target1": t1, "target": t2,
-        "risk": rk, "reward": round(2 * risk, dec),
+        "risk": rk, "reward": round(2 * rk, dec),
         "rr": 2.0,
         "weak": weak,
         "structure": bool(use_struct),
@@ -497,12 +510,16 @@ def _do_read(disp, yfs, dec, kind, source):
 
     # momentum-continuation bias (our highest-WR posture): take a 15-min push
     # that agrees with the 20-day trend; flat momentum = chop = wait. The
-    # "-weak" tags mark a push that fights the trend (lower conviction).
+    # "-weak" tags mark a push that fights the trend (lower conviction). The
+    # trigger is volatility-normalized: the push must clear the symbol's own
+    # noise (MOM_ATR_MULT * ATR%), not a flat threshold, so a quiet tape stays
+    # chop instead of firing a fake signal.
     bias = "neutral"
-    if mom15 is not None and sma20 is not None:
-        if mom15 > 0.05:
+    if mom15 is not None and sma20 is not None and atr and price:
+        mom_min = max(MOM_FLOOR_PCT, MOM_ATR_MULT * (atr / price * 100))
+        if mom15 >= mom_min:
             bias = "bullish" if above else "bullish-weak"
-        elif mom15 < -0.05:
+        elif mom15 <= -mom_min:
             bias = "bearish" if not above else "bearish-weak"
 
     plan = plan_levels(round(price, dec), bias, atr, hi, lo, dec, kind)

@@ -133,7 +133,7 @@ def signal_card(r: dict) -> str:
     if size:
         lines.append(size)
     if p.get("weak"):
-        lines.append("lower conviction: this push fights the bigger trend, go lighter.")
+        lines.append("lower conviction: this push fights the 20-day trend, go lighter.")
     if r.get("event_warning"):
         lines.append(r["event_warning"])
     lines.append("read only, not auto-traded. Your call.")
@@ -223,7 +223,7 @@ def _lean(kind: str, bias: str, r: dict = None) -> str:
     bull = bias.startswith("bull")
     weak = bias.endswith("weak")
     side = ("CALLS" if bull else "PUTS") if kind == "stock" else ("LONG" if bull else "SHORT")
-    qual = " (counter-trend, lighter)" if weak else " (with the trend)"
+    qual = " (counter the 20-day, lighter)" if weak else " (with the 20-day trend)"
     return f"{'📈' if bull else '📉'} lean: {side}{qual}"
 
 
