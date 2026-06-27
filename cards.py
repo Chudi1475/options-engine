@@ -70,35 +70,156 @@ def option_line(ticker: str, mn: dict, expiry=None) -> str:
     return f"{disp}  {arrow} BUY {typ}  {setup['strike']:g}{exp}  · {wtxt} {flag}"
 
 
+ICONS = {"gold": "🪙", "forex": "💱", "stock": "📊", "crypto": "🟠"}
+
+
+def fmt_price(price, kind: str, dec: int = 2) -> str:
+    """One place for instrument price formatting: forex prints bare (1.0832),
+    everything else gets a $, and decimals come from the read (so sub-dollar
+    crypto like SHIB keeps real digits instead of rounding to $0.00)."""
+    if price is None:
+        return "?"
+    s = f"{price:,.{dec}f}"
+    return s if kind == "forex" else f"${s}"
+
+
+def fmt_lvl(x, dec: int = 2) -> str:
+    """A bare price level (SL/TP/risk) with thousands separators, no currency."""
+    return "?" if x is None else f"{x:,.{dec}f}"
+
+
 def macro_line(r: dict) -> str:
-    """Compact read for gold / a forex pair from market_tools.macro_read():
-    instrument, price, day move, 15-min momentum, trend, plus any news warning."""
+    """The compact answer for ANY non-core symbol (gold, forex, crypto, a
+    looked-up stock). When the read carries a clean directional PLAN it renders
+    as a trade ticket (BUY/SELL, SL, TP). When it's chop or the market's closed
+    it falls back to the plain read + a 'wait' note."""
     if r.get("error"):
         return r["error"]
     if r.get("note"):
         return f"{r.get('instrument', 'that')}: {r['note']}"
+    if r.get("plan"):
+        return signal_card(r)
+    return read_card(r)
+
+
+def signal_card(r: dict) -> str:
+    """The trade ticket: clean and scannable, like a real signal.
+        🪙 SELL XAUUSD  @ 4,077.56
+        SL: 4,081.4   (risk 3.8)
+        TP: 4,069.9   (reward 7.6, 2R)
+    Built only from the read's real numbers — never a fabricated level."""
+    kind = r.get("kind", "stock")
+    dec = r.get("decimals", 2)
+    icon = ICONS.get(kind, "📊")
+    sym = r.get("ticker") or r.get("instrument", "?")
+    p = r["plan"]
+    dot = "🟢" if p["direction"] == "BUY" else "🔴"
+    verb = p["direction"]
+    if kind == "stock":  # a stock is traded as options, not spot
+        verb = "BUY CALLS" if p["direction"] == "BUY" else "BUY PUTS"
+    lines = [f"{icon} {dot} {verb} {sym}  @ {fmt_price(p['entry'], kind, dec)}"]
+    lines.append(f"SL: {fmt_lvl(p['stop'], dec)}   (risk {fmt_lvl(p['risk'], dec)})")
+    if p.get("target1") is not None:
+        lines.append(f"TP1: {fmt_lvl(p['target1'], dec)}   (1R, bank half, stop to entry)")
+    lines.append(f"TP2: {fmt_lvl(p['target'], dec)}   (2R, let it run)")
+    if kind == "stock":
+        lines.append("(levels are on the stock; trade it as the calls/puts)")
+    if r.get("asof"):
+        lines.append(f"price as of {r['asof']}, ~15m delayed, confirm live before you click.")
+    why = _why_line(r)
+    if why:
+        lines.append(why)
+    size = _size_line(r)
+    if size:
+        lines.append(size)
+    if p.get("weak"):
+        lines.append("lower conviction: this push fights the bigger trend, go lighter.")
+    if r.get("event_warning"):
+        lines.append(r["event_warning"])
+    lines.append("read only, not auto-traded. Your call.")
+    return "\n".join(lines)
+
+
+def _why_line(r: dict) -> str:
+    """One honest sentence on WHY, straight from the read's numbers."""
+    bits = []
+    mom = r.get("momentum_15min_pct")
+    if mom is not None:
+        bits.append(f"15m momentum {mom:+.2f}%")
+    vs = r.get("vs_20day_avg")
+    if vs:
+        bits.append(f"{vs} the 20-day")
+    return ("why: " + ", ".join(bits)) if bits else ""
+
+
+def _size_line(r: dict):
+    """Optional sizing. For gold the contract is well-defined (1 lot = 100 oz,
+    a $1 move = $100/lot), so when the account size is known we can suggest a
+    lot count that risks exactly RISK_PER_TRADE_PCT at the stop. Forex/crypto
+    only get the percent framing (pip value varies by broker). A stock plan is
+    traded as options, so its dollar risk is the premium, not the stop distance."""
+    p = r.get("plan") or {}
+    risk_pts = p.get("risk")
+    if not risk_pts or risk_pts <= 0:
+        return ""
+    kind = r.get("kind")
+    rp = config.RISK_PER_TRADE_PCT
+    if kind == "stock":
+        # option P&L isn't linear with the stock, so an underlying-distance stop
+        # is NOT the option's dollar risk. Don't imply it is.
+        return (f"your real risk is the premium you pay, size that to ~{rp:g}% of "
+                "the account. the SL is where you cut the calls/puts.")
+    acct = config.account_value()
+    if not acct:
+        return (f"size so the {fmt_lvl(risk_pts, r.get('decimals', 2))} stop costs "
+                f"~{rp:g}% of your account (/setaccount to size it).")
+    risk_dollars = acct * rp / 100
+    if kind == "gold":
+        lots = risk_dollars / (risk_pts * 100)
+        if lots < 0.01:
+            return (f"under a micro-lot at ~{rp:g}% of ${acct:,.0f}; gold's too big "
+                    "for this account on this stop, size down or skip.")
+        return (f"size: ~{lots:.2f} lots, risks ~${risk_dollars:,.0f} "
+                f"({rp:g}% of ${acct:,.0f}) if the stop hits.")
+    return (f"size it so the stop costs ~${risk_dollars:,.0f} ({rp:g}% of ${acct:,.0f}).")
+
+
+def read_card(r: dict) -> str:
+    """Plain read (no clean plan): price, day move, momentum, trend, and the
+    trigger that would turn it into a trade. Used on chop or a closed market."""
     disp = r.get("instrument", "?")
     kind = r.get("kind") or ("gold" if disp == "Gold" else "forex")
-    icon = {"gold": "🪙", "forex": "💱", "stock": "📊", "crypto": "🟠"}.get(kind, "📊")
-    price = r.get("price")
-    price_str = f"{price}" if kind == "forex" else f"${price:,.2f}"
-    parts = [f"{icon} {disp}  {price_str}"]
+    dec = r.get("decimals", 2)
+    icon = ICONS.get(kind, "📊")
+    head = ""
+    if r.get("stale"):
+        asof = r.get("asof")
+        head = (f"🕒 market's closed. last session{(' ' + asof) if asof else ''}, "
+                "these are reference levels, expect a gap on the open.\n")
+    parts = [f"{icon} {disp}  {fmt_price(r.get('price'), kind, dec)}"]
     if r.get("day_move_pct") is not None:
         parts.append(f"{r['day_move_pct']:+.2f}% today")
     if r.get("momentum_15min_pct") is not None:
         parts.append(f"15m mom {r['momentum_15min_pct']:+.2f}%")
     if r.get("vs_20day_avg"):
         parts.append(f"{r['vs_20day_avg']} 20d avg")
-    line = "  ·  ".join(parts) + "\n" + _lean(kind, r.get("bias"))
+    line = "  ·  ".join(parts) + "\n" + _lean(kind, r.get("bias"), r)
     if r.get("event_warning"):
         line += f"\n{r['event_warning']}"
-    return line + "\nYour call."
+    return head + line + "\nYour call."
 
 
-def _lean(kind: str, bias: str) -> str:
+def _lean(kind: str, bias: str, r: dict = None) -> str:
     """One-line directional lean from the read's momentum/trend bias."""
     if not bias or bias == "neutral":
-        return "⚪ chop, no clean lean — wait for a 15-min push to pick a side"
+        trig = ""
+        if r:
+            hi, lo = r.get("recent_session_high"), r.get("recent_session_low")
+            dec = r.get("decimals", 2)
+            if hi is not None and lo is not None:
+                trig = (f" (flips to a trade on a 15-min push over {fmt_lvl(hi, dec)} "
+                        f"or under {fmt_lvl(lo, dec)})")
+        return f"⚪ chop, no clean lean. Wait for a 15-min push to pick a side{trig}"
     bull = bias.startswith("bull")
     weak = bias.endswith("weak")
     side = ("CALLS" if bull else "PUTS") if kind == "stock" else ("LONG" if bull else "SHORT")
@@ -121,26 +242,26 @@ def size_lines(risk_pct: float, mid: float, correlated: bool):
             if n >= 1:
                 line += f" ≈ {n} contract{'s' if n != 1 else ''}"
             else:
-                line += " — under 1 contract at this price"
+                line += ", under 1 contract at this price"
         line += ")"
-    line += f" — risking {risk_pct:g}% if stopped"
+    line += f", risking {risk_pct:g}% if stopped"
     lines = [line]
     if not acct:
         lines.append("(text /setaccount 25000 to the bot to see dollar amounts)")
     if correlated:
-        lines.append("⚠️ CORRELATED — half size: a same-direction bet is already open.")
+        lines.append("⚠️ CORRELATED, half size: a same-direction bet is already open.")
     return lines, dollars
 
 
 def quote_lines(quote, est_mid: float):
     if quote is not None and quote.bid > 0:
-        return [f"Quote: Bid ${quote.bid:.2f} / Ask ${quote.ask:.2f} — "
-                f"set a LIMIT order near ${quote.mid:.2f}. Never market-order.",
+        return [f"Quote: Bid ${quote.bid:.2f} / Ask ${quote.ask:.2f}. "
+                f"Set a LIMIT order near ${quote.mid:.2f}. Never market-order.",
                 f"({quote.source})"]
     if quote is not None and quote.mid > 0:
-        return [f"Quote: last trade ${quote.mid:.2f} (no live bid/ask) — "
-                "set a LIMIT order near it. Never market-order."]
-    return [f"No live option quote available — tracking from an ESTIMATE of ${est_mid:.2f}.",
+        return [f"Quote: last trade ${quote.mid:.2f} (no live bid/ask). "
+                "Set a LIMIT order near it. Never market-order."]
+    return [f"No live option quote available, tracking from an ESTIMATE of ${est_mid:.2f}.",
             "Check the real price in your broker. Use a LIMIT order. Never market-order."]
 
 
@@ -293,8 +414,11 @@ def help_card() -> str:
         "/risk green|yellow|red [reason] — override today's risk mode",
         "/status — risk mode, account, open positions right now",
         "/calls [ticker] — live call/put setup per stock (BUY type, strike, expiry)",
+        "/signal <symbol> — clean trade ticket: BUY/SELL, entry, SL, TP, 2R "
+        "(e.g. /signal xauusd, /signal eurusd, /signal btc)",
+        "/chart <symbol> — same ticket PLUS a chart image with the levels drawn on",
         "/gold · /fx [pair] — read on gold or a forex pair (price, momentum, news)",
-        "/<symbol> — read + lean on ANY stock, ETF, fx, gold, or crypto "
+        "/<symbol> — read + plan on ANY stock, ETF, fx, gold, or crypto "
         "(e.g. /aapl /nvda /btc /eth) — or just ask me for a plan on it",
         "/health — bot self-check: feed, last heartbeat, today's alerts (owner)",
         "/score — your personal win/loss record (I keep it for you)",

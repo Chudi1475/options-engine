@@ -77,12 +77,50 @@ def paper_mode() -> bool:
     return os.environ.get("PAPER_MODE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def load_state() -> dict:
+class _StateUnavailable(Exception):
+    """state.json exists but is momentarily unreadable (e.g. a volume hiccup).
+    Raised on a WRITE path so we refuse to clobber real state with one key."""
+
+
+def _quarantine_state(reason: str = "") -> None:
+    """Move a corrupt state.json aside ONCE so the next write rebuilds clean
+    state instead of refusing forever, and the bad file is kept for forensics."""
+    bad = STATE_FILE.with_suffix(".corrupt")
+    try:
+        if STATE_FILE.exists() and not bad.exists():
+            STATE_FILE.replace(bad)
+            print(f"state.json {reason} -> moved to {bad.name}; rebuilding fresh state")
+    except OSError:
+        pass
+
+
+_LAST_GOOD = {}  # last successfully-parsed state, served to readers over a hiccup
+
+
+def load_state(strict: bool = False) -> dict:
+    global _LAST_GOOD
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8-sig"))
-        except (json.JSONDecodeError, OSError):
+            parsed = json.loads(STATE_FILE.read_text(encoding="utf-8-sig"))
+            if isinstance(parsed, dict):
+                _LAST_GOOD = parsed
+            return parsed
+        except json.JSONDecodeError as e:
+            # Corrupt/torn CONTENT won't heal itself. If we returned {} here, the
+            # next state_set would persist {only_that_key} and wipe everything
+            # else (requests, account_value, tg_offset, dedup keys...). Move the
+            # bad file aside once so a later write rebuilds clean state.
+            _quarantine_state(f"corrupt ({e})")
             return {}
+        except OSError as e:
+            # The file IS there but momentarily unreadable (mounted-volume
+            # hiccup — save_state anticipates the same on its write side). On a
+            # write path, refuse rather than clobber good-but-unreadable state.
+            # On a read path serve the last-good snapshot (not {}), so a one-cycle
+            # hiccup can't make a dedup check ("recap already sent?") re-fire.
+            if strict:
+                raise _StateUnavailable(str(e))
+            return dict(_LAST_GOOD)
     boot = os.environ.get("BOOTSTRAP_STATE", "").strip()
     if boot:  # first boot on a fresh volume: seed state (e.g. so a new cloud
         try:  # deploy doesn't re-send reports the local bot already sent)
@@ -126,7 +164,11 @@ def state_get(key, default=None):
 
 def state_set(key, value) -> None:
     with _STATE_LOCK:  # load -> mutate -> save is one atomic critical section
-        s = load_state()
+        try:
+            s = load_state(strict=True)
+        except _StateUnavailable as e:  # don't overwrite real state we can't read
+            print(f"state_set({key!r}): state.json unreadable, write skipped: {e}")
+            return
         s[key] = value
         save_state(s)
 
@@ -138,16 +180,24 @@ def state_update(key, fn, default=None) -> None:
     the news-watcher both touching pending_sends — so neither loses the other's
     update."""
     with _STATE_LOCK:
-        s = load_state()
+        try:
+            s = load_state(strict=True)
+        except _StateUnavailable as e:  # don't overwrite real state we can't read
+            print(f"state_update({key!r}): state.json unreadable, write skipped: {e}")
+            return
         s[key] = fn(s.get(key, default))
         save_state(s)
 
 
 def account_value():
-    """Account dollar size: /setaccount (state.json) beats the env var."""
+    """Account dollar size: /setaccount (state.json) beats the env var. A stored
+    value is honored even if it's 0 (use presence, not truthiness)."""
     v = state_get("account_value")
-    if v:
-        return float(v)
+    if v is not None:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            pass
     for name in ("ACCOUNT_VALUE", "ACCOUNT_SIZE"):
         raw = os.environ.get(name, "").replace(",", "").replace("$", "").strip()
         if raw:
@@ -161,4 +211,7 @@ def account_value():
 def suggested_alloc_pct(risk_pct: float) -> float:
     """% of account to put in so a full stop-out costs exactly risk_pct.
     Derived from the live STOP_PCT — e.g. risk 1% / stop 70% -> ~1.43%."""
-    return risk_pct / (abs(STOP_PCT) / 100.0)
+    stop = abs(STOP_PCT) / 100.0
+    if stop <= 0:  # guard a STOP_PCT=0 env override from dividing by zero
+        stop = 0.70
+    return risk_pct / stop

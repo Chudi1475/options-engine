@@ -23,6 +23,7 @@ import intake
 import telegram
 
 _HISTORY_LOCK = threading.Lock()  # serialize chat_history.json writes
+_TRADES_LOCK = threading.Lock()   # serialize user_trades.json writes
 
 API_URL = "https://api.anthropic.com/v1/messages"
 HISTORY_FILE = config.DATA_DIR / "chat_history.json"
@@ -93,30 +94,29 @@ Market reads & trade plans — be the SNIPER, decisive:
   market_now / analyze_day — that doesn't change. But when ANYONE asks about ANY
   OTHER symbol (a stock, ETF, forex pair, gold, or crypto like BTC/ETH), or asks
   "calls or puts on X", "is X a buy", "what's the play on X" — call macro_read
-  with that symbol and GIVE A REAL STRATEGY PLAN. NEVER refuse with "that's not
-  one of our setups" or "I can only give a read, your call." You commit to a plan.
-- Build the plan ONLY from what macro_read returns (price, momentum_15min_pct,
-  day move, recent_session_high/low, vs_20day_avg, the bias field, event_warning),
-  using our highest-WR method: momentum continuation in the direction of the
-  trend. Short and concrete, like a sniper:
-  * DIRECTION: bias bullish -> calls/long; bearish -> puts/short. A "-weak" bias
-    (push fighting the trend) = smaller, lower conviction, say so. bias neutral =
-    real chop, and the high-WR move IS to wait — say that and give the trigger
-    that flips it (e.g. "needs a 15-min push back above <recent high>").
-  * ENTRY: a real level (current price, or a pullback toward recent_session_low /
-    the 20-day for longs, recent_session_high for shorts).
-  * TARGET: the next real level (recent_session_high for longs, low for shorts).
-  * STOP: just past the level that proves you wrong (below recent_session_low for
-    longs, above the high for shorts).
-  * MANAGE IT our way: take half into the first target, trail the rest, cut at the
-    stop. Stock/ETF -> frame as calls or puts (near the money). Forex/crypto ->
-    long or short the spot.
+  with that symbol and GIVE THE PLAN. NEVER refuse with "that's not one of our
+  setups" or "I can only give a read."
+- macro_read does the math for you: it returns a ready 'plan' object built from
+  real numbers using our momentum-continuation method. When 'plan' is present,
+  just STATE it, clean like a signal:
+    * direction (BUY/SELL; for a stock say BUY CALLS / BUY PUTS), at entry
+    * SL = plan.stop, TP = plan.target (that's a 2R target, plan.rr)
+    * manage it our way: take half into the target, trail the rest, cut at the SL
+    * if plan.weak is true, say it's lower conviction (the push fights the bigger
+      trend) and to go lighter.
+  Quote plan.entry / plan.stop / plan.target EXACTLY as returned. Do not round
+  them differently or invent your own.
+- When 'plan' is null, there is NO clean trade right now — either it's chop
+  (bias neutral) or the market's closed and there's no intraday read. Say that
+  straight ("no clean setup on X right now") and give the trigger that would make
+  one (e.g. "a 15-min push back over <recent_session_high>"). Do NOT fabricate an
+  entry/stop/target to fill the gap, and do NOT hedge endlessly — one honest
+  "nothing clean here yet, watch <level>" is the decisive answer.
 - HONESTY still holds: quote ONLY the numbers macro_read returned, never invent a
   level, and never claim a win rate for THAT name (our backtested WR is on the
   core four; for others it's the same METHOD, not a measured number — say that in
   one line if it comes up). If event_warning is set, LEAD with "wait for it."
-  Don't promise profit. A short "Your call." at the end is fine, but the PLAN must
-  be concrete and decisive — direction, entry, target, stop — not a hedge.
+  Don't promise profit. End with "Your call."
 - If macro_read returns an "error", the symbol couldn't be found: say so and ask
   them to double-check the ticker.
 
@@ -319,9 +319,15 @@ def log_trade(chat_id: str, profit_dollars: float, ticker: str = "",
         "ticker": (ticker or "").upper(),
         "note": note or "",
     }
-    trades = _load_trades()
-    trades.setdefault(chat_id, []).append(entry)
-    TRADES_FILE.write_text(json.dumps(trades, indent=1), encoding="utf-8")
+    # the brain now runs on concurrent background threads (scanner._dispatch_brain),
+    # so two members logging at once could race a plain read-modify-write and wipe
+    # each other's ledger. Lock + atomic temp-replace, exactly like _save_turn.
+    with _TRADES_LOCK:
+        trades = _load_trades()
+        trades.setdefault(chat_id, []).append(entry)
+        tmp = TRADES_FILE.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(trades, indent=1), encoding="utf-8")
+        tmp.replace(TRADES_FILE)
     return entry
 
 

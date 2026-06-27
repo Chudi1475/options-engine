@@ -10,6 +10,7 @@ import re
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 import yfinance as yf
 
 import config
@@ -316,10 +317,105 @@ def resolve(symbol):
     return None
 
 
+def _adaptive_dec(price, kind, dec):
+    """Crypto spans BTC (~$100k) to SHIB (~$0.00002); a flat 2 dp rounds the
+    cheap coins to 0.0 and prints a false price. Pick decimals from the price
+    magnitude for crypto so sub-dollar coins keep real digits; everything else
+    keeps its declared precision."""
+    if kind != "crypto" or price is None:
+        return dec
+    if price >= 1:
+        return 2
+    if price >= 0.01:
+        return 5
+    return 8
+
+
+def _nan_none(x, dec):
+    """Round to dec, but turn NaN/None into a real None (so 'nan' never reaches
+    a user or a JSON dump)."""
+    if x is None or pd.isna(x):
+        return None
+    return round(float(x), dec)
+
+
+def _atr(bars, n=14):
+    """Average True Range over the last n bars — our volatility unit for sizing
+    the stop. Real numbers only; None when there aren't enough bars."""
+    if bars is None or bars.empty:
+        return None
+    hlc = bars[["High", "Low", "Close"]].dropna()
+    if len(hlc) < 3:
+        return None
+    prev_close = hlc["Close"].shift(1)
+    tr = pd.concat([hlc["High"] - hlc["Low"],
+                    (hlc["High"] - prev_close).abs(),
+                    (hlc["Low"] - prev_close).abs()], axis=1).max(axis=1)
+    val = float(tr.tail(n).mean())
+    return val if val > 0 and not pd.isna(val) else None
+
+
+def _signal_symbol(disp, kind):
+    """The symbol a trader actually places the order on: gold -> XAUUSD,
+    EUR/USD -> EURUSD, BTC/USD -> BTCUSD, a stock -> its ticker."""
+    if kind == "gold":
+        return "XAUUSD"
+    if kind in ("forex", "crypto"):
+        return disp.replace("/", "")
+    return disp
+
+
+def plan_levels(price, bias, atr, hi, lo, dec, kind):
+    """A concrete trade plan built ONLY from real numbers: ATR sizes the risk,
+    recent structure (session high/low) anchors the stop when it sits a sane
+    distance away, and a fixed 2R sets the target. Returns None when there's no
+    clean directional lean (chop = no trade) or no volatility estimate. Never
+    invents a level."""
+    if not bias or bias == "neutral" or not price or not atr or atr <= 0:
+        return None
+    bull = bias.startswith("bull")
+    weak = bias.endswith("weak")
+    pad = atr * 0.15  # sit the stop just PAST the level, not exactly on it
+    if bull:
+        struct = lo
+        use_struct = struct is not None and 0.3 * atr <= (price - struct) <= 1.5 * atr
+        stop = (struct - pad) if use_struct else (price - atr)
+        risk = price - stop
+        target1 = price + risk        # 1R: bank half, stop to entry
+        target = price + 2 * risk     # 2R: let the runner go
+        direction = "BUY"
+    else:
+        struct = hi
+        use_struct = struct is not None and 0.3 * atr <= (struct - price) <= 1.5 * atr
+        stop = (struct + pad) if use_struct else (price + atr)
+        risk = stop - price
+        target1 = price - risk
+        target = price - 2 * risk
+        direction = "SELL"
+    # validate the DISPLAYED (rounded) levels, not the raw ones: a stop a
+    # fraction of a tick from price rounds to risk 0.00, and a SELL on a cheap,
+    # very volatile name can push the 2R target to/under 0. Either is a nonsense
+    # ticket, so bail to None and let the read fall through to the honest
+    # "no clean trade, watch <level>" path.
+    e, s = round(price, dec), round(stop, dec)
+    t1, t2, rk = round(target1, dec), round(target, dec), round(risk, dec)
+    if rk <= 0 or s == e or t2 <= 0 or t1 <= 0:
+        return None
+    return {
+        "direction": direction,
+        "entry": e, "stop": s,
+        "target1": t1, "target": t2,
+        "risk": rk, "reward": round(2 * risk, dec),
+        "rr": 2.0,
+        "weak": weak,
+        "structure": bool(use_struct),
+    }
+
+
 def _do_read(disp, yfs, dec, kind, source):
     """Shared read engine for any symbol: price, day move, 15-min momentum,
-    recent high/low, 20-day trend, a momentum/trend BIAS, plus high-impact
-    news. Real numbers only (yfinance, ~15-min delayed)."""
+    recent high/low, 20-day trend, a momentum/trend BIAS, an ATR-sized trade
+    PLAN, plus high-impact news. Real numbers only (yfinance, ~15-min delayed)."""
     try:
         d1 = _flatten(yf.download(yfs, period="1mo", interval="1d",
                                   progress=False, auto_adjust=False))
@@ -332,8 +428,34 @@ def _do_read(disp, yfs, dec, kind, source):
 
     closes_d = d1["Close"].dropna()
     have_5m = m5 is not None and not m5.empty and not m5["Close"].dropna().empty
+    # normalize the intraday index to ET. yfinance hands back UTC for the 24h
+    # markets (forex/gold/crypto), so without this the "last session" filter
+    # below splits on the wrong calendar day and hi/lo cover a sliver of bars.
+    if have_5m and getattr(m5.index, "tz", None) is not None:
+        try:
+            m5.index = m5.index.tz_convert(ET)
+        except (TypeError, ValueError):
+            pass
     price = float(m5["Close"].dropna().iloc[-1]) if have_5m else float(closes_d.iloc[-1])
     prior_close = float(closes_d.iloc[-2]) if len(closes_d) >= 2 else None
+
+    # how old is the last bar? Used to tell a LIVE read from a stale one (market
+    # closed / weekend), so we never dress a last-session close up as a live
+    # entry. yfinance is ~15 min delayed, so a generous 90-min window keeps a
+    # normal live read from being flagged while a closed market (bars hours old)
+    # always is. 24/7 crypto is never stale by this rule.
+    asof = None
+    stale = not have_5m  # no intraday at all -> the daily fallback IS stale
+    if have_5m:
+        try:
+            last_ts = m5.index[-1].to_pydatetime()
+            asof = last_ts.strftime("%a %I:%M %p ET").replace(" 0", " ")
+            stale = (datetime.now(ET) - last_ts) > timedelta(minutes=90)
+        except (AttributeError, ValueError, TypeError):
+            stale = False  # can't tell -> don't falsely flag a live read
+
+    # crypto precision depends on the live price (SHIB needs 8 dp, BTC needs 2)
+    dec = _adaptive_dec(price, kind, dec)
 
     mom15 = None
     if have_5m:
@@ -341,18 +463,36 @@ def _do_read(disp, yfs, dec, kind, source):
         if len(c) >= 4:  # 15 min = 3 bars back
             mom15 = round((price / float(c.iloc[-4]) - 1) * 100, 2)
 
+    # recent session high/low for structure. Prefer the last ET day of 5m bars;
+    # fall back to the last DAILY bar when intraday is empty (market closed /
+    # weekend) so the level fields aren't null when someone chats after hours.
     hi = lo = None
+    day_bars = None
     if have_5m:
         try:
             last_day = max(m5.index.date)
             day_bars = m5[[d == last_day for d in m5.index.date]]
         except Exception:
             day_bars = m5
-        if not day_bars.empty:
-            hi = round(float(day_bars["High"].max()), dec)
-            lo = round(float(day_bars["Low"].min()), dec)
+        if day_bars is not None and not day_bars.empty:
+            hi = _nan_none(day_bars["High"].max(), dec)
+            lo = _nan_none(day_bars["Low"].min(), dec)
+    if hi is None or lo is None:  # intraday gap -> use the last completed day
+        try:
+            hi = _nan_none(d1["High"].dropna().iloc[-1], dec)
+            lo = _nan_none(d1["Low"].dropna().iloc[-1], dec)
+        except (KeyError, IndexError):
+            pass
 
-    sma20 = float(closes_d.tail(20).mean()) if len(closes_d) >= 5 else None
+    # ATR (volatility unit for the stop): the 5m timeframe they actually scalp
+    # when the market's open, else the daily range.
+    atr = _atr(day_bars if (day_bars is not None and not day_bars.empty) else m5)
+    if atr is None:
+        atr = _atr(d1)
+
+    # a true 20-day average needs 20 closes; with fewer, don't dress a short
+    # mean up as "the 20-day".
+    sma20 = float(closes_d.tail(20).mean()) if len(closes_d) >= 20 else None
     above = sma20 is not None and price > sma20
 
     # momentum-continuation bias (our highest-WR posture): take a 15-min push
@@ -365,6 +505,8 @@ def _do_read(disp, yfs, dec, kind, source):
         elif mom15 < -0.05:
             bias = "bearish" if not above else "bearish-weak"
 
+    plan = plan_levels(round(price, dec), bias, atr, hi, lo, dec, kind)
+
     # event awareness: forex uses both pair currencies; everything else watches
     # USD high-impact prints (Fed/CPI/NFP move stocks, gold and crypto too).
     event_ccy, events = ["USD"], []
@@ -376,31 +518,46 @@ def _do_read(disp, yfs, dec, kind, source):
     except Exception:
         events = []
     event_warning = None
+    blackout = False
     if events:
         nxt = events[0]
         m = nxt["mins_away"]
         tleft = f"{m}m" if m < 60 else f"{m // 60}h{m % 60:02d}m"
+        blackout = m <= 30  # too close to a high-impact print to enter
         event_warning = (f"⚠️ {nxt['title']} ({nxt['currency']}) in {tleft} "
                          f"({nxt['when']}), high impact. Expect a sharp move; "
-                         "it can wait until the dust settles.")
+                         + ("wait until it's out and the dust settles."
+                            if blackout else "it can wait until the dust settles."))
+
+    # Don't show a plan as a live entry when the price is stale (market closed)
+    # or a high-impact event is imminent. macro_line routes a null plan to the
+    # honest read_card ("no clean trade right now, watch <level>").
+    if stale or blackout:
+        plan = None
 
     return {
-        "instrument": disp, "symbol": yfs, "kind": kind,
-        "price": round(price, dec),
+        "instrument": disp, "ticker": _signal_symbol(disp, kind),
+        "symbol": yfs, "kind": kind, "decimals": dec,
+        "price": round(price, dec), "asof": asof, "stale": stale,
         "prior_close": round(prior_close, dec) if prior_close is not None else None,
         "day_move_pct": round((price / prior_close - 1) * 100, 2) if prior_close else None,
         "momentum_15min_pct": mom15,
         "recent_session_high": hi, "recent_session_low": lo,
-        "twentyday_avg": round(sma20, dec) if sma20 else None,
+        "atr": round(atr, dec) if atr is not None else None,
+        "twentyday_avg": round(sma20, dec) if sma20 is not None else None,
         "vs_20day_avg": (None if sma20 is None else "above" if above else "below"),
         "bias": bias,
+        "plan": plan, "blackout": blackout,
         "event_warning": event_warning,
         "upcoming_events": events[:4],
         "source": source,
-        "disclaimer": "Build a concrete PLAN (direction, entry, target, stop) from "
-                "these REAL numbers using our momentum method; lead with any "
-                "event_warning; quote only these levels, never invent one or a "
-                "win rate; end with 'Your call.'",
+        "disclaimer": "A ready trade PLAN is in the 'plan' field (direction, entry, "
+                "stop, TP1 at 1R, TP2 at 2R) built from these REAL numbers. State it "
+                "plainly. If 'plan' is null there's no clean trade: it's chop, the "
+                "market's closed (see 'stale'/'asof'), or a high-impact event is "
+                "imminent (see 'blackout'/event_warning). Say so and give the trigger "
+                "that would make a trade. Lead with any event_warning; quote only "
+                "these levels, never invent one or a win rate; end with 'Your call.'",
     }
 
 
@@ -416,11 +573,9 @@ def read_any(symbol):
 
 
 def known_symbol(symbol):
-    """Cheap membership check (no network) for the bare /<symbol> command guard."""
-    key = _norm(symbol)
-    if key in MACRO_SYMBOLS or key in CRYPTO or (key.endswith("usd") and key[:-3] in CRYPTO):
-        return True
-    return STOCK_ALIASES.get(key, (symbol or "").upper().lstrip("$").strip()) in LOOKUP_STOCKS
+    """Cheap membership check (no network) for the bare /<symbol> command guard.
+    Delegates to resolve() so the guard and the real resolver can never disagree."""
+    return resolve(symbol) is not None
 
 
 # back-compat aliases (older callers / tests)

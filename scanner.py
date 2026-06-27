@@ -451,27 +451,43 @@ class Service:
                     "(get one at console.anthropic.com) and I'll answer "
                     "questions, read chart screenshots, and read files like "
                     "a human. Commands still work any time: /help")
-        return self._respond_with_typing(item)
+        self._dispatch_brain(item)
+        return None  # the worker thread sends the reply itself
 
-    def _respond_with_typing(self, item: dict):
-        """Run the brain while a background thread keeps the 'Sniper is typing…'
-        indicator alive (Telegram's typing status expires after ~5s, so refresh
-        it every 4s until the reply is ready)."""
+    def _dispatch_brain(self, item: dict):
+        """Answer a free-form chat message on a BACKGROUND thread so the main
+        trading loop NEVER blocks on a slow brain call. A stalled Anthropic
+        request (up to ~120s per turn, longer across tool calls) must never
+        stall the next cycle's entry scans or, far worse, the +25%/give-back/
+        STOP exit monitoring. This mirrors how breaking-news reads already run
+        off-loop. A typing heartbeat keeps 'Sniper is typing…' alive until the
+        reply is sent. The status snapshot is taken HERE, on the loop thread
+        (serialized with scan/monitor), so the worker never races the book."""
         import threading
+
         import assistant
         chat_id = item["chat_id"]
-        stop = threading.Event()
+        status = self.status_text()  # snapshot on the loop thread (race-free)
 
-        def _beat():
-            while not stop.is_set():
-                telegram.send_chat_action(chat_id)
-                stop.wait(4)
+        def worker():
+            stop = threading.Event()
 
-        threading.Thread(target=_beat, daemon=True).start()
-        try:
-            return assistant.respond(item, self.status_text())
-        finally:
-            stop.set()
+            def beat():
+                while not stop.is_set():
+                    telegram.send_chat_action(chat_id)
+                    stop.wait(3)
+
+            threading.Thread(target=beat, daemon=True).start()
+            try:
+                reply = assistant.respond(item, status)
+            except Exception as e:
+                reply = f"that one hit an error on my end: {e}"
+            finally:
+                stop.set()
+            if reply:
+                telegram.send_to(chat_id, reply)
+
+        threading.Thread(target=worker, daemon=True, name="brain-reply").start()
 
     def offer_add_user(self, item: dict):
         """A stranger messaged the bot. Tell the owner(s) once, with a
@@ -555,6 +571,13 @@ class Service:
                 return self.read_text(args)
             return ("Which pair? I read EUR/USD, GBP/USD, USD/JPY, AUD/USD, "
                     "USD/CAD, USD/CHF.  e.g.  /fx eurusd   (or /gold for gold)")
+        if cmd in ("/signal", "/plan", "/trade"):
+            if args.strip():
+                return self.read_text(args)
+            return ("Which symbol? e.g.  /signal xauusd  ·  /signal eurusd  ·  "
+                    "/signal btc  ·  /signal nvda")
+        if cmd in ("/chart", "/pic", "/img"):
+            return self.chart_reply(args, chat_id)
         if cmd == "/requests":
             import intake
             return intake.list_text()
@@ -595,10 +618,7 @@ class Service:
             if t not in self.cfg.watchlist:
                 # not an options ticker — gold/forex/lookup-stock get a read
                 # instead of a flat rejection (so /calls gold, /calls aapl work)
-                r = market_tools.any_read(arg)
-                if not r.get("error"):
-                    return cards.macro_line(r)
-                return cards.macro_line(r)  # any_read's error is already helpful
+                return self.read_text(arg)
             tickers = [t]
         else:
             tickers = wl
@@ -624,6 +644,49 @@ class Service:
         bare-symbol commands like /aapl, and /calls."""
         import market_tools
         return cards.macro_line(market_tools.any_read(arg))
+
+    def chart_reply(self, arg: str, chat_id: str = ""):
+        """/chart <symbol> — text the trade ticket AND a chart image of it with
+        the entry/SL/TP drawn on. The read (two downloads) + render (a third +
+        matplotlib) run on a BACKGROUND thread so they never block exit
+        monitoring; it falls back to text only if the chart can't render."""
+        arg = (arg or "").strip()
+        if not arg:
+            return ("Which symbol? e.g.  /chart xauusd  ·  /chart eurusd  ·  "
+                    "/chart btc  ·  /chart nvda")
+        if self.dry:  # CLI/dry-run: synchronous text, no photo
+            import market_tools
+            return cards.macro_line(market_tools.read_any(arg))
+
+        import threading
+        stop = threading.Event()
+
+        def beat():
+            while not stop.is_set():
+                telegram.send_chat_action(chat_id, "upload_photo")
+                stop.wait(3)
+
+        def worker():
+            threading.Thread(target=beat, daemon=True).start()
+            try:
+                import charts
+                import market_tools
+                r = market_tools.read_any(arg)
+                text = cards.macro_line(r)
+                sent = False
+                if not (r.get("error") or r.get("note")):
+                    img, _ = charts.render_signal(r)
+                    if img and not telegram.send_photo(chat_id, img, caption=text[:1024]):
+                        sent = len(text) <= 1024  # caption carried the whole read
+                if not sent:
+                    telegram.send_to(chat_id, text)
+            except Exception as e:
+                telegram.send_to(chat_id, f"couldn't build that chart: {e}")
+            finally:
+                stop.set()
+
+        threading.Thread(target=worker, daemon=True, name="chart-reply").start()
+        return None  # the worker sends the photo/text itself
 
     def cmd_request_status(self, cmd: str, args: str):
         """/approve|/reject|/done <id> [note] — move a request and tell the

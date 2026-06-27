@@ -11,6 +11,8 @@ positions.json
 positions_dryrun.json
 positions_test.json
 state.json
+state.corrupt
+news_seen.json
 calendar_cache.json
 chat_history.json
 user_trades.json

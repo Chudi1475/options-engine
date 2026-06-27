@@ -67,13 +67,31 @@ def send_to(chat_id, text: str):
 
 def send_chat_action(chat_id, action: str = "typing"):
     """Best-effort 'typing…' indicator so a chat feels alive while the brain
-    thinks. Never raises — a hiccup here must never block the actual reply."""
+    thinks. Never raises — a hiccup here must never block the actual reply.
+    Short timeout so a stall can't push the next refresh past Telegram's ~5s
+    typing-status expiry and make the indicator flicker off."""
     try:
         requests.post(
             f"https://api.telegram.org/bot{_token()}/sendChatAction",
-            json={"chat_id": chat_id, "action": action}, timeout=5)
+            json={"chat_id": chat_id, "action": action}, timeout=3)
     except requests.RequestException:
         pass
+
+
+def send_photo(chat_id, image_bytes: bytes, caption: str = ""):
+    """Send a generated image (e.g. a chart) to one chat. Returns an error
+    string or None. Telegram caps captions at 1024 chars."""
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{_token()}/sendPhoto",
+            data={"chat_id": chat_id, "caption": caption[:1024]},
+            files={"photo": ("chart.png", image_bytes, "image/png")},
+            timeout=30)
+        if not r.ok:
+            return f"{chat_id}: {r.status_code} {r.text[:200]}"
+    except requests.RequestException as e:
+        return f"{chat_id}: {e}"
+    return None
 
 
 def send(text: str) -> list:

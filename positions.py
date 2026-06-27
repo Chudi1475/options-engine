@@ -229,15 +229,25 @@ class PositionBook:
     def needs_monitoring(self, today: date) -> list:
         """Positions that still need price updates: open ones, plus closed
         ones whose old-rules shadow is still open. Positions past expiry get
-        force-settled instead (bot was offline at their close)."""
+        force-settled instead (bot was offline at their close).
+
+        load() guarantees one bad record can't crash startup; that guarantee has
+        to hold at runtime too. expires_on() (parses self.expiry) and
+        old_rules[...] can still raise on a constructible-but-malformed record
+        (e.g. a blank/invalid expiry, old_rules==null), and this runs OUTSIDE
+        scanner's per-position try/except — so a single bad row would otherwise
+        drop EVERY live position from price/exit monitoring. Guard per record."""
         out = []
         for p in self.positions:
-            if p.state == "closed" and p.old_rules["status"] != "open":
-                continue
-            if p.expires_on() < today:
-                self._force_expire(p)
-                continue
-            out.append(p)
+            try:
+                if p.state == "closed" and p.old_rules["status"] != "open":
+                    continue
+                if p.expires_on() < today:
+                    self._force_expire(p)
+                    continue
+                out.append(p)
+            except Exception as e:
+                print(f"skipping unmonitorable position {getattr(p, 'id', '?')}: {e}")
         return out
 
     def _force_expire(self, p: Position):
