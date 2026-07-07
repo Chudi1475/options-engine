@@ -459,6 +459,7 @@ def help_card() -> str:
         "(I text the person back)",
         "/backlog — open build items, ready to paste into Claude Code",
         "/reqfrom add <id> <name> — bring Kelechi/Ryan online (asks + alerts)",
+        "/broadcastcommands — text the everyone-can-use list to all members",
         "",
         "You can also just TALK to me — ask anything, or send a chart "
         "screenshot / PDF / CSV and I'll read it and answer like a human.",
