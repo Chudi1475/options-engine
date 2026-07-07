@@ -589,6 +589,8 @@ class Service:
         if cmd == "/reqfrom":
             import intake
             return intake.reqfrom_command(args)
+        if cmd in ("/commands", "/cmds"):
+            return cards.public_commands_card()
         if cmd in ("/help", "/start"):
             return cards.help_card()
         # bare-symbol shortcut: /spx /qcom /gold /usdjpy /eurusd ... just work.

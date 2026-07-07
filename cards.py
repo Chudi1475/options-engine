@@ -407,6 +407,31 @@ def morning_card(mode: str, reason: str, today: date) -> str:
     ])
 
 
+def public_commands_card() -> str:
+    """The commands EVERYONE with access can use — no owner-only entries.
+    Single source of truth: /commands returns this and broadcast_commands.py
+    sends this, so the two never drift."""
+    return "\n".join([
+        "📋 Commands everyone can use:",
+        "",
+        "/status — risk mode, account, open positions right now",
+        "/calls [ticker] — live call/put setup per stock (BUY type, strike, expiry)",
+        "/signal <symbol> — clean trade ticket: BUY/SELL, entry, SL, TP, 2R "
+        "(e.g. /signal xauusd, /signal eurusd, /signal btc)",
+        "/chart <symbol> — same ticket PLUS a chart image with the levels drawn on",
+        "/gold — read on gold (price, momentum, news)",
+        "/fx [pair] — read on a forex pair (EUR/USD, GBP/USD, USD/JPY, AUD/USD, "
+        "USD/CAD, USD/CHF)",
+        "/<symbol> — read + plan on ANY stock, ETF, fx, gold, or crypto "
+        "(e.g. /aapl /nvda /btc /eth)",
+        "/score — your personal win/loss record",
+        "/help — the full list",
+        "",
+        "💬 You can also just talk to me, or send a chart screenshot / PDF / CSV "
+        "and I'll read it and answer like a human.",
+    ])
+
+
 def help_card() -> str:
     return "\n".join([
         "Commands I understand:",
@@ -425,6 +450,7 @@ def help_card() -> str:
         "/adduser — let another person in (owner only)",
         "/users — see who has access (owner only)",
         "/test — fire a fake signal through every alert type",
+        "/commands — just the everyone-can-use list (great to share)",
         "/help — this list",
         "",
         "Owner request controls:",
