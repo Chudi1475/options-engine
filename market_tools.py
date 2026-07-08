@@ -52,8 +52,25 @@ LOOKUP_STOCKS = {t: (t, t, 2) for t in (
     "BA", "INTC", "MU", "LLY", "QQQ", "IWM", "DIA", "GLD", "SLV", "ARKK",
 )}
 
+# Indices (and index-like names) need Yahoo's ^ symbols — a bare "SPX" ticker
+# doesn't exist on yfinance, which used to make /chart spx say "no recent
+# data". alias -> (display, yf symbol, decimals)
+INDEX_SYMBOLS = {
+    "spx": ("SPX", "^GSPC", 2), "sp500": ("SPX", "^GSPC", 2),
+    "spx500": ("SPX", "^GSPC", 2), "us500": ("SPX", "^GSPC", 2),
+    "s&p500": ("SPX", "^GSPC", 2), "s&p": ("SPX", "^GSPC", 2),
+    "ndx": ("NDX", "^NDX", 2), "nas100": ("NDX", "^NDX", 2),
+    "nasdaq100": ("NDX", "^NDX", 2), "us100": ("NDX", "^NDX", 2),
+    "vix": ("VIX", "^VIX", 2),
+    "us30": ("DOW", "^DJI", 2), "dow30": ("DOW", "^DJI", 2),
+    "dji": ("DOW", "^DJI", 2),
+    "dxy": ("DXY", "DX-Y.NYB", 2), "dollarindex": ("DXY", "DX-Y.NYB", 2),
+    "russell2000": ("RUT", "^RUT", 2), "us2000": ("RUT", "^RUT", 2),
+}
+
 # friendly name -> ticker so a chat like "how's nvidia" resolves
 STOCK_ALIASES = {
+    "tesla": "TSLA", "qualcomm": "QCOM",
     "apple": "AAPL", "microsoft": "MSFT", "nvidia": "NVDA", "amazon": "AMZN",
     "google": "GOOGL", "alphabet": "GOOGL", "meta": "META", "facebook": "META",
     "broadcom": "AVGO", "netflix": "NFLX", "palantir": "PLTR", "coinbase": "COIN",
@@ -306,6 +323,9 @@ def resolve(symbol):
     if key in MACRO_SYMBOLS:
         disp, yfs, dec = MACRO_SYMBOLS[key]
         return (disp, yfs, dec, "gold" if yfs == "GC=F" else "forex")
+    if key in INDEX_SYMBOLS:
+        disp, yfs, dec = INDEX_SYMBOLS[key]
+        return (disp, yfs, dec, "stock")
     base = CRYPTO.get(key) or (CRYPTO.get(key[:-3]) if key.endswith("usd") else None)
     if base:
         return (f"{base}/USD", f"{base}-USD", 2, "crypto")
