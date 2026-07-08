@@ -122,7 +122,13 @@ def step(pos: Position, now: datetime, mark: float, mark_source: str,
             pos.mfe_pct = pct if pos.mfe_pct is None else max(pos.mfe_pct, pct)
             pos.mae_pct = pct if pos.mae_pct is None else min(pos.mae_pct, pct)
 
-        stop_trigger = min(eff, est_pct) if est_pct is not None else eff
+        # the hard stop fires off the REAL quote when we have a comparable one;
+        # the realized-vol model estimate only governs when the quote is missing
+        # or non-comparable. On elevated-IV 0DTE days the model runs far more
+        # negative than the true option, and min(eff, est) let it stop winners
+        # out early even while a fresh live quote sat well above the stop.
+        stop_trigger = eff if comparable else (
+            min(eff, est_pct) if est_pct is not None else eff)
         if stop_trigger <= config.STOP_PCT:
             pos.final_exit = {"time": ts, "pct": eff, "mark": mark, "reason": "stop"}
             pos.final_pnl_pct = pos.weighted_final(eff)

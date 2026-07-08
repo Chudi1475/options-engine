@@ -884,8 +884,13 @@ class Service:
 
     def scan_entries(self, now: datetime):
         opened = self.book.opened_today(now.date())
+        # a weekly (TSLA/QCOM) opened earlier in the week is not dated today, so
+        # also skip any ticker with a live position: no stacking a fresh entry
+        # on top of an open one day after day
+        live = {p.ticker for p in self.book.positions
+                if getattr(p, "state", "") != "closed"}
         for ticker, yfs in self.cfg.watchlist.items():
-            if ticker in self.skipped_today or ticker in opened:
+            if ticker in self.skipped_today or ticker in opened or ticker in live:
                 continue
             try:
                 bars = self.get_bars(yfs, now)

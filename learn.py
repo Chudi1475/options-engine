@@ -40,7 +40,111 @@ ET = ZoneInfo("America/New_York")
 
 LESSONS_LOG = config.DATA_DIR / "lessons.jsonl"       # full append-only history
 LESSONS_DIGEST = config.DATA_DIR / "lessons_digest.md"  # distilled playbook the brain reads
+REVIEWS_FILE = config.DATA_DIR / "trade_reviews.jsonl"  # one deep review per closed trade, ever
 DIGEST_KEEP = 20   # most-recent lesson bullets kept in the digest (recency wins)
+
+
+# ------------------- deep per-trade review (full history) -------------------
+
+CAUSE_SYSTEM = """You are the trading bot doing a DEEP review of ONE past trade
+to fully understand why it won or lost. Consider the setup itself AND outside
+forces: breaking news, war or geopolitics, scandals, Fed or macro events (FOMC,
+CPI, NFP), volatility regime, time decay, and execution. Only reason from what
+you are shown; never invent facts. No dashes as punctuation. Reply ONLY JSON:
+{"why": "2-3 sentences, the honest root cause of the outcome",
+ "cause": "setup|news|geopolitics|macro_event|volatility|time_decay|execution|unknown",
+ "cause_detail": "one line naming the specific driver if any",
+ "lesson": "one concrete, actionable rule this trade teaches (or empty string)"}"""
+
+
+def _reviewed_ids() -> set:
+    if not REVIEWS_FILE.exists():
+        return set()
+    ids = set()
+    for line in REVIEWS_FILE.read_text(encoding="utf-8-sig").splitlines():
+        try:
+            ids.add(json.loads(line).get("id"))
+        except json.JSONDecodeError:
+            continue
+    return ids
+
+
+def _breaking_news_for(date_str: str) -> list:
+    """Breaking-news titles the bot itself alerted on that date, mined from
+    alerts.log ('--- YYYY-MM-DD hh:mm:ss' stamps + BREAKING lines)."""
+    titles, cur = [], ""
+    try:
+        for line in config.ALERTS_LOG.read_text(encoding="utf-8-sig").splitlines():
+            if line.startswith("--- "):
+                cur = line[4:14]
+            elif cur == date_str and "BREAKING" in line:
+                titles.append(line.strip()[:160])
+    except OSError:
+        pass
+    return titles[:8]
+
+
+def review_history(max_new: int = 25) -> int:
+    """Go back over EVERY closed trade not yet deep-reviewed: grade it, attribute
+    the real cause (setup vs news vs war vs macro etc.), extract the lesson, and
+    persist to trade_reviews.jsonl. Bounded per night so it can never run away;
+    it catches up across nights until the whole history is covered."""
+    import recap
+    try:
+        import assistant
+    except Exception:
+        assistant = None
+    book = PositionBook()
+    seen = _reviewed_ids()
+    todo = [p for p in book.positions
+            if getattr(p, "state", "") == "closed"
+            and getattr(p, "final_pnl_pct", None) is not None
+            and p.id not in seen]
+    done = 0
+    for p in todo[:max_new]:
+        verdict, story = recap.position_story(p)
+        news = _breaking_news_for(p.date)
+        brief = (f"Trade: {p.ticker} {p.strike:g} {p.direction.upper()} on {p.date}, "
+                 f"alerted {p.time_et} ET. Entry momentum {getattr(p, 'mom_pct', None)}, "
+                 f"quoted win rate {getattr(p, 'win_rate_quoted', None)}, risk mode "
+                 f"{getattr(p, 'risk_mode', None)}. Outcome: {verdict}, final "
+                 f"{p.final_pnl_pct}%, peak {getattr(p, 'mfe_pct', None)}%, trough "
+                 f"{getattr(p, 'mae_pct', None)}%, exit "
+                 f"'{(getattr(p, 'final_exit', None) or {}).get('reason')}'. "
+                 f"Story: {story}")
+        if news:
+            brief += "\nBreaking news the bot flagged that day:\n" + "\n".join(news)
+        parsed = None
+        if assistant is not None:
+            raw = assistant.complete(CAUSE_SYSTEM, brief, max_tokens=500)
+            if raw:
+                try:
+                    t = raw.strip()
+                    s, e = t.find("{"), t.rfind("}")
+                    parsed = json.loads(t[s:e + 1]) if s != -1 else None
+                except (json.JSONDecodeError, ValueError):
+                    parsed = None
+        if parsed is None:
+            parsed = {"why": story, "cause": "unknown", "cause_detail": "",
+                      "lesson": ""}
+        entry = {"id": p.id, "date": p.date, "ticker": p.ticker,
+                 "direction": p.direction, "strike": p.strike,
+                 "final_pnl_pct": p.final_pnl_pct, "verdict": verdict,
+                 "why": parsed.get("why", ""), "cause": parsed.get("cause", "unknown"),
+                 "cause_detail": parsed.get("cause_detail", ""),
+                 "lesson": (parsed.get("lesson") or "").strip(),
+                 "reviewed_at": et_now().strftime("%Y-%m-%d %H:%M:%S %Z")}
+        with REVIEWS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        # a real lesson from a deep review feeds the same digest the brain reads
+        if entry["lesson"]:
+            _append_lesson({"session": p.date, "graded_at": entry["reviewed_at"],
+                            "wins": 0, "losses": 0, "trades": [],
+                            "review": f"deep review {p.ticker} {p.date}: {entry['why']}",
+                            "lessons": [entry["lesson"]],
+                            "watch_tomorrow": "", "proposed_change": None})
+        done += 1
+    return done
 
 
 def et_now() -> datetime:
@@ -317,6 +421,17 @@ def run(require_date=None, dry=False):
     else:
         session = require_date
 
+    # deep-review every not-yet-reviewed closed trade (full history, bounded
+    # per night) with cause attribution: setup vs news vs war vs macro etc.
+    reviewed = 0
+    if not dry:
+        try:
+            reviewed = review_history()
+            if reviewed:
+                _rebuild_digest()
+        except Exception as e:
+            print(f"learn: deep review skipped ({e})")
+
     record = grade_day(session)
     lesson = synthesize(record)
     entry = {
@@ -332,6 +447,10 @@ def run(require_date=None, dry=False):
         "proposed_change": lesson.get("proposed_change"),
     }
     msg = _owner_message(record, lesson)
+    if reviewed:
+        msg += (f"\n\n🔎 DEEP REVIEW: went back over {reviewed} past trade(s), "
+                "attributed the real cause (setup vs news vs macro), and folded "
+                "the lessons into my playbook.")
 
     if dry:
         print("----- would append to lessons.jsonl -----")

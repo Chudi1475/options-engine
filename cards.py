@@ -374,7 +374,7 @@ def half_card(pos, ev: dict) -> str:
         f"${pos.entry_mid:.2f} entry ({ev['source']}).",
         "Sell HALF now. Let the rest ride.",
         "(Only got 1 contract? Just sell it — banking the win is the play.)",
-        "Next: I'll text MOMENTUM FLIPPED when the move dies — sell the rest then.",
+        "Next: I'll text you to SELL THE REST when it gives back enough off its peak.",
         "Your call.",
     ])
 

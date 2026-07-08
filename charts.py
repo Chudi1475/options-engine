@@ -1,22 +1,36 @@
 """Turn a market read into a picture the bot can text.
 
-Two renderers:
-- render_fvg(): the ICT / smart-money chart the guys share, in a clean trading-app
-  layout (candles + volume strip, bold color-coded right-axis price tags,
-  full-width level lines, the Fair Value Gap boxed with its consequent-
-  encroachment line and a BISI/SIBI + grade tag, premium/discount equilibrium,
-  and a compact info panel with the whole CE-based ticket).
-- render_signal(): a simple price-line fallback with entry/SL/TP.
+render_fvg(): the chart the guys share, styled EXACTLY like the TradingView
+light-theme markups from the group chat: white background, candlesticks, a gray
+analysis zone with a fib-style level ladder (level (price) labels on its left),
+a diagonal trendline, an orange channel around recent price action, red alert
+lines with red price tags pinned to the right axis, a dotted red current-price
+line with a price+time tag, a Target label at the objective, PLUS the FVG boxes
+(BISI/SIBI + grade) and CE line that are the bot's own edge.
 
-matplotlib is in requirements.txt (so it's there in the cloud), but this module
-NEVER hard-depends on it: if anything fails, render_* returns (None, reason) and
-every caller falls back to the text card. Pictures are a bonus, never a blocker.
+render_signal(): simple dark price-line fallback with entry/SL/TP.
+
+matplotlib is in requirements.txt (cloud-safe), but this module NEVER
+hard-depends on it: any failure returns (None, reason) and callers fall back to
+the text card. Pictures are a bonus, never a blocker.
 """
 
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
+
+# TradingView light palette
+_BG = "#ffffff"
+_GRID = "#e9ebf0"
+_TXT = "#131722"
+_MUT = "#787b86"
+_GREEN = "#089981"
+_RED = "#f23645"
+_ORANGE = "#f7931a"
+_LEVEL = "#5d606b"      # dark fib level lines
+_ZONE = "#9598a1"       # gray analysis zone fill
+_LBL = "#4a4e59"        # fib label text
 
 
 def _mpl():
@@ -35,17 +49,9 @@ def available() -> bool:
 
 
 def render_fvg(r: dict, bars=None):
-    """The ICT FVG chart in a clean trading-app layout. Candlesticks + a volume
-    strip; the Fair Value Gaps boxed (confirming one brightest) each with a CE
-    (50%) line and a BISI/SIBI + grade tag; the dealing-range equilibrium; bold
-    color-coded right-axis price tags with full-width level lines for the CE
-    entry / stop / target; and a compact info panel carrying the whole ticket so
-    the candles stay clean. FVGs are recomputed on the exact candles drawn.
-
-    Pass `bars` (an OHLC DataFrame) to chart a specific series instead of
-    downloading; otherwise it pulls 5m bars for r['symbol']. Returns
-    (png_bytes, None) or (None, reason); fully guarded so any failure falls back
-    to render_signal or the text card."""
+    """TradingView-light FVG chart (see module docstring). Pass `bars` (OHLC
+    DataFrame) to chart a specific series; otherwise downloads 5m bars for
+    r['symbol']. Returns (png_bytes, None) or (None, reason); fully guarded."""
     plt = _mpl()
     if plt is None:
         return None, "charts need matplotlib (not installed here)"
@@ -77,205 +83,228 @@ def render_fvg(r: dict, bars=None):
                     pass
         if df is None or df.empty or not {"Open", "High", "Low", "Close"}.issubset(df.columns):
             return None, "no intraday candles to chart"
-        df = df.dropna(subset=["Open", "High", "Low", "Close"]).tail(80)
-        if len(df) < 5:
+        df = df.dropna(subset=["Open", "High", "Low", "Close"]).tail(64)
+        if len(df) < 8:
             return None, "not enough candles to chart"
 
         o = df["Open"].astype(float).values
         h = df["High"].astype(float).values
         low = df["Low"].astype(float).values
         c = df["Close"].astype(float).values
-        vol = df["Volume"].astype(float).values if "Volume" in df.columns else None
-        has_vol = vol is not None and np.isfinite(np.nansum(vol)) and np.nansum(vol) > 0
-        x = list(range(len(df)))
+        x = np.arange(len(df))
+        n = len(df)
         price = float(c[-1])
         dec = r.get("decimals", 2)
         plan = r.get("plan") or {}
         direction = plan.get("direction")
 
-        # ATR + FVGs on the drawn candles (so boxes line up with the picture)
         atr = None
-        if len(df) > 2:
-            tr = np.maximum(h[1:] - low[1:],
-                            np.maximum(np.abs(h[1:] - c[:-1]), np.abs(low[1:] - c[:-1])))
-            if len(tr):
-                atr = float(np.nanmean(tr[-14:]))
+        tr = np.maximum(h[1:] - low[1:],
+                        np.maximum(np.abs(h[1:] - c[:-1]), np.abs(low[1:] - c[:-1])))
+        if len(tr):
+            atr = float(np.nanmean(tr[-14:]))
         bias = r.get("bias")
         fvgs = [f for f in fvg_mod.find_fvgs(df, atr, bias) if f["state"] != "filled"]
         fvgs.sort(key=lambda f: (f["score"], f["i"]), reverse=True)
         conf = fvg_mod.confirming_fvg(df, direction, price, atr, bias)
-        hi_r, lo_r = float(df["High"].max()), float(df["Low"].min())
-        eq = (hi_r + lo_r) / 2.0
+        tk = (conf or {}).get("ticket")
+        hi_r, lo_r = float(np.max(h)), float(np.min(low))
+        span = max(hi_r - lo_r, 1e-9)
+        sell = (direction == "SELL") or (not direction and price < (hi_r + lo_r) / 2)
 
-        # ---------------- palette ----------------
-        BG, GRID, TXT, MUT = "#0b0d11", "#191c23", "#e8e9ec", "#8a8d93"
-        GREEN, RED, GOLD, GREY = "#26a69a", "#ef5350", "#ffcf4a", "#c9ccd1"
+        def fmt(v):
+            return f"{v:,.{dec}f}"
 
-        # ---------------- figure: price (+ volume strip) ----------------
-        fig = plt.figure(figsize=(9.4, 5.5), dpi=120)
-        fig.patch.set_facecolor(BG)
-        if has_vol:
-            gs = fig.add_gridspec(2, 1, height_ratios=[5, 1], hspace=0.05)
-            ax = fig.add_subplot(gs[0])
-            axv = fig.add_subplot(gs[1], sharex=ax)
-        else:
-            ax = fig.add_subplot(111)
-            axv = None
-        for a in (ax, axv):
-            if a is None:
-                continue
-            a.set_facecolor(BG)
-            for sp in a.spines.values():
-                sp.set_color("#2a2d34")
-        right = x[-1] + 2
+        # ---------------- figure ----------------
+        fig, ax = plt.subplots(figsize=(7.6, 8.2), dpi=120)
+        fig.patch.set_facecolor(_BG)
+        ax.set_facecolor(_BG)
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+        ax.yaxis.tick_right()
+        ax.grid(True, color=_GRID, linewidth=0.8, zorder=0)
+        ax.tick_params(colors=_MUT, labelsize=9, length=0)
+        for lab in ax.get_yticklabels():
+            lab.set_color(_TXT)
+            lab.set_fontweight("bold")
 
-        # candles
-        for xi, oo, hh, ll, cc in zip(x, o, h, low, c):
-            up = cc >= oo
-            col = GREEN if up else RED
-            ax.plot([xi, xi], [ll, hh], color=col, linewidth=0.9, zorder=3)
-            body = max(abs(cc - oo), (hh - ll) * 1e-3 or 1e-9)
-            ax.add_patch(Rectangle((xi - 0.32, min(oo, cc)), 0.64, body,
-                                   facecolor=col, edgecolor=col, linewidth=0.4, zorder=4))
+        right = n + 2
 
-        # volume strip
-        if has_vol:
-            for xi, vv, oo, cc in zip(x, vol, o, c):
-                if np.isnan(vv):
-                    continue
-                axv.add_patch(Rectangle((xi - 0.32, 0), 0.64, vv, alpha=0.5,
-                                        facecolor=(GREEN if cc >= oo else RED), edgecolor="none"))
-            axv.set_ylim(0, (np.nanmax(vol) or 1.0) * 1.15)
-            axv.set_yticks([])
-            axv.text(0.008, 0.82, "vol", transform=axv.transAxes, color=MUT, fontsize=7, va="top")
+        # gray analysis zone anchored at the FVG / swing extreme
+        i0 = conf["i"] if conf else (int(np.argmax(h)) if sell else int(np.argmin(low)))
+        x0 = max(0, i0 - 1)
 
-        # dealing-range equilibrium (premium above / discount below)
-        ax.plot([0, right], [eq, eq], color="#6d6f76", linewidth=0.8,
-                linestyle=(0, (1, 3)), alpha=0.75, zorder=2)
-        ax.text(0.3, eq, "equilibrium", color="#7c7f86", fontsize=7.5,
-                va="bottom", ha="left", zorder=5)
+        # fib-style ladder over the dealing range, extensions in trade direction
+        fib = [1.0, 0.786, 0.618, 0.5, 0.382, 0.236, 0.0]
+        exts = [-0.27, -0.414, -0.618] if sell else [1.27, 1.414, 1.618]
+        levels = [(f, lo_r + f * span) for f in fib + (exts if direction else [])]
+        zone_lo = min(p for _, p in levels)
+        zone_hi = max(p for _, p in levels)
+        ax.add_patch(Rectangle((x0, zone_lo), right - x0, zone_hi - zone_lo,
+                               facecolor=_ZONE, alpha=0.28, edgecolor="none", zorder=1))
+        for f, p in levels:
+            ax.plot([x0, right], [p, p], color=_LEVEL, linewidth=1.3, zorder=2)
+            ax.text(x0 - 0.7, p, f"{f:g} ({fmt(p)})", color=_LBL, fontsize=8.2,
+                    va="center", ha="right", zorder=6)
 
-        # liquidity pools: the swing high/low where stops rest and price gets
-        # drawn (buy-side / sell-side liquidity) — the read retail charts skip.
-        for lvl, lab, va in ((hi_r, "BSL", "bottom"), (lo_r, "SSL", "top")):
-            ax.plot([0, right], [lvl, lvl], color="#8a7fb0", linewidth=0.7,
-                    linestyle=(0, (1, 4)), alpha=0.6, zorder=1)
-            ax.text(0.4, lvl, f" {lab} liquidity", color="#9a8fbf", fontsize=7,
-                    va=va, ha="left", zorder=5)
+        # diagonal trendline: swing extreme through the latest counter-extreme
+        try:
+            if sell:
+                i1 = int(np.argmax(h))
+                seg = h[i1 + 3:]
+                if len(seg) >= 2:
+                    i2 = i1 + 3 + int(np.argmax(seg))
+                    sl = (h[i2] - h[i1]) / max(i2 - i1, 1)
+                    if sl < 0:
+                        ax.plot([i1, right], [h[i1], h[i1] + sl * (right - i1)],
+                                color=_LEVEL, linewidth=1.6, zorder=3)
+            else:
+                i1 = int(np.argmin(low))
+                seg = low[i1 + 3:]
+                if len(seg) >= 2:
+                    i2 = i1 + 3 + int(np.argmin(seg))
+                    sl = (low[i2] - low[i1]) / max(i2 - i1, 1)
+                    if sl > 0:
+                        ax.plot([i1, right], [low[i1], low[i1] + sl * (right - i1)],
+                                color=_LEVEL, linewidth=1.6, zorder=3)
+        except Exception:
+            pass
 
-        # FVG boxes: the confirming one + up to 2 more, label boxed at the left
-        show = ([conf] if conf else []) + \
-               [f for f in fvgs if not (conf and f["i"] == conf["i"])][:2]
-        for f in show:
+        # FVG boxes (the bot's own edge), light tint + badge, CE dashed
+        for f in ([conf] if conf else []) + [f for f in fvgs if not (conf and f["i"] == conf["i"])][:2]:
             i = f["i"]
-            if i >= len(df):
+            if i >= n:
                 continue
             is_conf = bool(conf and f["i"] == conf["i"])
-            base = GREEN if f["polarity"] == "bull" else RED
+            base = _GREEN if f["polarity"] == "bull" else _RED
             ax.add_patch(Rectangle((i - 0.5, f["bottom"]), right - (i - 0.5),
                                    f["top"] - f["bottom"], facecolor=base,
-                                   alpha=0.30 if is_conf else 0.11,
-                                   edgecolor=base, linewidth=1.7 if is_conf else 0.8, zorder=1))
-            ax.plot([i - 0.5, right], [f["ce"], f["ce"]], color=base,
-                    linewidth=1.0 if is_conf else 0.7, linestyle="--",
-                    alpha=0.85 if is_conf else 0.4, zorder=2)
+                                   alpha=0.16 if is_conf else 0.09,
+                                   edgecolor=base, linewidth=1.1 if is_conf else 0.6,
+                                   zorder=2))
+            ax.plot([i - 0.5, right], [f["ce"], f["ce"]], color=base, linewidth=0.9,
+                    linestyle="--", alpha=0.8 if is_conf else 0.4, zorder=3)
             tag = f["label"] + (" IFVG" if f.get("inverted") else "") + f" · {f['grade']}"
-            ax.text(i - 0.2, f["top"], tag, color=base, fontsize=8, fontweight="bold",
-                    va="bottom", ha="left", zorder=6,
-                    bbox=dict(boxstyle="round,pad=0.2", facecolor=BG,
-                              edgecolor=base, linewidth=0.8, alpha=0.9))
+            ax.text(i - 0.3, f["top"], tag, color=base, fontsize=7.6, fontweight="bold",
+                    va="bottom", ha="left", zorder=7,
+                    bbox=dict(boxstyle="round,pad=0.22", facecolor=_BG,
+                              edgecolor=base, linewidth=0.7, alpha=0.95))
 
-        # arrow to the confirming FVG's CE (the entry)
-        if conf:
-            i = conf["i"]
-            off = max(8, len(df) // 6)
-            ax.annotate("CE", xy=(i, conf["ce"]), xytext=(max(0, i - off), conf["ce"]),
-                        color=GOLD, fontsize=10, fontweight="bold", va="center",
-                        arrowprops=dict(arrowstyle="->", color=GOLD, lw=1.8), zorder=7)
+        # candlesticks ON TOP of the zone, TradingView colors
+        for xi, oo, hh, ll, cc in zip(x, o, h, low, c):
+            col = _GREEN if cc >= oo else _RED
+            ax.plot([xi, xi], [ll, hh], color=col, linewidth=1.0, zorder=4)
+            body = max(abs(cc - oo), span * 1e-4)
+            ax.add_patch(Rectangle((xi - 0.31, min(oo, cc)), 0.62, body,
+                                   facecolor=col, edgecolor=col, linewidth=0.4, zorder=5))
 
-        # bold right-axis price tags (app style) + full-width level line
-        def level_tag(y, color, label):
+        # orange channel around the recent run
+        try:
+            k = min(24, max(10, n // 3))
+            xs = x[-k:].astype(float)
+            fitl = np.poly1d(np.polyfit(xs, c[-k:], 1))
+            up = float(np.max(h[-k:] - fitl(xs)))
+            dn = float(np.max(fitl(xs) - low[-k:]))
+            k0, k1 = xs[0], xs[-1]
+            pts_x = [k0, k1, k1, k0, k0]
+            pts_y = [fitl(k0) + up, fitl(k1) + up, fitl(k1) - dn, fitl(k0) - dn, fitl(k0) + up]
+            ax.plot(pts_x, pts_y, color=_ORANGE, linewidth=2.0, zorder=6,
+                    solid_joinstyle="round")
+        except Exception:
+            pass
+
+        # red alert lines + red right-axis tags (entry/CE and SL), like the app
+        def red_tag(y, two_line=None, dotted=False):
             if y is None:
                 return
-            ax.plot([0, right], [y, y], color=color, linewidth=1.0,
-                    linestyle=(0, (5, 3)), alpha=0.5, zorder=3)
-            ax.annotate(f"{label} {y:,.{dec}f}", xy=(right, y), xytext=(7, 0),
+            ax.plot([0, right], [y, y], color=_RED,
+                    linewidth=1.2 if dotted else 2.2,
+                    linestyle=(0, (2, 3)) if dotted else "-", zorder=6)
+            txt = two_line if two_line else fmt(y)
+            ax.annotate(txt, xy=(right, y), xytext=(8, 0),
                         textcoords="offset points", va="center", ha="left",
-                        fontsize=8.5, fontweight="bold", color="#0b0d11",
-                        bbox=dict(boxstyle="round,pad=0.3", facecolor=color, edgecolor="none"),
-                        annotation_clip=False, zorder=8)
+                        fontsize=9, fontweight="bold", color="#ffffff",
+                        linespacing=1.3,
+                        bbox=dict(boxstyle="round,pad=0.32", facecolor=_RED,
+                                  edgecolor="none"),
+                        annotation_clip=False, zorder=9)
 
-        tk = (conf or {}).get("ticket")
-        if tk:
-            level_tag(tk.get("entry_ce"), GOLD, "CE")
-            level_tag(tk.get("stop"), RED, "SL")
-            level_tag(tk.get("target_liquidity"), GREEN, "TP")
-        elif plan:
-            level_tag(plan.get("entry"), GREY, "entry")
-            level_tag(plan.get("stop"), RED, "SL")
-            level_tag(plan.get("target"), GREEN, "TP")
-        level_tag(price, "#5b6472", "px")  # current price, muted so it never fights the levels
+        entry_lvl = tk.get("entry_ce") if tk else plan.get("entry")
+        sl_lvl = tk.get("stop") if tk else plan.get("stop")
+        tp_lvl = tk.get("target_liquidity") if tk else plan.get("target")
+        red_tag(entry_lvl)
+        red_tag(sl_lvl)
+        # dotted current price with price + time tag (exactly like the app)
+        now_et = datetime.now(ET)
+        red_tag(price, two_line=f"{fmt(price)}\n{now_et:%H:%M}", dotted=True)
 
-        # compact info panel (top-left) carries the numbers so candles stay clean
-        lines = []
+        # arrows for extra read: projected path from the last candle to the
+        # target, and a pointer into the confirming FVG entry zone
+        if tp_lvl is not None:
+            try:
+                ax.annotate("", xy=(min(n + 4, right - 0.5), tp_lvl),
+                            xytext=(n - 1, price),
+                            arrowprops=dict(arrowstyle="-|>", color=_TXT, lw=2.0,
+                                            connectionstyle="arc3,rad=-0.25"),
+                            zorder=8)
+            except Exception:
+                pass
         if conf:
-            lines.append(f"grade {conf['grade']} {conf['label']}"
-                         + (" · IFVG" if conf.get("inverted") else ""))
-            lines.append(f"{conf['state']} · {conf['pd_zone']}")
-            if tk:
-                lines.append(f"CE  {tk['entry_ce']:,.{dec}f}")
-                lines.append(f"SL  {tk['stop']:,.{dec}f}")
-                rr = tk.get("rr")
-                lines.append(f"TP  {tk['target_liquidity']:,.{dec}f}"
-                             + (f"   {rr:g}R" if rr else ""))
-        else:
-            conv = (r.get("conviction") or "").upper()
-            if conv:
-                lines.append(f"conviction {conv}")
-            if plan.get("entry") is not None:
-                lines.append(f"entry {plan['entry']:,.{dec}f}")
-                if plan.get("stop") is not None:
-                    lines.append(f"SL  {plan['stop']:,.{dec}f}")
-        if lines:
-            # info panel on the RIGHT (block hugs the right edge, text stays
-            # left-aligned inside) so every number lives on one side of the chart
-            # next to the price tags, no left-right eye scanning
-            ax.text(0.987, 0.97, "\n".join(lines), transform=ax.transAxes, va="top",
-                    ha="right", ma="left", fontsize=9, color=TXT, fontweight="bold",
-                    zorder=9, linespacing=1.55, family="monospace",
-                    bbox=dict(boxstyle="round,pad=0.5", facecolor="#12151b",
-                              edgecolor="#2a2d34", alpha=0.94))
+            off = max(6, n // 6)
+            ax.annotate("entry", xy=(conf["i"] + 0.5, conf["ce"]),
+                        xytext=(max(0, conf["i"] - off), conf["ce"]),
+                        color=_TXT, fontsize=9, fontweight="bold", va="center",
+                        ha="right",
+                        arrowprops=dict(arrowstyle="->", color=_TXT, lw=1.6),
+                        zorder=8)
+
+        # Target label + bullseye at the objective
+        if tp_lvl is not None:
+            tx = x0 + 0.58 * (right - x0)
+            ax.text(tx, tp_lvl, "Target ", color=_TXT, fontsize=13,
+                    fontweight="bold", style="italic", va="center", ha="right",
+                    zorder=8,
+                    bbox=dict(boxstyle="round,pad=0.25", facecolor="#ffffff",
+                              edgecolor="none", alpha=0.85))
+            for sz, colr in ((130, _RED), (60, "#ffffff"), (18, _RED)):
+                ax.scatter([tx + (right - x0) * 0.02], [tp_lvl], s=sz, color=colr,
+                           zorder=9, edgecolors="none")
 
         # ---------------- cosmetics ----------------
-        sym = r.get("ticker") or r.get("instrument", symbol)
-        title = f"{direction + '  ' if direction else ''}{sym}"
+        name = r.get("instrument") or r.get("ticker") or symbol
+        fig.text(0.055, 0.965, str(name), color=_TXT, fontsize=15.5,
+                 fontweight="bold", ha="left", va="top")
+        prior = r.get("prior_close")
+        line2_y = 0.932
+        if prior:
+            chg = price - float(prior)
+            pct = chg / float(prior) * 100
+            fig.text(0.055, line2_y,
+                     f"{fmt(price)} {chg:+,.{dec}f} ({pct:+.2f}%)",
+                     color=(_RED if chg < 0 else _GREEN), fontsize=11.5,
+                     ha="left", va="top")
         if conf:
-            title += f"     grade {conf['grade']} {conf['label']} · CE entry"
-        elif r.get("conviction"):
-            title += f"     {r['conviction'].upper()}"
-        ax.set_title(title, color=TXT, fontsize=13.5, fontweight="bold", loc="left", pad=9)
+            fig.text(0.055, line2_y - 0.028,
+                     f"grade {conf['grade']} {conf['label']} · CE entry"
+                     + (f" · {tk['rr']:g}R" if tk and tk.get('rr') else ""),
+                     color=_MUT, fontsize=9.5, ha="left", va="top")
 
-        ax.set_xlim(-1, right + max(4, len(df) * 0.04))
-        ax.margins(y=0.09)
-        ax.grid(True, color=GRID, linewidth=0.5, zorder=0)
-        bottom_ax = axv if axv is not None else ax
-        step = max(1, len(df) // 7)
-        bottom_ax.set_xticks(x[::step])
-        bottom_ax.set_xticklabels([df.index[i].strftime("%H:%M") for i in x[::step]])
-        bottom_ax.tick_params(colors=MUT, labelsize=8)
-        if axv is not None:
-            ax.tick_params(labelbottom=False, colors=MUT, labelsize=8)
-            axv.grid(False)
-        else:
-            ax.tick_params(colors=MUT, labelsize=8)
-
-        stamp = datetime.now(ET).strftime("%a %b %d %I:%M %p ET")
-        fig.text(0.995, 0.008, f"{stamp}  ·  ~15m delayed, your call",
-                 color="#5a5d63", fontsize=7, ha="right", va="bottom")
-        fig.tight_layout(rect=(0, 0.02, 1, 1))
+        ax.set_xlim(-1.5, right + 0.5)
+        ymin = min(zone_lo, float(np.min(low)), sl_lvl or zone_lo, price)
+        ymax = max(zone_hi, float(np.max(h)), entry_lvl or zone_hi, price)
+        pad = (ymax - ymin) * 0.05
+        ax.set_ylim(ymin - pad, ymax + pad)
+        step = max(1, n // 5)
+        ax.set_xticks(x[::step])
+        ax.set_xticklabels([df.index[i].strftime("%H:%M") for i in x[::step]])
+        fig.text(0.985, 0.012,
+                 f"{now_et:%a %b %d %I:%M %p ET}  ·  ~15m delayed, your call",
+                 color=_MUT, fontsize=7, ha="right", va="bottom")
+        fig.subplots_adjust(top=0.885, bottom=0.055, left=0.03, right=0.87)
 
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
+        fig.savefig(buf, format="png", facecolor=fig.get_facecolor(),
+                    bbox_inches="tight")
         return buf.getvalue(), None
     except Exception as e:
         return None, f"couldn't render fvg ({e})"
@@ -289,9 +318,9 @@ def render_fvg(r: dict, bars=None):
 
 def render_signal(r: dict):
     """A price chart for one read, with entry/SL/TP lines when the read carries
-    a plan. Returns (png_bytes, None) on success or (None, reason). The ENTIRE
-    body is guarded: a picture is a bonus, so any failure (bad data, a matplotlib
-    edge) returns (None, reason) and the caller falls back to the text card."""
+    a plan. Returns (png_bytes, None) on success or (None, reason). Fully
+    guarded: any failure returns (None, reason) and the caller falls back to
+    the text card."""
     plt = _mpl()
     if plt is None:
         return None, "charts need matplotlib (not installed here)"
@@ -318,7 +347,7 @@ def render_signal(r: dict):
                 df.index = df.index.tz_convert(ET)
             except (TypeError, ValueError):
                 pass
-        closes = df["Close"].dropna().tail(120)  # ~last 10 hours of 5m bars
+        closes = df["Close"].dropna().tail(120)
 
         kind = r.get("kind", "stock")
         dec = r.get("decimals", 2)
