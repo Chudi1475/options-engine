@@ -617,6 +617,8 @@ class Service:
                     "/signal btc  ·  /signal nvda")
         if cmd in ("/chart", "/pic", "/img"):
             return self.chart_reply(args, chat_id)
+        if cmd in ("/ask", "/deep"):
+            return self.ask_reply(args, chat_id)
         if cmd == "/requests":
             import intake
             return intake.list_text()
@@ -730,6 +732,41 @@ class Service:
 
         threading.Thread(target=worker, daemon=True, name="chart-reply").start()
         return None  # the worker sends the photo/text itself
+
+    def ask_reply(self, arg: str, chat_id: str = ""):
+        """/ask <question> — deep reasoning mode. Escalates a hard question to
+        Fable 5 at high effort and texts back the full answer. Runs on a
+        background thread (it can take a minute) with a typing indicator, so it
+        never blocks exit monitoring. The bot never says 'I'm not trained'."""
+        arg = (arg or "").strip()
+        if not arg:
+            return ("Ask me anything, even outside trading. e.g.  /ask explain "
+                    "the carry trade and what unwinds it")
+        if self.dry:
+            import assistant
+            return assistant.deep_think(arg)
+
+        import threading
+        stop = threading.Event()
+
+        def beat():
+            while not stop.is_set():
+                telegram.send_chat_action(chat_id)
+                stop.wait(3)
+
+        def worker():
+            threading.Thread(target=beat, daemon=True).start()
+            try:
+                import assistant
+                ans = assistant.deep_think(arg)
+            except Exception as e:
+                ans = f"that one hit an error on my end: {e}"
+            finally:
+                stop.set()
+            telegram.send_to(chat_id, ans)
+
+        threading.Thread(target=worker, daemon=True, name="ask-reply").start()
+        return None  # the worker sends the answer itself
 
     def cmd_request_status(self, cmd: str, args: str):
         """/approve|/reject|/done <id> [note] — move a request and tell the

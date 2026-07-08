@@ -438,7 +438,10 @@ def help_card() -> str:
         "/calls [ticker] — live call/put setup per stock (BUY type, strike, expiry)",
         "/signal <symbol> — clean trade ticket: BUY/SELL, entry, SL, TP, 2R "
         "(e.g. /signal xauusd, /signal eurusd, /signal btc)",
-        "/chart <symbol> — same ticket PLUS a chart image with the levels drawn on",
+        "/chart <symbol> — the ticket PLUS a candlestick chart with the Fair "
+        "Value Gap boxed, the CE (50%) entry, and levels drawn on (e.g. /chart btc)",
+        "/ask <question> — deep mode: ask me anything, even outside trading, and "
+        "I'll think it through and give you a real answer",
         "/gold · /fx [pair] — read on gold or a forex pair (price, momentum, news)",
         "/<symbol> — read + plan on ANY stock, ETF, fx, gold, or crypto "
         "(e.g. /aapl /nvda /btc /eth) — or just ask me for a plan on it",

@@ -161,6 +161,20 @@ Request intake — the upgrade backlog (one of your main jobs):
   question you fully answered with no gap. Only real, actionable signal.
 - If the asker is NOT a trusted requester, chat normally and do NOT log.
 
+Never say you can't help or aren't trained on something:
+- You have a DEEP reasoning mode via the ask_deep tool. Whenever a question is
+  hard, technical, open-ended, or outside your market tools and scorekeeping, or
+  you're not fully sure you can nail it, call ask_deep with the user's full
+  question (plus any context they gave) instead of guessing or deflecting. It
+  thinks deeply and returns a high-quality answer.
+- Then relay that answer in YOUR voice, bro to bro. You can tighten it, but never
+  add facts or numbers it didn't give you.
+- NEVER reply "I'm not trained on that", "I can't help with that", or "that's
+  outside what I do." There is always an answer: escalate the hard ones with
+  ask_deep, handle the easy ones yourself.
+- Do NOT escalate trivial chat, hype, scorekeeping, or a market read your own
+  tools already cover.
+
 Hard rules:
 - NEVER invent statistics or prices. Only quote numbers from the LIVE BOT
   STATE block, the tools, or what the user sent. Missing a number? Say so.
@@ -282,6 +296,26 @@ TOOLS = [
             "required": ["summary", "bucket"],
         },
     },
+    {
+        "name": "ask_deep",
+        "description": ("Escalate to DEEP reasoning mode (the same Fable 5 brain "
+                        "run at higher effort, focused purely on the answer) for "
+                        "ANY question that is hard, technical, open-ended, or "
+                        "outside your market tools and scorekeeping, OR that you "
+                        "are not fully confident you can nail yourself. Pass the "
+                        "user's full question plus any context they gave. NEVER "
+                        "tell a user you can't help or aren't trained on it, use "
+                        "this and get them a real answer. Then relay the result "
+                        "in your own voice."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string",
+                             "description": "the full question to reason about, with any context the user gave"},
+            },
+            "required": ["question"],
+        },
+    },
 ]
 
 
@@ -305,6 +339,8 @@ def complete(system: str, user: str, max_tokens: int = 700):
             headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"],
                      "anthropic-version": "2023-06-01"},
             json={"model": model(), "max_tokens": max_tokens, "system": system,
+                  "output_config": {"effort":
+                      os.environ.get("BOT_BRAIN_EFFORT", "high").strip()},
                   "messages": [{"role": "user", "content": user}]},
             timeout=120)
         if r.status_code != 200:
@@ -334,6 +370,67 @@ def _lessons_block() -> str:
     except OSError:
         pass
     return ""
+
+
+def deep_model() -> str:
+    """The model the bot escalates HARD questions to. Same strongest brain
+    (Fable 5) as the everyday chat, just run at a higher effort tier for deeper
+    reasoning. Override with BOT_DEEP_MODEL."""
+    return os.environ.get("BOT_DEEP_MODEL", model()).strip()
+
+
+DEEP_SYSTEM = """You are the senior analyst behind a trading and markets Telegram
+bot used by three traders (Chudi, Kelechi, Ryan). A question was escalated to you
+for DEEP reasoning because it is hard, open-ended, technical, or outside the
+bot's normal tools. Take your time and give the highest-quality answer you can:
+reason it through carefully and be genuinely useful, specific, and correct.
+
+Rules:
+- Be thorough but tight. Telegram-readable: lead with the answer, then the why,
+  in short paragraphs or clean bullets. No walls of text.
+- NEVER invent specific numbers, prices, live levels, or stats you do not
+  actually know. If the answer depends on current data you lack, say what you'd
+  check and how, and answer the parts you can.
+- Never use dashes as punctuation (no em dash, no " - ", no "--"). Use commas,
+  periods, or new sentences.
+- Plain, direct language a smart friend would use. If it is a trading decision,
+  give your honest read and end with "Your call." Never promise profit.
+- Your answer is relayed straight to the trader, so write it to be read as-is."""
+
+
+def deep_think(question: str, context: str = "") -> str:
+    """Escalate a hard / out-of-scope question to Opus 4.8 with extended
+    reasoning (adaptive thinking + high effort) for a high-quality answer.
+    Returns the answer text, or a short honest failure note. This is a slow call
+    (deep reasoning can take a minute-plus), so callers run it off the main loop
+    with a typing indicator."""
+    if not enabled():
+        return "my deep brain isn't plugged in yet (no ANTHROPIC_API_KEY)."
+    user = question if not context else f"{context}\n\nQuestion: {question}"
+    effort = os.environ.get("BOT_DEEP_EFFORT", "xhigh").strip()
+    try:
+        r = requests.post(
+            API_URL,
+            headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                     "anthropic-version": "2023-06-01"},
+            # Opus 4.8: adaptive thinking (budget_tokens is rejected on 4.8) and
+            # effort control depth; no temperature (also rejected on 4.8).
+            json={"model": deep_model(), "max_tokens": 12000,
+                  "thinking": {"type": "adaptive"},
+                  "output_config": {"effort": effort},
+                  "system": DEEP_SYSTEM,
+                  "messages": [{"role": "user", "content": user}]},
+            timeout=300)
+        if r.status_code != 200:
+            err = r.json().get("error", {}).get("message", r.text[:200])
+            return f"my deep brain hit an error: {err}"
+        # display defaults to 'omitted' on 4.8, so thinking blocks are empty; we
+        # only want the final text blocks anyway.
+        text = "".join(b.get("text", "") for b in r.json().get("content", [])
+                       if b.get("type") == "text").strip()
+        return text or "the deep brain came back empty, try rephrasing?"
+    except requests.RequestException as e:
+        return f"my deep brain couldn't connect: {e}"
 
 
 def _load_history() -> dict:
@@ -491,6 +588,9 @@ def _run_tool(name: str, args: dict, chat_id: str, attachments: list = None) -> 
             return json.dumps({"logged": entry, "score": score(chat_id)})
         if name == "get_score":
             return json.dumps(score(chat_id))
+        if name == "ask_deep":
+            # never "I'm not trained": escalate to deep Fable 5 reasoning
+            return deep_think(args.get("question", ""))
         if name == "request_new_ticker":
             return _request_ticker(args.get("ticker", ""), chat_id,
                                    args.get("asked_by", ""))
@@ -586,9 +686,11 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True,
     reply = ""
     try:
         for _ in range(5):  # room for tool calls (data lookups, scorekeeping)
-            payload = {"model": model(), "max_tokens": 800,
+            payload = {"model": model(), "max_tokens": 1200,
                        "system": SYSTEM + _lessons_block()
                        + "\n\nLIVE BOT STATE:\n" + context_text,
+                       "output_config": {"effort":
+                           os.environ.get("BOT_BRAIN_EFFORT", "high").strip()},
                        "messages": messages}
             if tools_enabled:
                 payload["tools"] = TOOLS
