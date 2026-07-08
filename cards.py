@@ -144,13 +144,21 @@ def signal_card(r: dict) -> str:
 
 
 def _conviction_line(r: dict) -> str:
-    """Flag the Fair Value Gap conviction when a fresh gap confirms the plan."""
+    """Flag the Fair Value Gap conviction when a graded gap confirms the plan,
+    in the terms an ICT trader actually uses (BISI/SIBI, CE, grade)."""
     conf = (r.get("fvg") or {}).get("confirming")
     if r.get("conviction") == "high" and conf:
         dec = r.get("decimals", 2)
-        side = "bullish" if conf["type"] == "bull" else "bearish"
-        return (f"holds conviction: {side} FVG {fmt_lvl(conf['bottom'], dec)} to "
-                f"{fmt_lvl(conf['top'], dec)} confirms it, chart coming.")
+        name = "BISI" if conf["polarity"] == "bull" else "SIBI"
+        inv = " inverted" if conf.get("inverted") else ""
+        tk = conf.get("ticket") or {}
+        line = (f"holds conviction: grade {conf['grade']}{inv} {name} FVG "
+                f"{fmt_lvl(conf['bottom'], dec)} to {fmt_lvl(conf['top'], dec)} "
+                f"({conf['state']}, {conf['pd_zone']}), CE {fmt_lvl(conf['ce'], dec)}")
+        if tk.get("entry_ce") is not None:
+            line += (f". FVG entry {fmt_lvl(tk['entry_ce'], dec)}, "
+                     f"stop {fmt_lvl(tk['stop'], dec)}, target {fmt_lvl(tk['target_liquidity'], dec)}")
+        return line + ". chart coming."
     return ""
 
 

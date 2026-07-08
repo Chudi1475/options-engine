@@ -29,19 +29,21 @@ def available() -> bool:
     return _mpl() is not None
 
 
-def render_fvg(r: dict):
+def render_fvg(r: dict, bars=None):
     """A CANDLESTICK chart for one read with the Fair Value Gaps shaded as boxes,
-    an arrow pointing at the FVG that confirms the trade, and the entry/SL/TP
-    lines drawn on. This is the picture the guys share: candles, the gap boxed,
-    arrow on it. Returns (png_bytes, None) or (None, reason). FVGs are recomputed
-    on the exact candles being drawn so the boxes always line up with them.
-    Fully guarded: any failure returns (None, reason) and the caller falls back
-    to render_signal or the text card."""
+    each with its consequent-encroachment (CE / 50%) line and a BISI/SIBI + grade
+    tag, an arrow on the FVG that confirms the trade, the premium/discount
+    equilibrium, and the CE-based entry/stop/target. This is the picture the ICT
+    guys share. Returns (png_bytes, None) or (None, reason). FVGs are recomputed
+    on the exact candles being drawn so the boxes always line up. Pass `bars` (an
+    OHLC DataFrame) to chart a specific series instead of downloading; otherwise
+    it pulls 5m bars for r['symbol']. Fully guarded: any failure returns
+    (None, reason) and the caller falls back to render_signal or the text card."""
     plt = _mpl()
     if plt is None:
         return None, "charts need matplotlib (not installed here)"
     symbol = r.get("symbol")
-    if not symbol:
+    if not symbol and bars is None:
         return None, "no symbol to chart"
     fig = None
     try:
@@ -53,17 +55,20 @@ def render_fvg(r: dict):
 
         import fvg as fvg_mod
 
-        df = yf.download(symbol, period="2d", interval="5m",
-                         progress=False, auto_adjust=False)
-        if df is not None and hasattr(df.columns, "levels"):
-            df.columns = df.columns.get_level_values(0)
+        if bars is not None:
+            df = bars.copy()
+        else:
+            df = yf.download(symbol, period="2d", interval="5m",
+                             progress=False, auto_adjust=False)
+            if df is not None and hasattr(df.columns, "levels"):
+                df.columns = df.columns.get_level_values(0)
+            if df is not None and not df.empty and getattr(df.index, "tz", None) is not None:
+                try:
+                    df.index = df.index.tz_convert(ET)
+                except (TypeError, ValueError):
+                    pass
         if df is None or df.empty or not {"Open", "High", "Low", "Close"}.issubset(df.columns):
             return None, "no intraday candles to chart"
-        if getattr(df.index, "tz", None) is not None:
-            try:
-                df.index = df.index.tz_convert(ET)
-            except (TypeError, ValueError):
-                pass
         df = df.dropna(subset=["Open", "High", "Low", "Close"]).tail(80)
         if len(df) < 5:
             return None, "not enough candles to chart"
@@ -86,8 +91,12 @@ def render_fvg(r: dict):
                             np.maximum(np.abs(h[1:] - c[:-1]), np.abs(low[1:] - c[:-1])))
             if len(tr):
                 atr = float(np.nanmean(tr[-14:]))
-        fvgs = [f for f in fvg_mod.find_fvgs(df, atr) if not f["filled"]]
-        conf = fvg_mod.confirming_fvg(df, direction, price, atr)
+        bias = r.get("bias")
+        fvgs = [f for f in fvg_mod.find_fvgs(df, atr, bias) if f["state"] != "filled"]
+        fvgs.sort(key=lambda f: (f["score"], f["i"]), reverse=True)
+        conf = fvg_mod.confirming_fvg(df, direction, price, atr, bias)
+        hi_r, lo_r = float(df["High"].max()), float(df["Low"].min())
+        eq = (hi_r + lo_r) / 2.0
 
         fig, ax = plt.subplots(figsize=(8, 4.8), dpi=115)
         fig.patch.set_facecolor("#0e0f13")
@@ -102,31 +111,41 @@ def render_fvg(r: dict):
             ax.add_patch(Rectangle((xi - 0.3, min(oo, cc)), 0.6, body,
                                    facecolor=col, edgecolor=col, linewidth=0.4, zorder=3))
 
-        # FVG zones: each shades from its formation candle to the right edge, the
-        # standard way an FVG is drawn (a zone that projects forward). The
-        # confirming one is brighter and outlined.
         right = x[-1] + 2
-        for f in fvgs[-6:]:
+        # dealing-range equilibrium: premium above, discount below
+        ax.axhline(eq, color="#6d6f76", linewidth=0.8, linestyle=":", alpha=0.7, zorder=1)
+        ax.text(0, eq, " equilibrium (50%)", color="#6d6f76", fontsize=7,
+                va="bottom", ha="left", zorder=5)
+
+        # draw the strongest few actionable FVGs (best grade first); each shades
+        # forward from its formation candle with a dashed CE (50%) line and a
+        # BISI/SIBI + grade tag. The confirming one is brightest and outlined.
+        for f in fvgs[:4]:
             i = f["i"]
             if i >= len(df):
                 continue
-            is_conf = bool(conf and f["i"] == conf["i"] and f["type"] == conf["type"])
-            base = "#26a69a" if f["type"] == "bull" else "#ef5350"
+            is_conf = bool(conf and f["i"] == conf["i"])
+            bull = f["polarity"] == "bull"
+            base = "#26a69a" if bull else "#ef5350"
             ax.add_patch(Rectangle((i - 0.5, f["bottom"]), right - (i - 0.5),
                                    f["top"] - f["bottom"], facecolor=base,
-                                   alpha=0.30 if is_conf else 0.10,
+                                   alpha=0.32 if is_conf else 0.10,
                                    edgecolor=base if is_conf else "none",
-                                   linewidth=1.5 if is_conf else 0, zorder=1))
+                                   linewidth=1.6 if is_conf else 0, zorder=1))
+            ax.plot([i - 0.5, right], [f["ce"], f["ce"]], color=base, linewidth=0.9,
+                    linestyle="--", alpha=0.75 if is_conf else 0.35, zorder=2)
+            tag = f["label"] + (" IFVG" if f.get("inverted") else "") + f" {f['grade']}"
+            ax.text(i - 0.4, f["top"], f" {tag}", color=base, fontsize=7.5,
+                    fontweight="bold", va="bottom", ha="left", zorder=6)
 
-        # arrow pointing at the confirming FVG
+        # arrow pointing at the confirming FVG's CE (the entry)
         if conf:
             i = conf["i"]
-            midp = (conf["top"] + conf["bottom"]) / 2
             off = max(8, len(df) // 6)
-            ax.annotate("FVG", xy=(i, midp), xytext=(max(0, i - off), midp),
-                        color="#ffd54f", fontsize=11, fontweight="bold", va="center",
-                        arrowprops=dict(arrowstyle="->", color="#ffd54f", lw=1.8),
-                        zorder=6)
+            ax.annotate(f"{conf['label']} CE", xy=(i, conf["ce"]),
+                        xytext=(max(0, i - off), conf["ce"]),
+                        color="#ffd54f", fontsize=10.5, fontweight="bold", va="center",
+                        arrowprops=dict(arrowstyle="->", color="#ffd54f", lw=1.8), zorder=7)
 
         def hline(level, color, label):
             if level is None:
@@ -135,7 +154,12 @@ def render_fvg(r: dict):
             ax.text(x[-1], level, f" {label} {level:,.{dec}f}", color=color, fontsize=8,
                     va="center", ha="left", fontweight="bold", zorder=6)
 
-        if plan:
+        tk = (conf or {}).get("ticket")
+        if tk:  # a confirming FVG -> the CE-based FVG trade is the star
+            hline(tk.get("entry_ce"), "#ffd54f", "CE entry")
+            hline(tk.get("stop"), "#ef5350", "SL")
+            hline(tk.get("target_liquidity"), "#26a69a", "target")
+        elif plan:
             hline(plan.get("entry"), "#d0d0d0", "entry")
             hline(plan.get("stop"), "#ef5350", "SL")
             hline(plan.get("target1"), "#7e9e6d", "TP1")
@@ -145,7 +169,7 @@ def render_fvg(r: dict):
         conv = (r.get("conviction") or "").upper()
         title = f"{direction + ' ' if direction else ''}{sym}"
         if conf:
-            title += "  ·  FVG confirmed"
+            title += f"  ·  grade {conf['grade']} {conf['label']} · CE entry"
         elif conv:
             title += f"  ·  {conv}"
         ax.set_title(title, color="#f0f0f0", fontsize=13, fontweight="bold", loc="left")

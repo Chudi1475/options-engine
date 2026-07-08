@@ -553,10 +553,11 @@ def _do_read(disp, yfs, dec, kind, source):
     if stale or blackout:
         plan = None
 
-    # Fair Value Gap conviction: a plan carries more weight when a fresh,
-    # unfilled FVG confirms its direction and price is still respecting it. This
-    # is the ICT read the guys share. We never trade on an FVG alone; it only
-    # RAISES or LOWERS conviction on the momentum plan we already have.
+    # Fair Value Gap conviction (ICT / smart-money grade). We never trade on an
+    # FVG alone; a graded, displacement-backed FVG that confirms the momentum
+    # plan RAISES conviction (and gives a CE-based entry/stop/target), a weak or
+    # missing one leaves it on momentum alone. bias feeds FVG grading so a gap
+    # with the trend scores higher.
     fvg_info, conviction = None, None
     try:
         import fvg as _fvg
@@ -564,14 +565,17 @@ def _do_read(disp, yfs, dec, kind, source):
             else (m5 if have_5m else None)
         if fbars is not None and not fbars.empty:
             direction = plan["direction"] if plan else None
-            conf = _fvg.confirming_fvg(fbars, direction, price, atr)
-            recent = [f for f in _fvg.find_fvgs(fbars, atr) if not f["filled"]][-6:]
-            fvg_info = {"confirming": conf, "recent_unfilled": recent}
-            if plan and conf:
+            conf = _fvg.confirming_fvg(fbars, direction, price, atr, bias)
+            allf = _fvg.find_fvgs(fbars, atr, bias)
+            actionable = [f for f in allf if f["state"] != "filled"]
+            # the strongest few to draw, best grade first
+            actionable.sort(key=lambda f: (f["score"], f["i"]), reverse=True)
+            fvg_info = {"confirming": conf, "recent_unfilled": actionable[:6]}
+            if plan and conf and conf["grade"] in ("A", "B"):
                 conviction = "high"
             elif plan:
                 conviction = "medium"
-            elif recent:
+            elif any(f["strong"] for f in actionable):
                 conviction = "watch"
     except Exception:
         fvg_info, conviction = None, None
@@ -600,12 +604,17 @@ def _do_read(disp, yfs, dec, kind, source):
                 "imminent (see 'blackout'/event_warning). Say so and give the trigger "
                 "that would make a trade. Lead with any event_warning; quote only "
                 "these levels, never invent one or a win rate; end with 'Your call.' "
-                "The 'conviction' field ('high' when a fresh Fair Value Gap in "
-                "'fvg.confirming' backs the plan direction, 'medium' when the plan "
-                "stands on momentum alone) tells you how hard to lean. When it is "
-                "high, say the FVG confirms it and quote the gap from 'fvg.confirming' "
-                "(bottom to top); a marked-up FVG chart is auto-sent right after your "
-                "text. Never invent an FVG, only cite what 'fvg' returned.",
+                "The 'conviction' field ('high' when a graded, displacement-backed "
+                "Fair Value Gap in 'fvg.confirming' confirms the plan, 'medium' when "
+                "the plan stands on momentum alone) tells you how hard to lean. When "
+                "high, name it like an ICT trader: quote fvg.confirming.grade and "
+                "label (BISI=bullish, SIBI=bearish), its zone (bottom to top), its CE "
+                "(consequent encroachment, the 50% entry), whether it is unmitigated "
+                "or inverted (IFVG), and whether it sits in premium/discount. Give the "
+                "FVG ticket from fvg.confirming.ticket (entry_ce, stop beyond the far "
+                "edge, target_liquidity) as the smart-money refinement alongside the "
+                "momentum plan. A marked-up FVG chart is auto-sent right after your "
+                "text. Never invent an FVG or its levels; only cite what 'fvg' returned.",
     }
 
 
