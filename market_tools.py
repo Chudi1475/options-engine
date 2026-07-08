@@ -450,6 +450,7 @@ def _do_read(disp, yfs, dec, kind, source):
     """Shared read engine for any symbol: price, day move, 15-min momentum,
     recent high/low, 20-day trend, a momentum/trend BIAS, an ATR-sized trade
     PLAN, plus high-impact news. Real numbers only (yfinance, ~15-min delayed)."""
+    tried = [yfs]
     try:
         d1 = _flatten(yf.download(yfs, period="1mo", interval="1d",
                                   progress=False, auto_adjust=False))
@@ -457,8 +458,37 @@ def _do_read(disp, yfs, dec, kind, source):
                                   progress=False, auto_adjust=False))
     except Exception as e:
         return {"note": f"couldn't pull {disp} data right now ({e})."}
+    if (d1 is None or d1.empty) and kind == "stock":
+        # Cheap salvage before giving up: many indices only exist on Yahoo
+        # with a ^ prefix (RUT, FTSE, N225...), and a 6-letter all-alpha
+        # symbol like EURJPY is a Yahoo "=X" forex pair. Each variant costs
+        # one daily download; the 5m frame is only fetched for the winner.
+        fallbacks = []
+        if not yfs.startswith("^"):
+            fallbacks.append(("^" + yfs, kind, dec))
+        if len(yfs) == 6 and yfs.isalpha():
+            fallbacks.append((yfs + "=X", "forex",
+                              2 if yfs.upper().endswith("JPY") else 4))
+        for alt, alt_kind, alt_dec in fallbacks:
+            tried.append(alt)
+            try:
+                alt_d1 = _flatten(yf.download(alt, period="1mo", interval="1d",
+                                              progress=False, auto_adjust=False))
+                if alt_d1 is None or alt_d1.empty:
+                    continue
+                alt_m5 = _flatten(yf.download(alt, period="2d", interval="5m",
+                                              progress=False, auto_adjust=False))
+            except Exception:
+                continue
+            yfs, kind, dec = alt, alt_kind, alt_dec
+            d1, m5 = alt_d1, alt_m5
+            break
     if d1 is None or d1.empty:
-        return {"note": f"no recent data for {disp} right now."}
+        return {"note": f"no recent data for {disp} right now "
+                f"(tried {', '.join(tried)}). If that's a typo, check /help "
+                "for formats: stock/ETF tickers (AAPL, QQQ), indices (spx, "
+                "ndx, us30, vix), forex pairs (eurusd, eurjpy), gold, and "
+                "crypto (btc, eth, sol)."}
 
     closes_d = d1["Close"].dropna()
     have_5m = m5 is not None and not m5.empty and not m5["Close"].dropna().empty

@@ -708,25 +708,71 @@ class Service:
                 stop.wait(3)
 
         def worker():
+            # Every step below is guarded on its own so one failure can never
+            # swallow the reply: read -> text card -> fvg render -> line render
+            # -> photo send -> text send. The user ALWAYS hears back.
             threading.Thread(target=beat, daemon=True).start()
             try:
-                import charts
-                import market_tools
-                r = market_tools.read_any(arg)
-                text = cards.macro_line(r)
-                sent = False
+                # 1) the read (two downloads) — a crash here becomes an error read
+                try:
+                    import market_tools
+                    r = market_tools.read_any(arg)
+                except Exception as e:
+                    r = {"error": f"couldn't read {arg} right now ({e})"}
+                if not isinstance(r, dict):
+                    r = {"error": f"couldn't read {arg} right now (empty read)"}
+
+                # 2) the text card — even if it crashes we still have the raw
+                # note/error to send, and failing that one honest line
+                try:
+                    text = cards.macro_line(r)
+                except Exception:
+                    text = r.get("error") or r.get("note")
+                if not text or not isinstance(text, str):
+                    text = (f"couldn't build a read for {arg} right now. "
+                            f"Try again in a minute, or /signal {arg} for the "
+                            "text-only read.")
+
+                # 3) the picture (a bonus, never a blocker): candlestick FVG
+                # chart when we can build it; fall back to the plain price-line
+                # chart if the candle render can't. A note/error read skips the
+                # render and just texts the note.
+                img = None
                 if not (r.get("error") or r.get("note")):
-                    # candlestick FVG chart when we can build it; fall back to the
-                    # plain price-line chart if the candle render can't
-                    img, _ = charts.render_fvg(r)
+                    try:
+                        import charts
+                        img, _ = charts.render_fvg(r)
+                    except Exception:
+                        img = None
                     if img is None:
-                        img, _ = charts.render_signal(r)
-                    if img and not telegram.send_photo(chat_id, img, caption=text[:1024]):
-                        sent = len(text) <= 1024  # caption carried the whole read
+                        try:
+                            import charts
+                            img, _ = charts.render_signal(r)
+                        except Exception:
+                            img = None
+
+                # 4) deliver. If the photo carries the whole read in its caption
+                # we're done; otherwise (long text, failed send, no image) the
+                # text goes out on its own.
+                sent = False
+                if img:
+                    try:
+                        err = telegram.send_photo(chat_id, img,
+                                                  caption=text[:1024])
+                        sent = err is None and len(text) <= 1024
+                    except Exception:
+                        sent = False
                 if not sent:
                     telegram.send_to(chat_id, text)
             except Exception as e:
-                telegram.send_to(chat_id, f"couldn't build that chart: {e}")
+                # last-resort: one honest line with what to try
+                try:
+                    telegram.send_to(
+                        chat_id,
+                        f"couldn't build that chart ({e}). Try again in a "
+                        f"minute, or /signal {arg} for the text-only read.")
+                except Exception:
+                    pass
             finally:
                 stop.set()
 

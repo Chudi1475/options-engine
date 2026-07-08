@@ -55,6 +55,8 @@ def render_fvg(r: dict, bars=None):
     plt = _mpl()
     if plt is None:
         return None, "charts need matplotlib (not installed here)"
+    if not isinstance(r, dict):  # keep the (None, reason) contract even on a bad read
+        return None, "bad read, nothing to chart"
     symbol = r.get("symbol")
     if not symbol and bars is None:
         return None, "no symbol to chart"
