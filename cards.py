@@ -134,10 +134,24 @@ def signal_card(r: dict) -> str:
         lines.append(size)
     if p.get("weak"):
         lines.append("lower conviction: this push fights the 20-day trend, go lighter.")
+    conv = _conviction_line(r)
+    if conv:
+        lines.append(conv)
     if r.get("event_warning"):
         lines.append(r["event_warning"])
     lines.append("read only, not auto-traded. Your call.")
     return "\n".join(lines)
+
+
+def _conviction_line(r: dict) -> str:
+    """Flag the Fair Value Gap conviction when a fresh gap confirms the plan."""
+    conf = (r.get("fvg") or {}).get("confirming")
+    if r.get("conviction") == "high" and conf:
+        dec = r.get("decimals", 2)
+        side = "bullish" if conf["type"] == "bull" else "bearish"
+        return (f"holds conviction: {side} FVG {fmt_lvl(conf['bottom'], dec)} to "
+                f"{fmt_lvl(conf['top'], dec)} confirms it, chart coming.")
+    return ""
 
 
 def _why_line(r: dict) -> str:

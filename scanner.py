@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import json
+import random
 import sys
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -52,10 +53,24 @@ ET = ZoneInfo("America/New_York")
 SESSION_END = time(16, 12)      # loop exits after settle + weekly are done
 MONITOR_START = time(9, 45)
 WEEKLY_AT = time(16, 5)
+LEARN_START = time(21, 0)       # nightly self-review fires at a RANDOM minute
+LEARN_END = time(23, 45)        # inside this window (kept before midnight ET so
+                                # the same-day date/dedup logic never rolls over)
 
 
 def et_now() -> datetime:
     return datetime.now(ET)
+
+
+def learn_target(day) -> time:
+    """The randomized late-night fire time for the nightly self-review, SEEDED
+    off the date so every tick of the same day re-derives the SAME minute. That
+    makes it restart-stable: a crash-and-restart at 22:00 won't re-roll to an
+    earlier time and fire twice, and the once-per-day dedup key covers the rest."""
+    lo = LEARN_START.hour * 60 + LEARN_START.minute
+    hi = LEARN_END.hour * 60 + LEARN_END.minute
+    m = random.Random(f"learn-{day}").randrange(lo, hi + 1)
+    return time(m // 60, m % 60)
 
 
 def keep_awake(on: bool):
@@ -478,16 +493,40 @@ class Service:
                     stop.wait(3)
 
             threading.Thread(target=beat, daemon=True).start()
+            attachments = []  # high-conviction reads the brain pulled, to chart
             try:
-                reply = assistant.respond(item, status)
+                reply = assistant.respond(item, status, attachments=attachments)
             except Exception as e:
                 reply = f"that one hit an error on my end: {e}"
             finally:
                 stop.set()
             if reply:
                 telegram.send_to(chat_id, reply)
+            # when a read held conviction (FVG confirmed the plan), send the
+            # marked-up FVG chart right after the text — everything per usual,
+            # then the fig with the arrows. One per symbol, never blocks the reply.
+            self._send_fvg_charts(chat_id, attachments)
 
         threading.Thread(target=worker, daemon=True, name="brain-reply").start()
+
+    def _send_fvg_charts(self, chat_id: str, reads: list):
+        """Text a candlestick FVG chart for each high-conviction read (deduped by
+        symbol). Best-effort: a render/send hiccup never disturbs the chat."""
+        seen = set()
+        for r in reads or []:
+            tk = r.get("ticker") or r.get("symbol")
+            if not tk or tk in seen:
+                continue
+            seen.add(tk)
+            try:
+                import charts
+                img, _ = charts.render_fvg(r)
+                if img:
+                    d = (r.get("plan") or {}).get("direction", "")
+                    cap = f"{tk} {d} · FVG confirmed. ~15m delayed, your call."
+                    telegram.send_photo(chat_id, img, caption=cap[:1024])
+            except Exception as e:
+                print(f"fvg chart send skipped for {tk}: {e}")
 
     def offer_add_user(self, item: dict):
         """A stranger messaged the bot. Tell the owner(s) once, with a
@@ -675,7 +714,11 @@ class Service:
                 text = cards.macro_line(r)
                 sent = False
                 if not (r.get("error") or r.get("note")):
-                    img, _ = charts.render_signal(r)
+                    # candlestick FVG chart when we can build it; fall back to the
+                    # plain price-line chart if the candle render can't
+                    img, _ = charts.render_fvg(r)
+                    if img is None:
+                        img, _ = charts.render_signal(r)
                     if img and not telegram.send_photo(chat_id, img, caption=text[:1024]):
                         sent = len(text) <= 1024  # caption carried the whole read
                 if not sent:
@@ -1175,6 +1218,41 @@ class Service:
         except Exception as e:
             print(f"{now:%H:%M:%S} request digest failed (will retry): {e}")
 
+    def maybe_learn(self, now: datetime):
+        """Nightly self-review at a RANDOM late-evening time (21:00-23:45 ET),
+        fired from the daemon outer loop (the only loop alive at night). It
+        grades the day's own calls, writes lessons the brain then reads on every
+        reply, and texts the OWNER a 'what I learned' digest. Self-guards to
+        once per weekday; never in dry mode. Weekends have no new trades, so it
+        skips them, same as recap/weekly."""
+        if self.dry or now.weekday() >= 5 or now.time() < learn_target(now.date()):
+            return
+        today = str(now.date())
+        if config.state_get("learn_sent") == today:
+            return
+        try:
+            import learn
+            errs = learn.run(require_date=today)
+            if errs == "STALE":
+                print(f"{now:%H:%M:%S} learn: data not caught up to {today}; will retry")
+                return
+            if not errs:
+                config.state_set("learn_sent", today)
+                return
+            # delivery errors: bounded retries, then mark done so a permanently
+            # unreachable owner can't re-run the review every 45s all night.
+            tries = config.state_get("learn_tries", {})
+            n = (tries.get(today, 0) if isinstance(tries, dict) else 0) + 1
+            if n >= 2:
+                config.state_set("learn_sent", today)
+                print(f"{now:%H:%M:%S} learn had delivery errors after {n} tries; "
+                      f"marking done: {errs}")
+            else:
+                config.state_set("learn_tries", {today: n})
+                print(f"{now:%H:%M:%S} learn send had errors, will retry once: {errs}")
+        except Exception as e:
+            print(f"{now:%H:%M:%S} learn failed (will retry): {e}")
+
     def maybe_weekly(self, now: datetime):
         # Friday after the close — with weekend catch-up if the bot was
         # offline at 16:05 (daemon mode picks it up later)
@@ -1265,6 +1343,8 @@ class Service:
                 self.maybe_weekly(now)  # weekend catch-up
                 self.health_eod(now)    # close ping even if a restart ended the
                                         # session early (self-guards once/day)
+                self.maybe_learn(now)   # nightly self-review at a random late
+                                        # evening time (self-guards once/day)
                 self.handle_commands(timeout=45)  # long-poll, responsive + cheap
             except Exception as e:
                 print(f"daemon error (continuing): {e}")

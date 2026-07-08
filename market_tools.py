@@ -553,9 +553,33 @@ def _do_read(disp, yfs, dec, kind, source):
     if stale or blackout:
         plan = None
 
+    # Fair Value Gap conviction: a plan carries more weight when a fresh,
+    # unfilled FVG confirms its direction and price is still respecting it. This
+    # is the ICT read the guys share. We never trade on an FVG alone; it only
+    # RAISES or LOWERS conviction on the momentum plan we already have.
+    fvg_info, conviction = None, None
+    try:
+        import fvg as _fvg
+        fbars = day_bars if (day_bars is not None and not day_bars.empty) \
+            else (m5 if have_5m else None)
+        if fbars is not None and not fbars.empty:
+            direction = plan["direction"] if plan else None
+            conf = _fvg.confirming_fvg(fbars, direction, price, atr)
+            recent = [f for f in _fvg.find_fvgs(fbars, atr) if not f["filled"]][-6:]
+            fvg_info = {"confirming": conf, "recent_unfilled": recent}
+            if plan and conf:
+                conviction = "high"
+            elif plan:
+                conviction = "medium"
+            elif recent:
+                conviction = "watch"
+    except Exception:
+        fvg_info, conviction = None, None
+
     return {
         "instrument": disp, "ticker": _signal_symbol(disp, kind),
         "symbol": yfs, "kind": kind, "decimals": dec,
+        "fvg": fvg_info, "conviction": conviction,
         "price": round(price, dec), "asof": asof, "stale": stale,
         "prior_close": round(prior_close, dec) if prior_close is not None else None,
         "day_move_pct": round((price / prior_close - 1) * 100, 2) if prior_close else None,
@@ -575,7 +599,13 @@ def _do_read(disp, yfs, dec, kind, source):
                 "market's closed (see 'stale'/'asof'), or a high-impact event is "
                 "imminent (see 'blackout'/event_warning). Say so and give the trigger "
                 "that would make a trade. Lead with any event_warning; quote only "
-                "these levels, never invent one or a win rate; end with 'Your call.'",
+                "these levels, never invent one or a win rate; end with 'Your call.' "
+                "The 'conviction' field ('high' when a fresh Fair Value Gap in "
+                "'fvg.confirming' backs the plan direction, 'medium' when the plan "
+                "stands on momentum alone) tells you how hard to lean. When it is "
+                "high, say the FVG confirms it and quote the gap from 'fvg.confirming' "
+                "(bottom to top); a marked-up FVG chart is auto-sent right after your "
+                "text. Never invent an FVG, only cite what 'fvg' returned.",
     }
 
 

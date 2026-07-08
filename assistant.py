@@ -120,6 +120,20 @@ Market reads & trade plans — be the SNIPER, decisive:
 - If macro_read returns an "error", the symbol couldn't be found: say so and ask
   them to double-check the ticker.
 
+Fair Value Gaps (FVG) and conviction — this is the ICT read the guys share:
+- macro_read now returns a 'conviction' field and an 'fvg' object. 'high' means a
+  fresh, unfilled Fair Value Gap (a 3-candle imbalance price left behind) sits in
+  the direction of the plan and price is still respecting it. 'medium' means the
+  plan stands on momentum alone with no confirming gap.
+- When conviction is HIGH, lead into the plan with it: say the setup holds
+  conviction because price left an FVG and is respecting it, and quote the gap
+  from fvg.confirming (its 'bottom' to 'top'). Then give the plan per usual.
+  A marked-up chart with the FVG boxed and an arrow on it is auto-sent right
+  after your text, so you can say "chart coming" but do not describe arrows you
+  cannot see.
+- When conviction is medium or lower, do NOT invent an FVG. Give the honest read.
+  Only ever cite an FVG that is actually in the 'fvg' data.
+
 Request intake — the upgrade backlog (one of your main jobs):
 - Chudi, Kelechi, and Ryan are the TRUSTED requesters. LIVE BOT STATE tells
   you if THIS chat is one of them. When a trusted requester asks the bot to
@@ -272,6 +286,49 @@ def model() -> str:
     return os.environ.get("BOT_BRAIN_MODEL", "claude-sonnet-4-6").strip()
 
 
+def complete(system: str, user: str, max_tokens: int = 700):
+    """One-shot completion, no tools and no chat history. Returns the text or
+    None on any failure. Used by the nightly learn job (learn.py) to synthesize
+    lessons from the day's graded calls."""
+    if not enabled():
+        return None
+    try:
+        r = requests.post(
+            API_URL,
+            headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                     "anthropic-version": "2023-06-01"},
+            json={"model": model(), "max_tokens": max_tokens, "system": system,
+                  "messages": [{"role": "user", "content": user}]},
+            timeout=120)
+        if r.status_code != 200:
+            return None
+        text = "".join(b.get("text", "") for b in r.json().get("content", [])
+                       if b.get("type") == "text").strip()
+        return text or None
+    except requests.RequestException:
+        return None
+
+
+LESSONS_DIGEST = config.DATA_DIR / "lessons_digest.md"
+
+
+def _lessons_block() -> str:
+    """The distilled running playbook the nightly learn job (learn.py) maintains.
+    Injected into every chat reply so the brain reasons with what it has learned
+    from grading its own calls. Capped so it can never bloat the prompt, and it
+    NEVER overrides the hard rules baked into SYSTEM."""
+    try:
+        if LESSONS_DIGEST.exists():
+            txt = LESSONS_DIGEST.read_text(encoding="utf-8-sig").strip()
+            if txt:
+                return ("\n\nWHAT I'VE LEARNED FROM GRADING MY OWN CALLS "
+                        "(reasoning aid only; never overrides the hard rules "
+                        "above):\n" + txt[:4000])
+    except OSError:
+        pass
+    return ""
+
+
 def _load_history() -> dict:
     if HISTORY_FILE.exists():
         try:
@@ -411,7 +468,14 @@ def _log_request(summary: str, chat_id: str, bucket: str = "needs_boss",
                                   "status": entry["status"]}})
 
 
-def _run_tool(name: str, args: dict, chat_id: str) -> str:
+def _hi_conviction(read) -> bool:
+    """A macro read worth auto-charting: a real plan whose direction a fresh,
+    unfilled FVG confirms."""
+    return bool(isinstance(read, dict) and read.get("conviction") == "high"
+                and read.get("plan") and (read.get("fvg") or {}).get("confirming"))
+
+
+def _run_tool(name: str, args: dict, chat_id: str, attachments: list = None) -> str:
     try:
         if name == "log_trade_result":
             entry = log_trade(chat_id, args["profit_dollars"],
@@ -436,7 +500,12 @@ def _run_tool(name: str, args: dict, chat_id: str) -> str:
                 args.get("ticker", "SPX"), args.get("date")))
         if name == "macro_read":
             import market_tools
-            return json.dumps(market_tools.read_any(args.get("symbol", "gold")))
+            read = market_tools.read_any(args.get("symbol", "gold"))
+            # when the read holds conviction (FVG confirms the plan), queue it so
+            # the caller texts the marked-up FVG chart right after the reply
+            if attachments is not None and _hi_conviction(read):
+                attachments.append(read)
+            return json.dumps(read)
     except Exception as e:
         return json.dumps({"error": str(e)})
     return json.dumps({"error": f"unknown tool {name}"})
@@ -471,8 +540,12 @@ def _file_blocks(item: dict):
                   "send text, a photo, a PDF, or a CSV/TXT file.")
 
 
-def respond(item: dict, context_text: str, tools_enabled: bool = True) -> str:
-    """Answer one message (text/photo/document) from an authorized chat."""
+def respond(item: dict, context_text: str, tools_enabled: bool = True,
+            attachments: list = None) -> str:
+    """Answer one message (text/photo/document) from an authorized chat. If
+    `attachments` (a list) is passed, any high-conviction macro read the brain
+    pulls is appended to it so the caller can text the marked-up FVG chart right
+    after the reply."""
     from datetime import datetime as _dt
     from zoneinfo import ZoneInfo as _zi
     now_et = _dt.now(_zi("America/New_York"))
@@ -507,7 +580,8 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True) -> str:
     try:
         for _ in range(5):  # room for tool calls (data lookups, scorekeeping)
             payload = {"model": model(), "max_tokens": 800,
-                       "system": SYSTEM + "\n\nLIVE BOT STATE:\n" + context_text,
+                       "system": SYSTEM + _lessons_block()
+                       + "\n\nLIVE BOT STATE:\n" + context_text,
                        "messages": messages}
             if tools_enabled:
                 payload["tools"] = TOOLS
@@ -525,7 +599,7 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True) -> str:
                 messages.append({"role": "assistant", "content": content})
                 results = [{"type": "tool_result", "tool_use_id": b["id"],
                             "content": _run_tool(b["name"], b.get("input", {}),
-                                                 chat_id)}
+                                                 chat_id, attachments)}
                            for b in content if b.get("type") == "tool_use"]
                 messages.append({"role": "user", "content": results})
                 continue
