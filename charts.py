@@ -19,6 +19,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
+CT = ZoneInfo("America/Chicago")  # Chudi's time: every displayed time is Central
 
 # TradingView light palette
 _BG = "#ffffff"
@@ -80,7 +81,7 @@ def render_fvg(r: dict, bars=None):
                 df.columns = df.columns.get_level_values(0)
             if df is not None and not df.empty and getattr(df.index, "tz", None) is not None:
                 try:
-                    df.index = df.index.tz_convert(ET)
+                    df.index = df.index.tz_convert(CT)
                 except (TypeError, ValueError):
                     pass
         if df is None or df.empty or not {"Open", "High", "Low", "Close"}.issubset(df.columns):
@@ -237,7 +238,7 @@ def render_fvg(r: dict, bars=None):
         red_tag(entry_lvl)
         red_tag(sl_lvl)
         # dotted current price with price + time tag (exactly like the app)
-        now_et = datetime.now(ET)
+        now_et = datetime.now(CT)
         red_tag(price, two_line=f"{fmt(price)}\n{now_et:%H:%M}", dotted=True)
 
         # arrows for extra read: projected path from the last candle to the
@@ -300,7 +301,7 @@ def render_fvg(r: dict, bars=None):
         ax.set_xticks(x[::step])
         ax.set_xticklabels([df.index[i].strftime("%H:%M") for i in x[::step]])
         fig.text(0.985, 0.012,
-                 f"{now_et:%a %b %d %I:%M %p ET}  ·  ~15m delayed, your call",
+                 f"{now_et:%a %b %d %I:%M %p CT}  ·  ~15m delayed, your call",
                  color=_MUT, fontsize=7, ha="right", va="bottom")
         fig.subplots_adjust(top=0.885, bottom=0.055, left=0.03, right=0.87)
 
@@ -346,7 +347,7 @@ def render_signal(r: dict):
             return None, "no intraday bars to chart"
         if getattr(df.index, "tz", None) is not None:
             try:
-                df.index = df.index.tz_convert(ET)
+                df.index = df.index.tz_convert(CT)
             except (TypeError, ValueError):
                 pass
         closes = df["Close"].dropna().tail(120)
@@ -386,10 +387,10 @@ def render_signal(r: dict):
         ax.grid(True, color="#1c1f26", linewidth=0.6)
         try:
             import matplotlib.dates as mdates
-            ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=ET))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=CT))
         except Exception:
             pass
-        stamp = datetime.now(ET).strftime("%a %b %d %I:%M %p ET")
+        stamp = datetime.now(CT).strftime("%a %b %d %I:%M %p CT")
         ax.text(0.99, 0.02, f"{stamp}  ·  ~15m delayed, your call",
                 transform=ax.transAxes, color="#5a5d63", fontsize=7,
                 ha="right", va="bottom")

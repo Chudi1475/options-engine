@@ -655,7 +655,7 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True,
     after the reply."""
     from datetime import datetime as _dt
     from zoneinfo import ZoneInfo as _zi
-    now_et = _dt.now(_zi("America/New_York"))
+    now_et = _dt.now(_zi("America/Chicago"))
     chat_id = item["chat_id"]
     who_line = ("This chat IS the owner (Chudi) himself."
                 if telegram.is_owner(chat_id)

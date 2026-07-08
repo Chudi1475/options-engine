@@ -21,7 +21,7 @@ import sys
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -67,7 +67,7 @@ def pct(a, b):
 
 def _t(hms: str) -> str:
     """'10:42:15' -> '10:42 AM ET'"""
-    return datetime.strptime(hms, "%H:%M:%S").strftime("%I:%M %p ET").lstrip("0")
+    return (datetime.strptime(hms, "%H:%M:%S") - timedelta(hours=1)).strftime("%I:%M %p CT").lstrip("0")
 
 
 def _minutes_between(a: str, b: str) -> int:
