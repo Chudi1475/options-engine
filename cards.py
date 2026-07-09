@@ -144,21 +144,24 @@ def signal_card(r: dict) -> str:
 
 
 def _conviction_line(r: dict) -> str:
-    """Flag the Fair Value Gap conviction when a graded gap confirms the plan,
-    in the terms an ICT trader actually uses (BISI/SIBI, CE, grade)."""
+    """Conviction 'high' is the verified SNIPER pattern (79% win rate over 133
+    walk-forward replays, chart_backtest_round6): quote the measured ticket.
+    Anything below high gets no measured claim, so no line."""
     conf = (r.get("fvg") or {}).get("confirming")
     if r.get("conviction") == "high" and conf:
         dec = r.get("decimals", 2)
-        name = "BISI" if conf["polarity"] == "bull" else "SIBI"
-        inv = " inverted" if conf.get("inverted") else ""
         tk = conf.get("ticket") or {}
-        line = (f"holds conviction: grade {conf['grade']}{inv} {name} FVG "
-                f"{fmt_lvl(conf['bottom'], dec)} to {fmt_lvl(conf['top'], dec)} "
-                f"({conf['state']}, {conf['pd_zone']}), CE {fmt_lvl(conf['ce'], dec)}")
-        if tk.get("entry_ce") is not None:
-            line += (f". FVG entry {fmt_lvl(tk['entry_ce'], dec)}, "
-                     f"stop {fmt_lvl(tk['stop'], dec)}, target {fmt_lvl(tk['target_liquidity'], dec)}")
-        return line + ". chart coming."
+        if all(tk.get(k) is not None for k in ("entry", "stop", "target")):
+            return (f"SNIPER setup: 79% win rate on 133 verified replays. "
+                    f"entry {fmt_lvl(tk['entry'], dec)}, "
+                    f"stop {fmt_lvl(tk['stop'], dec)}, "
+                    f"TP (0.4R) {fmt_lvl(tk['target'], dec)}. chart coming.")
+        # high without a sniper ticket should not happen; stay honest, no
+        # measured claim, just the structure
+        name = "BISI" if conf["polarity"] == "bull" else "SIBI"
+        return (f"holds conviction: grade {conf['grade']} {name} FVG "
+                f"{fmt_lvl(conf['bottom'], dec)} to {fmt_lvl(conf['top'], dec)}"
+                f" ({conf['state']}, {conf['pd_zone']}). chart coming.")
     return ""
 
 

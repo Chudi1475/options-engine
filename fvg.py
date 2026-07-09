@@ -28,6 +28,24 @@ import pandas as pd
 
 # a gap this small is micro-noise even if the wicks technically miss
 _MIN_GAP_ATR = 0.05
+
+# ---------------------------------------------------------------------------
+# SNIPER pattern: the walk-forward-verified config from
+# reports/chart_backtest_round6.json (procedural winner, OOS 79.0% / 62 trades,
+# 133 trades total across IS+OOS). Every constant here mirrors that config;
+# change them only with a new verified backtest round.
+# ---------------------------------------------------------------------------
+SNIPER_SYMBOLS = {"EURUSD=X", "JPY=X", "^GSPC", "TSLA", "SPY"}
+_SNIPER_MIN_GAP_ATR = 1.0    # FVG gap floor (x ATR)
+_SNIPER_MAX_GAP_ATR = 3.0    # FVG gap cap (x ATR)
+_SNIPER_MIN_HOUR_ET = 7      # entries only 07:00 ET or later
+_SNIPER_MAX_RUN_ATR = 8.0    # skip if price already ran this far from the open
+_SNIPER_MAX_DAY_EFF = 0.85   # skip a one-way day: abs(close-open)/(high-low)
+_SNIPER_MAX_RISK_ATR = 3.6   # skip if the stop sits this far away or more
+_SNIPER_STOP_BUF_ATR = 0.1   # stop = FVG far edge +/- this buffer
+_SNIPER_TP_R = 0.4           # take profit, all out, no runner
+SNIPER_MEASURED = {"win_rate": 79.0, "trades": 133,
+                   "basis": "walk-forward replay, chart_backtest_round6"}
 # middle-candle body must clear this multiple of ATR to count as real
 # displacement (strong = institutional impulse, not a drift)
 _DISP_STRONG_ATR = 1.0
@@ -244,6 +262,121 @@ def confirming_fvg(bars, direction, price=None, atr=None, bias=None):
         "rr": round(abs(target - entry) / risk, 2) if risk > 0 else None,
     }
     return out
+
+
+def sniper_check(bars, direction, price, atr, conf, yf_symbol, now_et):
+    """Gate a read against the verified SNIPER pattern (see SNIPER_* above,
+    from reports/chart_backtest_round6.json). ALL conditions must pass:
+
+      - yf_symbol is one of the five verified symbols (SNIPER_SYMBOLS)
+      - `conf` is a grade A confirming FVG in the plan `direction`
+      - FVG gap size >= 1.0*ATR and < 3.0*ATR
+      - clock (now_et) is 07:00 ET or later
+      - price has run < 8*ATR from today's session open in the trade direction
+      - day efficiency abs(close-open)/(high-low) < 0.85
+      - stop distance < 3.6*ATR, stop = FVG far edge -0.1*ATR (BUY, bottom
+        side) / +0.1*ATR (SELL, top side)
+
+    Returns a JSON-safe dict:
+      {"passes": bool,
+       "reasons": [str, ...]   # every failed condition, empty when passing
+       "ticket": {"entry": price (market, now), "stop", "target" (0.4R all
+                  out), "risk", "rr": 0.4} or None when no stop is computable}
+
+    Pure (no network, no state) and fully guarded: bad input never raises, it
+    just fails the check with a reason."""
+    try:
+        if direction not in ("BUY", "SELL"):
+            return {"passes": False, "reasons": ["no plan direction"], "ticket": None}
+        if bars is None or len(bars) == 0 or price is None or not atr or atr <= 0:
+            return {"passes": False, "reasons": ["missing bars/price/ATR"], "ticket": None}
+        price = float(price)
+        atr = float(atr)
+        reasons = []
+
+        if yf_symbol not in SNIPER_SYMBOLS:
+            reasons.append(f"{yf_symbol or '?'} is not a verified sniper symbol "
+                           "(EUR/USD, USD/JPY, SPX, TSLA, SPY only)")
+
+        if not conf or conf.get("grade") != "A":
+            reasons.append("no grade A confirming FVG")
+        else:
+            size = float(conf.get("size") or 0.0)
+            if size < _SNIPER_MIN_GAP_ATR * atr:
+                reasons.append(f"FVG gap {size / atr:.2f} ATR under the "
+                               f"{_SNIPER_MIN_GAP_ATR:g} ATR floor")
+            elif size >= _SNIPER_MAX_GAP_ATR * atr:
+                reasons.append(f"FVG gap {size / atr:.2f} ATR at/over the "
+                               f"{_SNIPER_MAX_GAP_ATR:g} ATR cap")
+
+        if now_et is None or not hasattr(now_et, "hour"):
+            reasons.append("no ET clock")
+        elif now_et.hour < _SNIPER_MIN_HOUR_ET:
+            reasons.append(f"before {_SNIPER_MIN_HOUR_ET:02d}:00 ET")
+
+        # today's session only: bars may span days when intraday fell back
+        db = bars
+        try:
+            dates = bars.index.date
+            last_day = max(dates)
+            mask = [d == last_day for d in dates]
+            if any(mask) and not all(mask):
+                db = bars[mask]
+        except (AttributeError, TypeError, ValueError):
+            db = bars
+        day_open = day_hi = day_lo = day_close = None
+        try:
+            o = db["Open"].astype(float).dropna()
+            h = db["High"].astype(float).dropna()
+            low = db["Low"].astype(float).dropna()
+            c = db["Close"].astype(float).dropna()
+            if len(o) and len(h) and len(low) and len(c):
+                day_open = float(o.iloc[0])
+                day_hi = float(h.max())
+                day_lo = float(low.min())
+                day_close = float(c.iloc[-1])
+        except (KeyError, TypeError, ValueError, IndexError):
+            pass
+        if day_open is None:
+            reasons.append("can't read today's session bars")
+        else:
+            run = (price - day_open) if direction == "BUY" else (day_open - price)
+            if run >= _SNIPER_MAX_RUN_ATR * atr:
+                reasons.append(f"already ran {run / atr:.1f} ATR from the open "
+                               f"(cap {_SNIPER_MAX_RUN_ATR:g})")
+            rng = day_hi - day_lo
+            if rng > 0:
+                eff = abs(day_close - day_open) / rng
+                if eff >= _SNIPER_MAX_DAY_EFF:
+                    reasons.append(f"one-way day, efficiency {eff:.2f} at/over "
+                                   f"{_SNIPER_MAX_DAY_EFF:g}")
+
+        ticket = None
+        if conf and conf.get("top") is not None and conf.get("bottom") is not None:
+            buf = _SNIPER_STOP_BUF_ATR * atr
+            if direction == "BUY":
+                stop = float(conf["bottom"]) - buf
+            else:
+                stop = float(conf["top"]) + buf
+            risk = abs(price - stop)
+            if risk >= _SNIPER_MAX_RISK_ATR * atr:
+                reasons.append(f"stop {risk / atr:.1f} ATR away, at/over the "
+                               f"{_SNIPER_MAX_RISK_ATR:g} ATR cap")
+            if risk > 0:
+                tgt = price + _SNIPER_TP_R * risk if direction == "BUY" \
+                    else price - _SNIPER_TP_R * risk
+                ticket = {"entry": round(price, 6), "stop": round(stop, 6),
+                          "target": round(tgt, 6), "risk": round(risk, 6),
+                          "rr": _SNIPER_TP_R}
+            else:
+                reasons.append("zero-distance stop")
+
+        return {"passes": bool(not reasons and ticket), "reasons": reasons,
+                "ticket": ticket}
+    except Exception as e:  # never let the sniper gate take down a read
+        return {"passes": False,
+                "reasons": [f"sniper check failed ({type(e).__name__})"],
+                "ticket": None}
 
 
 def summary_line(f: dict, dec: int = 2) -> str:

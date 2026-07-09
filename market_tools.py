@@ -612,10 +612,12 @@ def _do_read(disp, yfs, dec, kind, source):
         plan = None
 
     # Fair Value Gap conviction (ICT / smart-money grade). We never trade on an
-    # FVG alone; a graded, displacement-backed FVG that confirms the momentum
-    # plan RAISES conviction (and gives a CE-based entry/stop/target), a weak or
-    # missing one leaves it on momentum alone. bias feeds FVG grading so a gap
-    # with the trend scores higher.
+    # FVG alone. Conviction "high" is EARNED by exactly one thing: the SNIPER
+    # pattern, the walk-forward-verified round-6 config (grade A confirming FVG
+    # on a verified symbol, gap 1.0-3.0 ATR, 07:00 ET+, run-from-open < 8 ATR,
+    # day efficiency < 0.85, stop < 3.6 ATR). It measured 79.0% over 133
+    # replays; nothing else may borrow that number. A plan without the sniper
+    # gate is "medium" (structural read only), no plan but strong gaps = "watch".
     fvg_info, conviction = None, None
     try:
         import fvg as _fvg
@@ -628,11 +630,22 @@ def _do_read(disp, yfs, dec, kind, source):
             actionable = [f for f in allf if f["state"] != "filled"]
             # the strongest few to draw, best grade first
             actionable.sort(key=lambda f: (f["score"], f["i"]), reverse=True)
-            fvg_info = {"confirming": conf, "recent_unfilled": actionable[:6]}
-            if plan and conf and conf["grade"] in ("A", "B"):
+            sniper = _fvg.sniper_check(fbars, direction, price, atr, conf,
+                                       yfs, datetime.now(ET))
+            is_sniper = bool(plan and conf and sniper.get("passes")
+                             and sniper.get("ticket"))
+            fvg_info = {"confirming": conf, "recent_unfilled": actionable[:6],
+                        "sniper": is_sniper}
+            if is_sniper:
                 conviction = "high"
+                ticket = dict(sniper["ticket"])
+                ticket["measured"] = dict(_fvg.SNIPER_MEASURED)
+                conf["ticket"] = ticket
             elif plan:
                 conviction = "medium"
+                if sniper.get("reasons"):
+                    # why this is NOT the measured pattern (honesty, not noise)
+                    fvg_info["sniper_reasons"] = sniper["reasons"]
             elif any(f["strong"] for f in actionable):
                 conviction = "watch"
     except Exception:
@@ -662,17 +675,22 @@ def _do_read(disp, yfs, dec, kind, source):
                 "imminent (see 'blackout'/event_warning). Say so and give the trigger "
                 "that would make a trade. Lead with any event_warning; quote only "
                 "these levels, never invent one or a win rate; end with 'Your call.' "
-                "The 'conviction' field ('high' when a graded, displacement-backed "
-                "Fair Value Gap in 'fvg.confirming' confirms the plan, 'medium' when "
-                "the plan stands on momentum alone) tells you how hard to lean. When "
-                "high, name it like an ICT trader: quote fvg.confirming.grade and "
-                "label (BISI=bullish, SIBI=bearish), its zone (bottom to top), its CE "
-                "(consequent encroachment, the 50% entry), whether it is unmitigated "
-                "or inverted (IFVG), and whether it sits in premium/discount. Give the "
-                "FVG ticket from fvg.confirming.ticket (entry_ce, stop beyond the far "
-                "edge, target_liquidity) as the smart-money refinement alongside the "
-                "momentum plan. A marked-up FVG chart is auto-sent right after your "
-                "text. Never invent an FVG or its levels; only cite what 'fvg' returned.",
+                "The 'conviction' field tells you how hard to lean. 'high' means "
+                "exactly one thing: this read passed the verified SNIPER pattern "
+                "(fvg.sniper true) and its measured record is in "
+                "fvg.confirming.ticket.measured: 79.0% win rate over 133 "
+                "walk-forward replays (chart_backtest_round6). Quote that measured "
+                "number when and ONLY when conviction is high, and give the sniper "
+                "ticket from fvg.confirming.ticket: entry (market, now), stop, "
+                "target (take profit at 0.4R, all out, no runner), one trade per "
+                "symbol per day. When conviction is 'medium' the plan stands on "
+                "structure/momentum alone: say plainly it has NO measured win rate "
+                "(fvg.sniper_reasons lists what failed the sniper gate). You may "
+                "still describe the FVG in fvg.confirming (grade, BISI/SIBI, CE, "
+                "premium/discount) at any conviction, but never attach the 79% to "
+                "a non-sniper read. A marked-up FVG chart is auto-sent right after "
+                "your text. Never invent an FVG or its levels; only cite what "
+                "'fvg' returned.",
     }
 
 

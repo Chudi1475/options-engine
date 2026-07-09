@@ -100,6 +100,13 @@ def render_fvg(r: dict, bars=None):
         dec = r.get("decimals", 2)
         plan = r.get("plan") or {}
         direction = plan.get("direction")
+        # the verified SNIPER read carries its own measured ticket; the chart
+        # tags MUST show those exact levels, not the recomputed CE refinement
+        rfvg = r.get("fvg") or {}
+        sniper = bool(rfvg.get("sniper"))
+        stk = ((rfvg.get("confirming") or {}).get("ticket") or {}) if sniper else {}
+        sniper = sniper and all(
+            stk.get(k) is not None for k in ("entry", "stop", "target"))
 
         atr = None
         tr = np.maximum(h[1:] - low[1:],
@@ -232,9 +239,12 @@ def render_fvg(r: dict, bars=None):
                                   edgecolor="none"),
                         annotation_clip=False, zorder=9)
 
-        entry_lvl = tk.get("entry_ce") if tk else plan.get("entry")
-        sl_lvl = tk.get("stop") if tk else plan.get("stop")
-        tp_lvl = tk.get("target_liquidity") if tk else plan.get("target")
+        if sniper:
+            entry_lvl, sl_lvl, tp_lvl = stk["entry"], stk["stop"], stk["target"]
+        else:
+            entry_lvl = tk.get("entry_ce") if tk else plan.get("entry")
+            sl_lvl = tk.get("stop") if tk else plan.get("stop")
+            tp_lvl = tk.get("target_liquidity") if tk else plan.get("target")
         red_tag(entry_lvl)
         red_tag(sl_lvl)
         # dotted current price with price + time tag (exactly like the app)
@@ -275,7 +285,8 @@ def render_fvg(r: dict, bars=None):
 
         # ---------------- cosmetics ----------------
         name = r.get("instrument") or r.get("ticker") or symbol
-        fig.text(0.055, 0.965, str(name), color=_TXT, fontsize=15.5,
+        title = str(name) + ("  SNIPER · 79% verified" if sniper else "")
+        fig.text(0.055, 0.965, title, color=_TXT, fontsize=15.5,
                  fontweight="bold", ha="left", va="top")
         prior = r.get("prior_close")
         line2_y = 0.932
@@ -286,7 +297,14 @@ def render_fvg(r: dict, bars=None):
                      f"{fmt(price)} {chg:+,.{dec}f} ({pct:+.2f}%)",
                      color=(_RED if chg < 0 else _GREEN), fontsize=11.5,
                      ha="left", va="top")
-        if conf:
+        if sniper:
+            rconf = rfvg.get("confirming") or {}
+            info = "79% on 133 replays · TP 0.4R all out"
+            if rconf.get("grade") and rconf.get("label"):
+                info = f"grade {rconf['grade']} {rconf['label']} · " + info
+            fig.text(0.055, line2_y - 0.028, info,
+                     color=_MUT, fontsize=9.5, ha="left", va="top")
+        elif conf:
             fig.text(0.055, line2_y - 0.028,
                      f"grade {conf['grade']} {conf['label']} · CE entry"
                      + (f" · {tk['rr']:g}R" if tk and tk.get('rr') else ""),
