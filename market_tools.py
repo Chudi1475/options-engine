@@ -66,6 +66,8 @@ INDEX_SYMBOLS = {
     "dji": ("DOW", "^DJI", 2),
     "dxy": ("DXY", "DX-Y.NYB", 2), "dollarindex": ("DXY", "DX-Y.NYB", 2),
     "russell2000": ("RUT", "^RUT", 2), "us2000": ("RUT", "^RUT", 2),
+    "es": ("ES (S&P futures)", "ES=F", 2), "spxfutures": ("ES (S&P futures)", "ES=F", 2),
+    "nq": ("NQ (Nasdaq futures)", "NQ=F", 2),
 }
 
 # friendly name -> ticker so a chat like "how's nvidia" resolves
@@ -260,10 +262,16 @@ def market_now(ticker="SPX"):
     yfs = _cfg.watchlist[ticker]
     now = datetime.now(ET)
     if now.weekday() >= 5 or not (time(9, 30) <= now.time() <= time(16, 0)):
-        day, _ = _resolve_day(None)
-        return {"note": "The market is closed right now.", "last_session": str(day),
-                "tip": "Ask me to analyze the last session, or send a chart and "
-                "I'll read it."}
+        # extended hours: keep tracking. Stocks/ETFs get pre/post-market bars;
+        # SPX has no after-hours tape so it rides the ES futures.
+        r = read_any("es" if ticker == "SPX" else ticker)
+        if isinstance(r, dict) and not r.get("error"):
+            r["session"] = "extended-hours"
+            r.setdefault("disclaimer", "")
+            r["note_session"] = ("After-hours/pre-market read: thinner volume, "
+                                 "wider spreads, RTH open can gap. No 0DTE "
+                                 "alerts fire outside 9:45-10:30 ET.")
+            return r
     try:
         bars = _feed.today_bars(yfs, now)
         price = _feed.latest_price(yfs)
@@ -454,7 +462,7 @@ def _do_read(disp, yfs, dec, kind, source):
     try:
         d1 = _flatten(yf.download(yfs, period="1mo", interval="1d",
                                   progress=False, auto_adjust=False))
-        m5 = _flatten(yf.download(yfs, period="2d", interval="5m",
+        m5 = _flatten(yf.download(yfs, period="2d", interval="5m", prepost=True,
                                   progress=False, auto_adjust=False))
     except Exception as e:
         return {"note": f"couldn't pull {disp} data right now ({e})."}

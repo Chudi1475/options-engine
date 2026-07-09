@@ -75,7 +75,7 @@ def render_fvg(r: dict, bars=None):
         if bars is not None:
             df = bars.copy()
         else:
-            df = yf.download(symbol, period="2d", interval="5m",
+            df = yf.download(symbol, period="2d", interval="5m", prepost=True,
                              progress=False, auto_adjust=False)
             if df is not None and hasattr(df.columns, "levels"):
                 df.columns = df.columns.get_level_values(0)
@@ -336,7 +336,7 @@ def render_signal(r: dict):
 
         import yfinance as yf
 
-        df = yf.download(symbol, period="2d", interval="5m",
+        df = yf.download(symbol, period="2d", interval="5m", prepost=True,
                          progress=False, auto_adjust=False)
         if df is not None and hasattr(df.columns, "levels"):
             df.columns = df.columns.get_level_values(0)
