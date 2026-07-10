@@ -1,12 +1,8 @@
-# The always-on improvement loop (waiting on your go-ahead)
+# The always-on improvement loop
 
-One piece of the autonomy stack cannot install itself: a forever-running
-wrapper that launches headless Claude Code sessions against this repo while
-you are away. Claude's safety layer (correctly) requires the owner to
-approve creating an unattended agent with code-execution rights, so this
-file is the reviewed design. To build it, open Claude Code in this repo
-interactively and say: "build self_improve.py exactly per SELF_IMPROVE.md"
-and approve the prompts.
+Built and installed 2026-07-10 with the owner's explicit authorization.
+`self_improve.py` is the forever-running wrapper that launches headless
+Claude Code sessions against this repo while you are away.
 
 ## What it does, each cycle
 1. Runs one headless Claude session with SCOPED permissions (file tools +
@@ -17,8 +13,11 @@ and approve the prompts.
 2. The wrapper re-runs those same gates itself and `git revert`s the commit
    if anything fails. It never trusts the session's word.
 3. Texts the owner a one-line summary per cycle via the bot's Telegram token.
-4. On a Claude usage-limit message: texts you, counts down exactly 5 hours
-   5 minutes, resumes on its own.
+4. On a Claude usage-limit message: texts you, then resumes the moment usage
+   is actually back: it parses the reset time straight out of the CLI's
+   message ("resets 5am") and waits until then; if no time was given it
+   knocks every 15 minutes with a tiny probe call. The fixed 5h05m wait is
+   only the hard cap when everything else fails.
 5. Never deploys (deploys stay `railway up --detach`, run by a human), never
    pushes unless AUTO_PUSH is flipped on, never touches the frozen sniper
    constants in fvg.py or the trading thresholds in config.py.

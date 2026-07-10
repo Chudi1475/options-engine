@@ -63,9 +63,12 @@ def _resume_text() -> str:
     return f"{at:%I:%M %p CT}".lstrip("0")
 
 
-def _start_cooldown(reason: str):
-    """Arm the 5h05m countdown and tell the owner once."""
-    config.state_set(_COOLDOWN_KEY, _now_s() + USAGE_WAIT_S)
+def _start_cooldown(reason: str, wait_s: float = None):
+    """Arm the countdown and tell the owner once. When the API said exactly
+    how long (retry-after), trust that instead of the 5h05m default; the
+    fixed wait is only the fallback for limits with no stated end."""
+    wait = min(float(wait_s), USAGE_WAIT_S + 3600) if wait_s else USAGE_WAIT_S
+    config.state_set(_COOLDOWN_KEY, _now_s() + wait)
     config.state_set(_COOLDOWN_FLAG, True)
     try:
         owner = telegram.primary_owner_id()
@@ -148,10 +151,14 @@ def _post_anthropic(payload: dict, timeout: int):
         retry_after = r.headers.get("retry-after")
         if _looks_like_usage_limit(r.status_code, err_type, err_msg,
                                    retry_after):
-            _start_cooldown(err_msg or f"HTTP {r.status_code}")
-            return None, ("Claude usage limit hit. Brain naps for 5h05m and "
-                          f"comes back around {_resume_text()}. Everything "
-                          "else keeps running.")
+            try:  # the API often says exactly when: wait THAT, not 5h05m
+                stated = float(retry_after) + 120 if retry_after else None
+            except (TypeError, ValueError):
+                stated = None
+            _start_cooldown(err_msg or f"HTTP {r.status_code}", stated)
+            return None, ("Claude usage limit hit. Brain naps and comes "
+                          f"back around {_resume_text()}. Everything else "
+                          "keeps running.")
         if r.status_code in (429, 500, 502, 503, 529) and attempt < 2:
             try:
                 wait = min(float(retry_after), 30) if retry_after else 2 ** attempt * 2
