@@ -53,6 +53,11 @@ import backtest_chart_v4 as v4
 SCRATCH = (r"C:\Users\Chudi\AppData\Local\Temp\claude\C--Users-Chudi"
            r"\57d7f2c7-4e77-45b8-b3fa-04ab441a1a92\scratchpad")
 STREAM_PKL = os.path.join(SCRATCH, "r5stream.pkl")
+# the frozen stream now lives in the repo; prefer it (survives scratchpad GC)
+_REPO_PKL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "data", "backtest_frozen", "r5stream.pkl")
+if os.path.isfile(_REPO_PKL):
+    STREAM_PKL = _REPO_PKL
 
 PRIOR_LOOKS = 19        # cumulative OOS-look ledger through round 5
 MAX_PEEKS = 6           # hard cap on gate checks this round

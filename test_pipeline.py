@@ -80,7 +80,8 @@ evs = feed(p, at(10, 30), 28)
 check("S1 runner give-back fires (peak 70 -> 28 = 42 back >= 40)",
       [e["type"] for e in evs] == ["runner_trail"])
 check("S1 weighted final 0.5*26 + 0.5*28 = 27",
-      abs(p.final_pnl_pct - 27.0) < 0.01, f"got {p.final_pnl_pct}")
+      p.final_pnl_pct is not None and abs(p.final_pnl_pct - 27.0) < 0.01,
+      f"got {p.final_pnl_pct}")
 
 # --- scenario 2: straight stop; old shadow keeps running after ---
 p = mk_pos()
@@ -94,7 +95,8 @@ evs = feed(p, at(11, 0), -61)
 check("S2 closed pos emits no new events", evs == [])
 check("S2 old shadow stops at -61", p.old_rules["status"] == "closed"
       and p.old_rules["exit_reason"] == "old stop")
-check("S2 final unchanged by shadow marks", abs(p.final_pnl_pct + 32) < 0.01)
+check("S2 final unchanged by shadow marks",
+      p.final_pnl_pct is not None and abs(p.final_pnl_pct + 32) < 0.01)
 
 # --- scenario 3: half then stop on the remainder ---
 p = mk_pos()
@@ -102,7 +104,8 @@ feed(p, at(10, 0), 27)
 evs = feed(p, at(10, 20), -31)
 check("S3 stop after half", [e["type"] for e in evs] == ["stop"])
 check("S3 weighted final 0.5*27 + 0.5*(-31) = -2",
-      abs(p.final_pnl_pct + 2.0) < 0.01, f"got {p.final_pnl_pct}")
+      p.final_pnl_pct is not None and abs(p.final_pnl_pct + 2.0) < 0.01,
+      f"got {p.final_pnl_pct}")
 
 # --- scenario 4: expiry warning then settle at the close ---
 p = mk_pos()
@@ -112,15 +115,20 @@ evs = feed(p, at(15, 47), 5)
 check("S4 warning not repeated", evs == [])
 evs = feed(p, at(16, 1), 3)
 check("S4 settled at close, no extra alert", evs == [] and p.state == "closed")
-check("S4 settle reason expiry close", p.final_exit["reason"] == "expiry close")
+check("S4 settle reason expiry close",
+      p.final_exit is not None and p.final_exit["reason"] == "expiry close")
 check("S4 old shadow time-stopped too", p.old_rules["status"] == "closed")
 
-# --- scenario 5: estimate acts as early-warning floor for the stop ---
+# --- scenario 5: estimate floors the stop only on non-comparable cycles ---
 p = mk_pos()
 evs = feed(p, at(10, 0), -20, est_pct=-31.0)
-check("S5 stop fires when estimate says -31 even if quote says -20",
+check("S5 comparable quote at -20 outranks the -31 estimate (no stop)",
+      evs == [] and p.state == "open")
+evs = feed(p, at(10, 5), -20, est_pct=-31.0, comparable=False)
+check("S5 stop fires off the estimate once the mark is non-comparable",
       [e["type"] for e in evs] == ["stop"])
-check("S5 recorded pct is the mark (-20)", abs(p.final_exit["pct"] + 20) < 0.01)
+check("S5 recorded pct is the estimate (-31)",
+      p.final_exit is not None and abs(p.final_exit["pct"] + 31) < 0.01)
 
 # --- scenario 6: no trail exit before the half target ---
 p = mk_pos()
@@ -169,7 +177,8 @@ feed(p, at(10, 5), 80)            # comparable, peak 80
 evs = feed(p, at(10, 10), 30, est_pct=30.0, comparable=False)  # cross-source read
 check("S10 no give-back on a non-comparable cycle",
       evs == [] and p.state == "half_sold")
-check("S10 peak not moved by a non-comparable cycle", abs(p.mfe_pct - 80) < 0.01)
+check("S10 peak not moved by a non-comparable cycle",
+      p.mfe_pct is not None and abs(p.mfe_pct - 80) < 0.01)
 evs = feed(p, at(10, 15), 38)     # comparable: 80-38=42 >= 40 -> give-back
 check("S10 give-back fires on the next comparable cycle",
       [e["type"] for e in evs] == ["runner_trail"])

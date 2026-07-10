@@ -53,13 +53,23 @@ RISK_PER_TRADE_PCT = _f("RISK_PER_TRADE_PCT", 1.0)    # full stop-out costs 1% o
 CORRELATED_RISK_PCT = _f("CORRELATED_RISK_PCT", 0.5)  # risk when same-direction trade already open
 SPREAD_COST_PCT = _f("SPREAD_COST_PCT", 4.0)  # est. round-trip cost of crossing the spread (live stats)
 MIN_WINRATE = _f("MIN_WINRATE", 70.0)        # never alert below this backtested win rate
+GAP_UP_SKIP_PCT = _f("GAP_UP_SKIP_PCT", 1.0) # stand aside when SPX opens this far
+                                             # above yesterday's close. Verified
+                                             # regime study (bt_exp_regime_split):
+                                             # gap-up>1% days won only 56.7% and
+                                             # LOST money; skipping them lifted the
+                                             # book to 76.7% win / +25.9%/trade and
+                                             # beat baseline in walk-forward.
+                                             # 0 disables the rule.
 LIVE_STATS_MIN_TOTAL = 30                    # closed signals before live stats replace the backtest
 LIVE_STATS_MIN_SETUP = 10                    # and at least this many for the specific setup
 POLL_SECONDS = int(_f("POLL_SECONDS", 15))   # main loop cadence
 NEWS_POLL_SECONDS = int(_f("NEWS_POLL_SECONDS", 12))  # breaking-news scan cadence
                                              # (own thread; lower = faster but
                                              # risks the free RSS feeds rate-limiting)
-EXPIRY_WARN_MINUTES = 15                     # "close before expiry" warning, minutes before 4 PM ET
+EXPIRY_WARN_MINUTES = int(_f("EXPIRY_WARN_MINUTES", 15))  # "close before expiry"
+                                             # warning, minutes before 4 PM ET
+                                             # (env-tunable like the other knobs)
 # -----------------------------------------------------------------
 
 # where runtime data lives — set DATA_DIR to a mounted volume in the cloud

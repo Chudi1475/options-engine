@@ -5,6 +5,7 @@ no trading logic."""
 from datetime import date
 
 import config
+import fvg
 
 TIERS = [
     (85.0, "🟢🌟", "GREAT ODDS"),
@@ -57,14 +58,14 @@ def option_line(ticker: str, mn: dict, expiry=None) -> str:
     pstr = f"${price:g}" if price is not None else "?"
     if not setup:
         if not mn.get("in_entry_window"):
-            return f"{disp}  no setup yet (entry window is 8:45-9:30 AM CT, {pstr})"
+            return f"{disp}  no setup yet (entry window is 8:45-9:30 AM CT, now {pstr})"
         mom = mn.get("momentum_15min_pct")
         mtxt = f"{mom:+.2f}%" if mom is not None else "n/a"
-        return f"{disp}  no live setup ({pstr}, 15m momentum {mtxt})"
+        return f"{disp}  no live setup (now {pstr}, 15m momentum {mtxt})"
     arrow = "📈" if setup["direction"] == "call" else "📉"
     typ = setup["direction"].upper()
     wr = setup.get("win_rate")
-    wtxt = f"{wr:g}%" if wr is not None else "n/a"
+    wtxt = f"wins {wr:g} of 100" if wr is not None else "win rate n/a"
     flag = "✅ alert-worthy" if setup.get("would_alert") else "⚪ below the bar"
     exp = f"  exp {expiry_str(expiry, date.today())}" if expiry else ""
     return f"{disp}  {arrow} BUY {typ}  {setup['strike']:g}{exp}  · {wtxt} {flag}"
@@ -120,8 +121,10 @@ def signal_card(r: dict) -> str:
     lines = [f"{icon} {dot} {verb} {sym}  @ {fmt_price(p['entry'], kind, dec)}"]
     lines.append(f"SL: {fmt_lvl(p['stop'], dec)}   (risk {fmt_lvl(p['risk'], dec)})")
     if p.get("target1") is not None:
-        lines.append(f"TP1: {fmt_lvl(p['target1'], dec)}   (1R, bank half, stop to entry)")
-    lines.append(f"TP2: {fmt_lvl(p['target'], dec)}   (2R, let it run)")
+        lines.append(f"TP1: {fmt_lvl(p['target1'], dec)}   "
+                     "(1R: a win here equals what the stop risks. Bank half, move stop to entry)")
+    lines.append(f"TP2: {fmt_lvl(p['target'], dec)}   "
+                 "(2R: twice what the stop risks. Let it run)")
     if kind == "stock":
         lines.append("(levels are on the stock; trade it as the calls/puts)")
     if r.get("asof"):
@@ -143,25 +146,46 @@ def signal_card(r: dict) -> str:
     return "\n".join(lines)
 
 
+# plain-English readings of the FVG dict fields users would otherwise see raw
+_GAP_STATE = {
+    "unmitigated": "still unfilled",
+    "entered": "partly refilled",
+    "ce_tapped": "refilled to its midpoint",
+    "filled": "fully refilled",
+    "inverted": "broken through, now working the other way",
+}
+_GAP_ZONE = {
+    "discount": "in the cheap half of the range",
+    "premium": "in the expensive half of the range",
+    "equilibrium": "in the middle of the range",
+}
+
+
 def _conviction_line(r: dict) -> str:
-    """Conviction 'high' is the verified SNIPER pattern (79% win rate over 133
-    walk-forward replays, chart_backtest_round6): quote the measured ticket.
-    Anything below high gets no measured claim, so no line."""
+    """Conviction 'high' is the verified SNIPER pattern: quote the measured
+    record from fvg.SNIPER_MEASURED (the one source of truth; a new backtest
+    round updates it there). Anything below high gets no measured claim, so
+    no line."""
     conf = (r.get("fvg") or {}).get("confirming")
     if r.get("conviction") == "high" and conf:
         dec = r.get("decimals", 2)
         tk = conf.get("ticket") or {}
         if all(tk.get(k) is not None for k in ("entry", "stop", "target")):
-            return (f"SNIPER setup: 79% win rate on 133 verified replays. "
+            sm = fvg.SNIPER_MEASURED
+            return (f"SNIPER setup: wins {sm['win_rate']:.0f} of 100 "
+                    f"({sm['trades']} replays). "
                     f"entry {fmt_lvl(tk['entry'], dec)}, "
                     f"stop {fmt_lvl(tk['stop'], dec)}, "
-                    f"TP (0.4R) {fmt_lvl(tk['target'], dec)}. chart coming.")
+                    f"target {fmt_lvl(tk['target'], dec)} "
+                    "(0.4R: a win banks 40% of what the stop risks). chart coming.")
         # high without a sniper ticket should not happen; stay honest, no
-        # measured claim, just the structure
-        name = "BISI" if conf["polarity"] == "bull" else "SIBI"
-        return (f"holds conviction: grade {conf['grade']} {name} FVG "
-                f"{fmt_lvl(conf['bottom'], dec)} to {fmt_lvl(conf['top'], dec)}"
-                f" ({conf['state']}, {conf['pd_zone']}). chart coming.")
+        # measured claim, just the structure in plain words
+        side = "bullish" if conf["polarity"] == "bull" else "bearish"
+        state = _GAP_STATE.get(conf["state"], conf["state"])
+        zone = _GAP_ZONE.get(conf["pd_zone"], conf["pd_zone"])
+        return (f"holds conviction: a grade {conf['grade']} {side} price gap "
+                f"on the chart from {fmt_lvl(conf['bottom'], dec)} to "
+                f"{fmt_lvl(conf['top'], dec)}, {state}, {zone}. chart coming.")
     return ""
 
 
@@ -244,7 +268,7 @@ def _lean(kind: str, bias: str, r: dict = None) -> str:
             if hi is not None and lo is not None:
                 trig = (f" (flips to a trade on a 15-min push over {fmt_lvl(hi, dec)} "
                         f"or under {fmt_lvl(lo, dec)})")
-        return f"⚪ chop, no clean lean. Wait for a 15-min push to pick a side{trig}"
+        return f"⚪ no clear direction either way. Wait for a 15-min push to pick a side{trig}"
     bull = bias.startswith("bull")
     weak = bias.endswith("weak")
     side = ("CALLS" if bull else "PUTS") if kind == "stock" else ("LONG" if bull else "SHORT")
@@ -293,10 +317,10 @@ def quote_lines(quote, est_mid: float):
 def why_text(setup) -> str:
     if setup.direction == "call":
         return (f"WHY: {setup.ticker} just turned UP in the last 15 minutes "
-                f"({setup.mom_pct:+.2f}%) — the exact pattern behind Kelechi's "
+                f"({setup.mom_pct:+.2f}%). The exact pattern behind Kelechi's "
                 "best trades.")
     return (f"WHY: {setup.ticker} is below its open and falling "
-            f"({setup.mom_pct:+.2f}% in 15 min) — the mirror of the call "
+            f"({setup.mom_pct:+.2f}% in 15 min). The mirror of the call "
             "setup. Less proven; extra care.")
 
 
@@ -311,21 +335,21 @@ def _expected_lines(stats: dict, dollars):
 def _winrate_footer(stats: dict) -> str:
     if stats["source"] == "live":
         emoji, label = tier_for(stats["win_rate"])
-        return (f"{emoji} Live win rate: {stats['win_rate']:.0f} of 100 — {label} "
+        return (f"{emoji} Live record: wins {stats['win_rate']:.0f} of 100, {label} "
                 f"({stats['trades']} real signals)")
     if stats["source"] == "backtest_new" and stats.get("old_win_rate") is not None:
         # the 70/75/80/85 tier bar belongs to the OLD-rules gate that
         # qualified this setup; the new exits trade win count for win size
         emoji, label = tier_for(stats["old_win_rate"])
-        return (f"{emoji} Setup tier: {label} — old rules won "
-                f"{stats['old_win_rate']:.0f} of 100. New exits win "
-                f"{stats['win_rate']:.0f} of 100 but make more per trade "
-                f"({stats['trades']} trades {stats['start']}-{stats['end']}, "
-                "approx pricing)")
+        return (f"{emoji} Setup tier: {label}. The old +15% target / -60% stop "
+                f"exits won {stats['old_win_rate']:.0f} of 100; the new exits "
+                f"win {stats['win_rate']:.0f} of 100, so they win less often "
+                f"but each win is bigger ({stats['trades']} trades "
+                f"{stats['start']}-{stats['end']}, prices modeled, not real fills)")
     emoji, label = tier_for(stats["win_rate"])
-    return (f"{emoji} Win rate in testing: {stats['win_rate']:.0f} of 100 — {label} "
+    return (f"{emoji} Tested: wins {stats['win_rate']:.0f} of 100, {label} "
             f"({stats['trades']} trades {stats['start']}-{stats['end']}, "
-            "old +15/-60 rules, approx pricing)")
+            "the old +15% target / -60% stop exits, prices modeled, not real fills)")
 
 
 def entry_card(setup, pos, quote, stats: dict, risk_mode: str,
@@ -333,16 +357,16 @@ def entry_card(setup, pos, quote, stats: dict, risk_mode: str,
                news_lines=None) -> str:
     lines = []
     if pos.paper:
-        lines.append("[PAPER] practice mode — track it, don't trade it")
+        lines.append("[PAPER] practice mode: track it, don't trade it")
     if risk_mode == "red":
-        lines.append("🚨 HIGH-RISK DAY — consider sitting out. Size below is HALVED.")
+        lines.append("🚨 HIGH-RISK DAY: consider sitting out. Size below is HALVED.")
     elif risk_mode == "yellow":
         lines.append(f"⚠️ CAUTION DAY: {mode_reason}")
     size, dollars = size_lines(pos.risk_pct, pos.entry_mid, pos.correlated)
     lines += _expected_lines(stats, dollars)
     lines.append("")
     arrow = "📈" if setup.direction == "call" else "📉"
-    lines.append(f"{arrow} BUY {setup.direction.upper()} — "
+    lines.append(f"{arrow} BUY {setup.direction.upper()}: "
                  f"{disp_ticker(setup.ticker)} {setup.strike:g}, "
                  f"expires {expiry_str(expiry, today)}")
     lines += quote_lines(quote, pos.entry_mid)
@@ -352,10 +376,12 @@ def entry_card(setup, pos, quote, stats: dict, risk_mode: str,
     for n in (news_lines or []):
         lines.append(n)
     lines.append("")
-    lines.append("EXIT PLAN — I'll text you each step:")
+    lines.append("EXIT PLAN, I'll text you each step:")
     lines.append(f"1️⃣ SELL HALF at +{config.TP_HALF_PCT:g}%")
-    lines.append("2️⃣ let the rest RUN — I text you to sell when it gives back "
-                 "from its peak")
+    gb = config.RUNNER_GIVEBACK_PCT
+    lines.append(f"2️⃣ let the rest RUN. I text you to sell when its gain drops "
+                 f"{gb:g} points from its peak (example: +60% falling to "
+                 f"+{60 - gb:g}%)")
     lines.append(f"3️⃣ STOP: {config.STOP_PCT:g}% → sell everything")
     if expiry == today:
         lines.append(f"4️⃣ expires today → I warn you "
@@ -372,12 +398,13 @@ def _paper(pos) -> str:
 
 def half_card(pos, ev: dict) -> str:
     return "\n".join([
-        f"{_paper(pos)}💰 SELL HALF — +{config.TP_HALF_PCT:g}% target hit",
+        f"{_paper(pos)}💰 SELL HALF: +{config.TP_HALF_PCT:g}% target hit",
         f"{contract_str(pos)} is up {ev['pct']:+.0f}% from your "
         f"${pos.entry_mid:.2f} entry ({ev['source']}).",
         "Sell HALF now. Let the rest ride.",
-        "(Only got 1 contract? Just sell it — banking the win is the play.)",
-        "Next: I'll text you to SELL THE REST when it gives back enough off its peak.",
+        "(Only got 1 contract? Just sell it. Banking the win is the play.)",
+        f"Next: I'll text you to SELL THE REST when its gain drops "
+        f"{config.RUNNER_GIVEBACK_PCT:g} points from its peak.",
         "Your call.",
     ])
 
@@ -385,8 +412,9 @@ def half_card(pos, ev: dict) -> str:
 def trail_card(pos, ev: dict) -> str:
     half_pct = pos.half_exit["pct"] if pos.half_exit else 0.0
     return "\n".join([
-        f"{_paper(pos)}🔄 LOCK IN THE RUNNER — SELL REMAINING",
-        f"{contract_str(pos)}: the runner gave back enough off its peak — bank it.",
+        f"{_paper(pos)}🔄 LOCK IN THE RUNNER: SELL REMAINING",
+        f"{contract_str(pos)}: the runner's gain dropped "
+        f"{config.RUNNER_GIVEBACK_PCT:g} points from its peak. Time to bank it.",
         f"Remaining half is at {ev['pct']:+.0f}% ({ev['source']}).",
         f"Whole trade: about {ev['total_pct']:+.0f}% "
         f"(half banked at {half_pct:+.0f}%, half here).",
@@ -397,10 +425,10 @@ def trail_card(pos, ev: dict) -> str:
 
 def stop_card(pos, ev: dict) -> str:
     return "\n".join([
-        f"{_paper(pos)}🛑 STOP — SELL EVERYTHING",
+        f"{_paper(pos)}🛑 STOP: SELL EVERYTHING",
         f"{contract_str(pos)} is down {ev['pct']:+.0f}% from your "
         f"${pos.entry_mid:.2f} entry ({ev['source']}).",
-        "Sell it all now. The stop is the stop — one ignored stop "
+        "Sell it all now. The stop is the stop. One ignored stop "
         "erases a week of wins.",
         "Your call.",
     ])
@@ -412,7 +440,7 @@ def expiry_card(pos, ev: dict) -> str:
         f"{contract_str(pos)} expires TODAY at 3 PM CT and is still open "
         f"(now {ev['pct']:+.0f}%, {ev['source']}).",
         f"Close it in the next {config.EXPIRY_WARN_MINUTES} minutes. "
-        "0DTE options can go to $0 at the bell.",
+        "Same-day (0DTE) options can go to $0 at the bell.",
         "Your call.",
     ])
 
@@ -421,11 +449,11 @@ def morning_card(mode: str, reason: str, today: date) -> str:
     effects = {
         "green": "Standard rules. Entry window 8:45-9:30 AM CT; "
                  "I'll watch every position until the close.",
-        "yellow": "Setups still fire, with a warning banner — consider smaller size.",
-        "red": "HIGH-RISK DAY — consider sitting out. Any alert today is HALF size.",
+        "yellow": "Setups still fire, with a warning banner. Consider smaller size.",
+        "red": "HIGH-RISK DAY: consider sitting out. Any alert today is HALF size.",
     }
     return "\n".join([
-        f"{MODE_EMOJI[mode]} RISK MODE: {mode.upper()} — "
+        f"{MODE_EMOJI[mode]} RISK MODE: {mode.upper()}, "
         f"{today.strftime('%A')} {fmt_day(today)}",
         reason,
         effects[mode],
@@ -435,33 +463,34 @@ def morning_card(mode: str, reason: str, today: date) -> str:
 def help_card() -> str:
     return "\n".join([
         "Commands I understand:",
-        "/setaccount 25000 — set your account size (sizes cards in dollars)",
-        "/risk green|yellow|red [reason] — override today's risk mode",
-        "/status — risk mode, account, open positions right now",
-        "/calls [ticker] — live call/put setup per stock (BUY type, strike, expiry)",
-        "/signal <symbol> — clean trade ticket: BUY/SELL, entry, SL, TP, 2R "
+        "/setaccount 25000 - set your account size (sizes cards in dollars)",
+        "/risk green|yellow|red [reason] - override today's risk mode",
+        "/status - risk mode, account, open positions right now",
+        "/calls [ticker] - live call/put setup per stock (BUY type, strike, expiry)",
+        "/signal <symbol> - clean trade ticket: BUY/SELL, entry, stop, targets "
         "(e.g. /signal xauusd, /signal eurusd, /signal btc)",
-        "/chart <symbol> — the ticket PLUS a candlestick chart with the Fair "
-        "Value Gap boxed, the CE (50%) entry, and levels drawn on (e.g. /chart btc)",
-        "/ask <question> — deep mode: ask me anything, even outside trading, and "
+        "/chart <symbol> - the ticket PLUS a candlestick chart with the price "
+        "gap boxed (the 'Fair Value Gap'), the entry at the gap's halfway "
+        "point, and levels drawn on (e.g. /chart btc)",
+        "/ask <question> - deep mode: ask me anything, even outside trading, and "
         "I'll think it through and give you a real answer",
-        "/gold · /fx [pair] — read on gold or a forex pair (price, momentum, news)",
-        "/<symbol> — read + plan on ANY stock, ETF, fx, gold, or crypto "
-        "(e.g. /aapl /nvda /btc /eth) — or just ask me for a plan on it",
-        "/health — bot self-check: feed, last heartbeat, today's alerts (owner)",
-        "/score — your personal win/loss record (I keep it for you)",
-        "/adduser — let another person in (owner only)",
-        "/users — see who has access (owner only)",
-        "/test — fire a fake signal through every alert type",
-        "/help — this list",
+        "/gold · /fx [pair] - read on gold or a forex pair (price, momentum, news)",
+        "/<symbol> - read + plan on ANY stock, ETF, fx, gold, or crypto "
+        "(e.g. /aapl /nvda /btc /eth), or just ask me for a plan on it",
+        "/health - bot self-check: feed, last heartbeat, today's alerts (owner)",
+        "/score - your personal win/loss record (I keep it for you)",
+        "/adduser - let another person in (owner only)",
+        "/users - see who has access (owner only)",
+        "/test - fire a fake signal through every alert type",
+        "/help - this list",
         "",
         "Owner request controls:",
-        "/requests — see open asks from Chudi/Kelechi/Ryan",
-        "/approve <id> [note] · /reject <id> [note] · /done <id> — close one out "
+        "/requests - see open asks from Chudi/Kelechi/Ryan",
+        "/approve <id> [note] · /reject <id> [note] · /done <id> - close one out "
         "(I text the person back)",
-        "/backlog — open build items, ready to paste into Claude Code",
-        "/reqfrom add <id> <name> — bring Kelechi/Ryan online (asks + alerts)",
+        "/backlog - open build items, ready to paste into Claude Code",
+        "/reqfrom add <id> <name> - bring Kelechi/Ryan online (asks + alerts)",
         "",
-        "You can also just TALK to me — ask anything, or send a chart "
+        "You can also just TALK to me. Ask anything, or send a chart "
         "screenshot / PDF / CSV and I'll read it and answer like a human.",
     ])

@@ -1,0 +1,313 @@
+{
+  "experiment": "strike selection bake-off (identical entries + give-back exits)",
+  "window": {
+    "start": "04/08/2026",
+    "end": "07/02/2026"
+  },
+  "entries_kept": 212,
+  "entries_dropped_premium_floor": 10,
+  "exit_params": {
+    "half": 25.0,
+    "give": 40.0,
+    "stop": -70.0
+  },
+  "pricing": "approximated (Black-Scholes, 20d realized vol) \u2014 optimistic for 0DTE",
+  "policies": {
+    "first_otm": {
+      "overall": {
+        "trades": 212,
+        "win_rate": 74.05660377358491,
+        "avg_win_pct": 55.1460755485175,
+        "avg_loss_pct": -74.26377991360292,
+        "expectancy_pct": 21.57276398994856,
+        "total_pnl": 45537.69046625592,
+        "max_drawdown": -4092.352498628403,
+        "start": "04/08/2026",
+        "end": "07/02/2026",
+        "avg_entry_prem": 5.135811115190527,
+        "avg_delta": 0.4510321374688348
+      },
+      "acct_ret_per_trade_pct": 0.3081823427135508,
+      "per_setup": {
+        "QCOM:call": {
+          "trades": 49,
+          "win_rate": 71.42857142857143,
+          "avg_win_pct": 62.15634532759748,
+          "avg_loss_pct": -72.34227604754118,
+          "expectancy_pct": 23.72816779184358,
+          "total_pnl": 4409.623911419427,
+          "max_drawdown": -5334.77222598372,
+          "start": "04/14/2026",
+          "end": "07/02/2026",
+          "avg_entry_prem": 4.797684785957626,
+          "avg_delta": 0.472039640572222,
+          "avg_otm_pts": 1.153150597397162
+        },
+        "SPX:call": {
+          "trades": 60,
+          "win_rate": 80.0,
+          "avg_win_pct": 56.59814396994048,
+          "avg_loss_pct": -74.01966202622835,
+          "expectancy_pct": 30.474582770706707,
+          "total_pnl": 37755.21709758542,
+          "max_drawdown": -3283.405158394853,
+          "start": "04/08/2026",
+          "end": "07/02/2026",
+          "avg_entry_prem": 10.263519761700405,
+          "avg_delta": 0.47006919544639314,
+          "avg_otm_pts": 2.26201171875
+        },
+        "SPY:call": {
+          "trades": 60,
+          "win_rate": 76.66666666666667,
+          "avg_win_pct": 55.58597677450495,
+          "avg_loss_pct": -74.43795920027704,
+          "expectancy_pct": 25.247058380389145,
+          "total_pnl": 2770.9917433336814,
+          "max_drawdown": -359.1986214624362,
+          "start": "04/08/2026",
+          "end": "07/02/2026",
+          "avg_entry_prem": 0.9010250899072813,
+          "avg_delta": 0.4301941325759306,
+          "avg_otm_pts": 0.48327738444010415
+        },
+        "TSLA:put": {
+          "trades": 43,
+          "win_rate": 65.11627906976744,
+          "avg_win_pct": 43.17128330239179,
+          "avg_loss_pct": -76.08991049759763,
+          "expectancy_pct": 1.5685412791396687,
+          "total_pnl": 601.857713917399,
+          "max_drawdown": -4942.237881970701,
+          "start": "04/08/2026",
+          "end": "07/02/2026",
+          "avg_entry_prem": 4.275179321209452,
+          "avg_delta": 0.429606304046854,
+          "avg_otm_pts": 1.5531382006268168
+        }
+      }
+    },
+    "second_otm": {
+      "overall": {
+        "trades": 212,
+        "win_rate": 68.86792452830188,
+        "avg_win_pct": 61.96050330829917,
+        "avg_loss_pct": -71.63261576395293,
+        "expectancy_pct": 20.370192653730108,
+        "total_pnl": 33727.104319273014,
+        "max_drawdown": -4354.825174197729,
+        "start": "04/08/2026",
+        "end": "07/02/2026",
+        "avg_entry_prem": 3.9806107604248933,
+        "avg_delta": 0.34715392954589613
+      },
+      "acct_ret_per_trade_pct": 0.2910027521961444,
+      "per_setup": {
+        "QCOM:call": {
+          "trades": 49,
+          "win_rate": 67.3469387755102,
+          "avg_win_pct": 60.818475008878366,
+          "avg_loss_pct": -65.16956634489584,
+          "expectancy_pct": 19.67952273009495,
+          "total_pnl": 645.4194594181429,
+          "max_drawdown": -6213.297505468537,
+          "start": "04/14/2026",
+          "end": "07/02/2026",
+          "avg_entry_prem": 3.7980430274698276,
+          "avg_delta": 0.368303426836058,
+          "avg_otm_pts": 3.653150597397162
+        },
+        "SPX:call": {
+          "trades": 60,
+          "win_rate": 76.66666666666667,
+          "avg_win_pct": 64.4536870695607,
+          "avg_loss_pct": -76.07640043416345,
+          "expectancy_pct": 31.66333331869175,
+          "total_pnl": 30152.556272805206,
+          "max_drawdown": -2996.021013125439,
+          "start": "04/08/2026",
+          "end": "07/02/2026",
+          "avg_entry_prem": 8.074944142344956,
+          "avg_delta": 0.39590551903186044,
+          "avg_otm_pts": 7.26201171875
+        },
+        "SPY:call": {
+          "trades": 60,
+          "win_rate": 66.66666666666666,
+          "avg_win_pct": 67.38370834689958,
+          "avg_loss_pct": -69.31372786023852,
+          "expectancy_pct": 21.81789627785355,
+          "total_pnl": 1673.170737712934,
+          "max_drawdown": -223.9443496486433,
+          "start": "04/08/2026",
+          "end": "07/02/2026",
+          "avg_entry_prem": 0.5390444026838863,
+          "avg_delta": 0.2897551708829527,
+          "avg_otm_pts": 1.4832773844401042
+        },
+        "TSLA:put": {
+          "trades": 43,
+          "win_rate": 62.7906976744186,
+          "avg_win_pct": 51.07429143121905,
+          "avg_loss_pct": -77.10596347621882,
+          "expectancy_pct": 3.3793128610096153,
+          "total_pnl": 1255.957849336741,
+          "max_drawdown": -3522.4206478311817,
+          "start": "04/08/2026",
+          "end": "07/02/2026",
+          "avg_entry_prem": 3.2778153526122282,
+          "avg_delta": 0.335119157066845,
+          "avg_otm_pts": 4.053138200626817
+        }
+      }
+    },
+    "delta40": {
+      "overall": {
+        "trades": 212,
+        "win_rate": 73.11320754716981,
+        "avg_win_pct": 55.33038486053052,
+        "avg_loss_pct": -74.21982239356025,
+        "expectancy_pct": 20.498489513911803,
+        "total_pnl": 33050.70887214913,
+        "max_drawdown": -3853.5109379929845,
+        "start": "04/08/2026",
+        "end": "07/02/2026",
+        "avg_entry_prem": 4.107845161843188,
+        "avg_delta": 0.40258213827401423
+      },
+      "acct_ret_per_trade_pct": 0.2928355644844543,
+      "per_setup": {
+        "QCOM:call": {
+          "trades": 49,
+          "win_rate": 71.42857142857143,
+          "avg_win_pct": 57.27700425019962,
+          "avg_loss_pct": -73.17959615535742,
+          "expectancy_pct": 20.0036898486119,
+          "total_pnl": 1886.245835220611,
+          "max_drawdown": -5329.493183238402,
+          "start": "04/14/2026",
+          "end": "07/02/2026",
+          "avg_entry_prem": 3.7297719398877165,
+          "avg_delta": 0.41119377121145906,
+          "avg_otm_pts": 3.7041710055604273
+        },
+        "SPX:call": {
+          "trades": 60,
+          "win_rate": 78.33333333333333,
+          "avg_win_pct": 60.69360376096034,
+          "avg_loss_pct": -77.47165437948965,
+          "expectancy_pct": 30.75779783052952,
+          "total_pnl": 27906.67325971528,
+          "max_drawdown": -2694.760665735601,
+          "start": "04/08/2026",
+          "end": "07/02/2026",
+          "avg_entry_prem": 8.020831683379324,
+          "avg_delta": 0.39987200436890225,
+          "avg_otm_pts": 7.345345052083333
+        },
+        "SPY:call": {
+          "trades": 60,
+          "win_rate": 75.0,
+          "avg_win_pct": 56.85866566920628,
+          "avg_loss_pct": -70.22473310198005,
+          "expectancy_pct": 25.08781597640969,
+          "total_pnl": 2350.112814988286,
+          "max_drawdown": -316.9780539604035,
+          "start": "04/08/2026",
+          "end": "07/02/2026",
+          "avg_entry_prem": 0.795662215371974,
+          "avg_delta": 0.39930776094913323,
+          "avg_otm_pts": 0.7332773844401042
+        },
+        "TSLA:put": {
+          "trades": 43,
+          "win_rate": 65.11627906976744,
+          "avg_win_pct": 41.43839902663683,
+          "avg_loss_pct": -76.36753511965766,
+          "expectancy_pct": 0.3433057197899139,
+          "total_pnl": 907.6769622249456,
+          "max_drawdown": -4331.569772500257,
+          "start": "04/08/2026",
+          "end": "07/02/2026",
+          "avg_entry_prem": 3.700342217004189,
+          "avg_delta": 0.40111936292203304,
+          "avg_otm_pts": 2.833617454351381
+        }
+      }
+    },
+    "delta25": {
+      "overall": {
+        "trades": 212,
+        "win_rate": 68.39622641509435,
+        "avg_win_pct": 65.20513364170561,
+        "avg_loss_pct": -68.1874116075722,
+        "expectancy_pct": 23.048055661981014,
+        "total_pnl": 21230.822585763908,
+        "max_drawdown": -2374.7039281322723,
+        "start": "04/08/2026",
+        "end": "07/02/2026",
+        "avg_entry_prem": 2.1330908753790427,
+        "avg_delta": 0.24948995708393665
+      },
+      "acct_ret_per_trade_pct": 0.3292579380283002,
+      "per_setup": {
+        "QCOM:call": {
+          "trades": 49,
+          "win_rate": 73.46938775510205,
+          "avg_win_pct": 61.86473684374001,
+          "avg_loss_pct": -63.03150543289474,
+          "expectancy_pct": 28.72899909687771,
+          "total_pnl": 2882.1628822750617,
+          "max_drawdown": -1862.6094841155477,
+          "start": "04/14/2026",
+          "end": "07/02/2026",
+          "avg_entry_prem": 1.9238032934829739,
+          "avg_delta": 0.24973051604741459,
+          "avg_otm_pts": 9.673558760662468
+        },
+        "SPX:call": {
+          "trades": 60,
+          "win_rate": 68.33333333333333,
+          "avg_win_pct": 72.69028620587989,
+          "avg_loss_pct": -65.97159376125165,
+          "expectancy_pct": 28.7806908829549,
+          "total_pnl": 14932.29026000421,
+          "max_drawdown": -1284.7606728453998,
+          "start": "04/08/2026",
+          "end": "07/02/2026",
+          "avg_entry_prem": 4.174843780563643,
+          "avg_delta": 0.24853324855494818,
+          "avg_otm_pts": 19.178678385416667
+        },
+        "SPY:call": {
+          "trades": 60,
+          "win_rate": 65.0,
+          "avg_win_pct": 72.39441379010711,
+          "avg_loss_pct": -67.43259378813202,
+          "expectancy_pct": 23.454961137723398,
+          "total_pnl": 1341.122498382361,
+          "max_drawdown": -164.14108111148195,
+          "start": "04/08/2026",
+          "end": "07/02/2026",
+          "avg_entry_prem": 0.4249122678774834,
+          "avg_delta": 0.2530861318588805,
+          "avg_otm_pts": 1.8666107177734375
+        },
+        "TSLA:put": {
+          "trades": 43,
+          "win_rate": 67.44186046511628,
+          "avg_win_pct": 49.10103377301454,
+          "avg_loss_pct": -77.11444686179664,
+          "expectancy_pct": 8.007621473308578,
+          "total_pnl": 2075.2469451022826,
+          "max_drawdown": -1186.3104000844223,
+          "start": "04/08/2026",
+          "end": "07/02/2026",
+          "avg_entry_prem": 1.9061288672842767,
+          "avg_delta": 0.24553285559631496,
+          "avg_otm_pts": 8.122905642487282
+        }
+      }
+    }
+  }
+}

@@ -184,7 +184,7 @@ def market_stress_check(include_gap: bool):
         vix = fetch_daily("^VIX", "10d")
         vix_now = float(vix["Close"].iloc[-1])
     except Exception:
-        reasons.append("couldn't read VIX")
+        reasons.append("couldn't read VIX (the market's fear gauge)")
     if vix_now is not None:
         if vix_now >= VIX_RED:
             mode = "red"
@@ -267,13 +267,21 @@ def risk_mode(include_gap: bool = True):
             reasons.append(f"news: {n_reason}")
 
     if not reasons or mode == "green":
+        msg = "No major releases scheduled."
         calm = []
         if vix_now is not None:
             calm.append(f"VIX {vix_now:.0f}")
         if gap is not None:
             calm.append(f"overnight gap {gap:+.1f}%")
-        detail = ", ".join(calm) if calm else "no data problems"
-        return "green", f"No major releases scheduled. {detail}. All clear."
+        if calm:
+            msg += " " + ", ".join(calm) + "."
+        if reasons:
+            # a green day with a blind spot (e.g. the VIX fetch failed) is not
+            # "all clear": say what went unchecked instead of dropping it
+            msg += " Heads up: " + "; ".join(reasons) + "."
+        else:
+            msg += " All clear."
+        return "green", msg
     return mode, "; ".join(reasons)
 
 

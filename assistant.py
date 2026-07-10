@@ -28,6 +28,140 @@ _TRADES_LOCK = threading.Lock()   # serialize user_trades.json writes
 API_URL = "https://api.anthropic.com/v1/messages"
 HISTORY_FILE = config.DATA_DIR / "chat_history.json"
 TRADES_FILE = config.DATA_DIR / "user_trades.json"
+
+# ---- usage-limit countdown -------------------------------------------------
+# When Anthropic says the account hit its usage limit, every brain call is
+# paused for exactly 5 hours 5 minutes (the owner's rule), then resumes on its
+# own. The pause survives restarts (state.json) and the owner gets ONE text
+# when it starts and one when the brain is back.
+USAGE_WAIT_S = 5 * 3600 + 5 * 60
+_COOLDOWN_KEY = "brain_cooldown_until"       # epoch seconds, in state.json
+_COOLDOWN_FLAG = "brain_cooldown_announced"  # so recovery texts exactly once
+
+# one pooled HTTPS session for every brain call (skips per-call TLS handshake)
+_api_session = requests.Session()
+
+
+def _now_s() -> float:
+    import time as _t
+    return _t.time()
+
+
+def cooldown_left_s() -> int:
+    """Seconds until the brain may call Claude again (0 = not paused)."""
+    try:
+        until = float(config.state_get(_COOLDOWN_KEY, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, int(until - _now_s()))
+
+
+def _resume_text() -> str:
+    from datetime import datetime as _dt, timedelta as _td
+    from zoneinfo import ZoneInfo as _zi
+    at = _dt.now(_zi("America/Chicago")) + _td(seconds=cooldown_left_s())
+    return f"{at:%I:%M %p CT}".lstrip("0")
+
+
+def _start_cooldown(reason: str):
+    """Arm the 5h05m countdown and tell the owner once."""
+    config.state_set(_COOLDOWN_KEY, _now_s() + USAGE_WAIT_S)
+    config.state_set(_COOLDOWN_FLAG, True)
+    try:
+        owner = telegram.primary_owner_id()
+        if owner:
+            telegram.send_to(owner,
+                "🧠⏸️ Claude usage limit hit. The brain is on a 5h05m "
+                f"countdown and will wake back up around {_resume_text()}. "
+                "Alerts, exits, and all non-AI features keep running the "
+                f"whole time. ({reason[:120]})")
+    except Exception:
+        pass
+
+
+def check_cooldown_recovery():
+    """Cheap per-cycle check the scanner calls: when the countdown ends,
+    text the owner ONCE that the brain is back."""
+    try:
+        if config.state_get(_COOLDOWN_FLAG, False) and cooldown_left_s() == 0:
+            config.state_set(_COOLDOWN_FLAG, False)
+            owner = telegram.primary_owner_id()
+            if owner:
+                telegram.send_to(owner,
+                    "🧠▶️ The 5h05m wait is over. Brain is back online and "
+                    "answering again.")
+    except Exception:
+        pass
+
+
+def _looks_like_usage_limit(status: int, err_type: str, err_msg: str,
+                            retry_after) -> bool:
+    msg = (err_msg or "").lower()
+    if status in (400, 402, 403) and ("credit" in msg or "billing" in msg):
+        return True
+    if status == 429:
+        if any(w in msg for w in ("usage limit", "quota", "credit",
+                                  "monthly", "exceeded your")):
+            return True
+        try:  # a very long server-mandated wait = a usage window, not a blip
+            if retry_after is not None and float(retry_after) > 300:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
+
+
+def _post_anthropic(payload: dict, timeout: int):
+    """Single choke point for every Claude call. Returns (body_dict, None) on
+    success or (None, honest_error_text) on failure. Handles:
+    - the 5h05m usage-limit countdown (short-circuits while paused),
+    - transient 429/5xx with up to 3 attempts and respectful backoff,
+    - arming the countdown when the account truly runs dry."""
+    left = cooldown_left_s()
+    if left:
+        h, m = divmod(left // 60, 60)
+        return None, (f"brain is resting after a Claude usage limit. Back in "
+                      f"{h}h{m:02d}m (around {_resume_text()}).")
+    import time as _t
+    last_err = "unknown error"
+    for attempt in range(3):
+        try:
+            r = _api_session.post(
+                API_URL,
+                headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                         "anthropic-version": "2023-06-01"},
+                json=payload, timeout=timeout)
+        except requests.RequestException as e:
+            last_err = f"couldn't connect: {e}"
+            _t.sleep(min(2 ** attempt, 5))
+            continue
+        if r.status_code == 200:
+            try:
+                return r.json(), None
+            except ValueError:
+                return None, "Claude sent back something unreadable"
+        try:
+            err = r.json().get("error", {})
+            err_type, err_msg = err.get("type", ""), err.get("message", "")
+        except ValueError:
+            err_type, err_msg = "", r.text[:200]
+        retry_after = r.headers.get("retry-after")
+        if _looks_like_usage_limit(r.status_code, err_type, err_msg,
+                                   retry_after):
+            _start_cooldown(err_msg or f"HTTP {r.status_code}")
+            return None, ("Claude usage limit hit. Brain naps for 5h05m and "
+                          f"comes back around {_resume_text()}. Everything "
+                          "else keeps running.")
+        if r.status_code in (429, 500, 502, 503, 529) and attempt < 2:
+            try:
+                wait = min(float(retry_after), 30) if retry_after else 2 ** attempt * 2
+            except (TypeError, ValueError):
+                wait = 2 ** attempt * 2
+            last_err = err_msg or f"HTTP {r.status_code}"
+            _t.sleep(wait)
+            continue
+        return None, err_msg or f"HTTP {r.status_code}"
+    return None, last_err
 MAX_TURNS = 24          # rolling memory per chat (deeper = smoother back-and-forth)
 MAX_TEXT_FILE = 20000   # chars of a text/CSV file passed to the model
 
@@ -339,23 +473,17 @@ def complete(system: str, user: str, max_tokens: int = 700):
     lessons from the day's graded calls."""
     if not enabled():
         return None
-    try:
-        r = requests.post(
-            API_URL,
-            headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"],
-                     "anthropic-version": "2023-06-01"},
-            json={"model": model(), "max_tokens": max_tokens, "system": system,
-                  "output_config": {"effort":
-                      os.environ.get("BOT_BRAIN_EFFORT", "high").strip()},
-                  "messages": [{"role": "user", "content": user}]},
-            timeout=120)
-        if r.status_code != 200:
-            return None
-        text = "".join(b.get("text", "") for b in r.json().get("content", [])
-                       if b.get("type") == "text").strip()
-        return text or None
-    except requests.RequestException:
+    body, err = _post_anthropic(
+        {"model": model(), "max_tokens": max_tokens, "system": system,
+         "output_config": {"effort":
+             os.environ.get("BOT_BRAIN_EFFORT", "high").strip()},
+         "messages": [{"role": "user", "content": user}]},
+        timeout=120)
+    if body is None:
         return None
+    text = "".join(b.get("text", "") for b in body.get("content", [])
+                   if b.get("type") == "text").strip()
+    return text or None
 
 
 LESSONS_DIGEST = config.DATA_DIR / "lessons_digest.md"
@@ -379,10 +507,10 @@ def _lessons_block() -> str:
 
 
 def deep_model() -> str:
-    """The model the bot escalates HARD questions to. Same strongest brain
-    (Fable 5) as the everyday chat, just run at a higher effort tier for deeper
-    reasoning. Override with BOT_DEEP_MODEL."""
-    return os.environ.get("BOT_DEEP_MODEL", model()).strip()
+    """The model the bot escalates HARD questions to: Opus-tier by default
+    (the everyday chat model is faster/cheaper; this one is smarter).
+    Override with BOT_DEEP_MODEL."""
+    return os.environ.get("BOT_DEEP_MODEL", "claude-opus-4-8").strip()
 
 
 DEEP_SYSTEM = """You are the senior analyst behind a trading and markets Telegram
@@ -414,29 +542,22 @@ def deep_think(question: str, context: str = "") -> str:
         return "my deep brain isn't plugged in yet (no ANTHROPIC_API_KEY)."
     user = question if not context else f"{context}\n\nQuestion: {question}"
     effort = os.environ.get("BOT_DEEP_EFFORT", "xhigh").strip()
-    try:
-        r = requests.post(
-            API_URL,
-            headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"],
-                     "anthropic-version": "2023-06-01"},
-            # Opus 4.8: adaptive thinking (budget_tokens is rejected on 4.8) and
-            # effort control depth; no temperature (also rejected on 4.8).
-            json={"model": deep_model(), "max_tokens": 12000,
-                  "thinking": {"type": "adaptive"},
-                  "output_config": {"effort": effort},
-                  "system": DEEP_SYSTEM,
-                  "messages": [{"role": "user", "content": user}]},
-            timeout=300)
-        if r.status_code != 200:
-            err = r.json().get("error", {}).get("message", r.text[:200])
-            return f"my deep brain hit an error: {err}"
-        # display defaults to 'omitted' on 4.8, so thinking blocks are empty; we
-        # only want the final text blocks anyway.
-        text = "".join(b.get("text", "") for b in r.json().get("content", [])
-                       if b.get("type") == "text").strip()
-        return text or "the deep brain came back empty, try rephrasing?"
-    except requests.RequestException as e:
-        return f"my deep brain couldn't connect: {e}"
+    # Opus 4.8: adaptive thinking (budget_tokens is rejected on 4.8) and
+    # effort control depth; no temperature (also rejected on 4.8).
+    body, err = _post_anthropic(
+        {"model": deep_model(), "max_tokens": 12000,
+         "thinking": {"type": "adaptive"},
+         "output_config": {"effort": effort},
+         "system": DEEP_SYSTEM,
+         "messages": [{"role": "user", "content": user}]},
+        timeout=300)
+    if body is None:
+        return f"my deep brain is unavailable: {err}"
+    # display defaults to 'omitted' on 4.8, so thinking blocks are empty; we
+    # only want the final text blocks anyway.
+    text = "".join(b.get("text", "") for b in body.get("content", [])
+                   if b.get("type") == "text").strip()
+    return text or "the deep brain came back empty, try rephrasing?"
 
 
 def _load_history() -> dict:
@@ -690,39 +811,36 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True,
     history = _load_history().get(chat_id, [])
     messages = history + [{"role": "user", "content": blocks}]
     reply = ""
-    try:
-        for _ in range(5):  # room for tool calls (data lookups, scorekeeping)
-            payload = {"model": model(), "max_tokens": 1200,
-                       "system": SYSTEM + _lessons_block()
-                       + "\n\nLIVE BOT STATE:\n" + context_text,
-                       "output_config": {"effort":
-                           os.environ.get("BOT_BRAIN_EFFORT", "high").strip()},
-                       "messages": messages}
-            if tools_enabled:
-                payload["tools"] = TOOLS
-            r = requests.post(
-                API_URL,
-                headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"],
-                         "anthropic-version": "2023-06-01"},
-                json=payload, timeout=120)
-            body = r.json()
-            if r.status_code != 200:
-                err = body.get("error", {}).get("message", r.text[:200])
-                return f"My brain hit an error: {err}"
-            content = body.get("content", [])
-            if body.get("stop_reason") == "tool_use":
-                messages.append({"role": "assistant", "content": content})
-                results = [{"type": "tool_result", "tool_use_id": b["id"],
-                            "content": _run_tool(b["name"], b.get("input", {}),
-                                                 chat_id, attachments)}
-                           for b in content if b.get("type") == "tool_use"]
-                messages.append({"role": "user", "content": results})
-                continue
-            reply = "".join(b.get("text", "") for b in content
-                            if b.get("type") == "text").strip()
-            break
-    except requests.RequestException as e:
-        return f"My brain couldn't connect: {e}"
+    for _ in range(5):  # room for tool calls (data lookups, scorekeeping)
+        # system is split so the big fixed prefix gets prompt-cached: replies
+        # come back faster and cost a fraction after the first message.
+        payload = {"model": model(), "max_tokens": 1200,
+                   "system": [
+                       {"type": "text", "text": SYSTEM,
+                        "cache_control": {"type": "ephemeral"}},
+                       {"type": "text", "text": _lessons_block()
+                        + "\n\nLIVE BOT STATE:\n" + context_text},
+                   ],
+                   "output_config": {"effort":
+                       os.environ.get("BOT_BRAIN_EFFORT", "high").strip()},
+                   "messages": messages}
+        if tools_enabled:
+            payload["tools"] = TOOLS
+        body, err = _post_anthropic(payload, timeout=120)
+        if body is None:
+            return f"My brain is unavailable right now: {err}"
+        content = body.get("content", [])
+        if body.get("stop_reason") == "tool_use":
+            messages.append({"role": "assistant", "content": content})
+            results = [{"type": "tool_result", "tool_use_id": b["id"],
+                        "content": _run_tool(b["name"], b.get("input", {}),
+                                             chat_id, attachments)}
+                       for b in content if b.get("type") == "tool_use"]
+            messages.append({"role": "user", "content": results})
+            continue
+        reply = "".join(b.get("text", "") for b in content
+                        if b.get("type") == "text").strip()
+        break
     if not reply:
         return "I read it but came back empty — try rephrasing?"
     # history stores text only (never base64 blobs)

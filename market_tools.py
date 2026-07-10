@@ -27,6 +27,21 @@ CT = ZoneInfo("America/Chicago")  # display timezone ONLY — logic stays ET
 _cfg = StrategyConfig()
 _feed = DataFeed()
 
+# last 5m bars per yf symbol, refreshed by every read; lets the chart renderer
+# skip its own duplicate download when it runs within seconds of the read
+_M5_CACHE = {}
+
+
+def cached_m5(symbol, max_age_s: int = 180):
+    """Recent 5m bars from the last read of `symbol`, or None if missing/old."""
+    hit = _M5_CACHE.get(symbol)
+    if not hit:
+        return None
+    ts, bars = hit
+    if (datetime.now(ET) - ts).total_seconds() > max_age_s:
+        return None
+    return bars
+
 # Gold + major forex the bot can give an honest READ on (not options setups —
 # we don't trade these as 0DTE options). Each: alias -> (display, yf symbol,
 # price decimals). yfinance has no working spot-gold symbol (XAUUSD=X is dead),
@@ -509,6 +524,10 @@ def _do_read(disp, yfs, dec, kind, source):
             m5.index = m5.index.tz_convert(ET)
         except (TypeError, ValueError):
             pass
+    if have_5m:
+        # short-lived cache so the chart renderer right after a read reuses
+        # these bars instead of paying a third yfinance download
+        _M5_CACHE[yfs] = (datetime.now(ET), m5)
     price = float(m5["Close"].dropna().iloc[-1]) if have_5m else float(closes_d.iloc[-1])
     prior_close = float(closes_d.iloc[-2]) if len(closes_d) >= 2 else None
 
@@ -644,6 +663,19 @@ def _do_read(disp, yfs, dec, kind, source):
                 conviction = "high"
                 ticket = dict(sniper["ticket"])
                 ticket["measured"] = dict(_fvg.SNIPER_MEASURED)
+                # stretch map: same entry/stop, bigger paydays. These carry NO
+                # measured win rate yet; the forward ledger is earning them one.
+                try:
+                    _entry, _stop = float(ticket["entry"]), float(ticket["stop"])
+                    _risk = abs(_entry - _stop)
+                    _sign = 1 if direction == "BUY" else -1
+                    ticket["target_1r"] = round(_entry + _sign * _risk, 6)
+                    ticket["target_2r"] = round(_entry + _sign * 2 * _risk, 6)
+                    _ct = (conf.get("ticket") or {}).get("target_liquidity")
+                    if _ct:
+                        ticket["target_structure"] = _ct
+                except (KeyError, TypeError, ValueError):
+                    pass
                 conf["ticket"] = ticket
             elif plan:
                 conviction = "medium"
@@ -652,6 +684,25 @@ def _do_read(disp, yfs, dec, kind, source):
                     fvg_info["sniper_reasons"] = sniper["reasons"]
             elif any(f["strong"] for f in actionable):
                 conviction = "watch"
+            # forward ledger: every candidate with a real ticket gets recorded
+            # (passes AND near-misses) so the bot grades itself every night
+            try:
+                import forward_ledger as _fl
+                _tk = (conf.get("ticket") if (conf and is_sniper)
+                       else (sniper.get("ticket") or (conf or {}).get("ticket")))
+                if conf and direction and _tk and _tk.get("entry") is not None:
+                    _gap_atr = None
+                    try:
+                        _gap_atr = (float(conf["top"]) - float(conf["bottom"])) / atr
+                    except (KeyError, TypeError, ZeroDivisionError):
+                        pass
+                    _now = datetime.now(ET)
+                    _fl.record_candidate(
+                        yfs, direction, price, atr, _tk, conf,
+                        bool(is_sniper), sniper.get("reasons"),
+                        gap_atr=_gap_atr, hour_et=_now.hour, now_et=_now)
+            except Exception:
+                pass
     except Exception:
         fvg_info, conviction = None, None
 
@@ -687,7 +738,11 @@ def _do_read(disp, yfs, dec, kind, source):
                 "number when and ONLY when conviction is high, and give the sniper "
                 "ticket from fvg.confirming.ticket: entry (market, now), stop, "
                 "target (take profit at 0.4R, all out, no runner), one trade per "
-                "symbol per day. When conviction is 'medium' the plan stands on "
+                "symbol per day. The ticket may also carry target_1r, target_2r "
+                "and target_structure: bigger paydays from the SAME entry and "
+                "stop. Those have NO measured win rate yet (the bot grades them "
+                "forward nightly to earn one); if asked about bigger targets, "
+                "quote them WITH that honesty note, never with the 79. When conviction is 'medium' the plan stands on "
                 "structure/momentum alone: say plainly it has NO measured win rate "
                 "(fvg.sniper_reasons lists what failed the sniper gate). You may "
                 "still describe the FVG in fvg.confirming (grade, BISI/SIBI, CE, "

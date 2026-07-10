@@ -1,0 +1,212 @@
+{
+  "pricing": "approximated (Black-Scholes, realized vol) \u2014 relative only",
+  "exit_rules": {
+    "tp_half": 25.0,
+    "stop": -70.0,
+    "giveback": 40.0
+  },
+  "window": {
+    "SPX": [
+      "2026-04-08 09:30:00-04:00",
+      "2026-07-02 15:25:00-04:00"
+    ],
+    "SPY": [
+      "2026-04-08 09:30:00-04:00",
+      "2026-07-02 15:25:00-04:00"
+    ],
+    "TSLA": [
+      "2026-04-08 09:30:00-04:00",
+      "2026-07-02 15:25:00-04:00"
+    ],
+    "QCOM": [
+      "2026-04-08 09:30:00-04:00",
+      "2026-07-02 15:25:00-04:00"
+    ]
+  },
+  "baseline_quoted": {
+    "SPX:call": {
+      "win_rate": 78,
+      "expectancy_pct": 31
+    },
+    "SPY:call": {
+      "win_rate": 78,
+      "expectancy_pct": 26
+    },
+    "QCOM:call": {
+      "win_rate": 71,
+      "expectancy_pct": 17
+    },
+    "TSLA:put": {
+      "win_rate": 67,
+      "expectancy_pct": 6
+    }
+  },
+  "per_setup_fresh": {
+    "QCOM:call": {
+      "trades": 56,
+      "win_rate": 71.42857142857143,
+      "avg_win_pct": 58.781233345064756,
+      "avg_loss_pct": -73.56358582054409,
+      "expectancy_pct": 20.96842786917652,
+      "total_pnl": 4404.759271673658,
+      "max_drawdown": -5334.77222598372,
+      "start": "04/08/2026",
+      "end": "07/02/2026"
+    },
+    "QCOM:put": {
+      "trades": 38,
+      "win_rate": 71.05263157894737,
+      "avg_win_pct": 38.322083843228704,
+      "avg_loss_pct": -54.049394604458435,
+      "expectancy_pct": 11.582971661003473,
+      "total_pnl": 1207.189182978596,
+      "max_drawdown": -4916.203514372886,
+      "start": "04/08/2026",
+      "end": "07/02/2026"
+    },
+    "TSLA:call": {
+      "trades": 55,
+      "win_rate": 60.0,
+      "avg_win_pct": 61.15237209000959,
+      "avg_loss_pct": -75.07852221403542,
+      "expectancy_pct": 6.660014368391585,
+      "total_pnl": 835.6246725495323,
+      "max_drawdown": -5320.129284193379,
+      "start": "04/08/2026",
+      "end": "07/01/2026"
+    },
+    "TSLA:put": {
+      "trades": 43,
+      "win_rate": 65.11627906976744,
+      "avg_win_pct": 43.17128330239179,
+      "avg_loss_pct": -76.08991049759763,
+      "expectancy_pct": 1.5685412791396687,
+      "total_pnl": 601.857713917399,
+      "max_drawdown": -4942.237881970701,
+      "start": "04/08/2026",
+      "end": "07/02/2026"
+    },
+    "SPX:call": {
+      "trades": 60,
+      "win_rate": 80.0,
+      "avg_win_pct": 56.59814396994048,
+      "avg_loss_pct": -74.01966202622835,
+      "expectancy_pct": 30.474582770706707,
+      "total_pnl": 37755.21709758542,
+      "max_drawdown": -3283.405158394853,
+      "start": "04/08/2026",
+      "end": "07/02/2026"
+    },
+    "SPX:put": {
+      "trades": 36,
+      "win_rate": 44.44444444444444,
+      "avg_win_pct": 42.00625012314075,
+      "avg_loss_pct": -77.02393405831529,
+      "expectancy_pct": -24.12162997766816,
+      "total_pnl": -15281.177796915246,
+      "max_drawdown": -19791.981706779825,
+      "start": "04/09/2026",
+      "end": "06/29/2026"
+    },
+    "SPY:call": {
+      "trades": 60,
+      "win_rate": 76.66666666666667,
+      "avg_win_pct": 55.58597677450495,
+      "avg_loss_pct": -74.43795920027704,
+      "expectancy_pct": 25.247058380389145,
+      "total_pnl": 2770.9917433336814,
+      "max_drawdown": -359.1986214624362,
+      "start": "04/08/2026",
+      "end": "07/02/2026"
+    },
+    "SPY:put": {
+      "trades": 35,
+      "win_rate": 48.57142857142857,
+      "avg_win_pct": 41.778923280363394,
+      "avg_loss_pct": -77.32564316161157,
+      "expectancy_pct": -19.474853746938006,
+      "total_pnl": -1059.7952863257726,
+      "max_drawdown": -1428.7087874769536,
+      "start": "04/08/2026",
+      "end": "06/29/2026"
+    }
+  },
+  "portfolio_scenarios": {
+    "A_full_allowlist": {
+      "trades": 219,
+      "win_rate": 73.97260273972603,
+      "expectancy_pct": 20.93597125453261,
+      "total_pnl": 45532.82582651015,
+      "max_drawdown": -4092.352498628403,
+      "acct_return_units": 65.49968149632343,
+      "start": "04/08/2026",
+      "end": "07/02/2026"
+    },
+    "B_without_TSLA_put": {
+      "trades": 176,
+      "win_rate": 76.13636363636364,
+      "expectancy_pct": 25.66778653261157,
+      "total_pnl": 44930.96811259277,
+      "max_drawdown": -5346.887856128233,
+      "acct_return_units": 64.5361489962805,
+      "start": "04/08/2026",
+      "end": "07/02/2026"
+    },
+    "C_half_size_TSLA_put": {
+      "trades": 219,
+      "win_rate": 73.97260273972603,
+      "expectancy_pct": 20.78198204219698,
+      "total_pnl": 45231.89696955146,
+      "max_drawdown": -4677.778665354344,
+      "acct_return_units": 65.01791524630197,
+      "start": "04/08/2026",
+      "end": "07/02/2026"
+    }
+  },
+  "tsla_put_drift": {
+    "first_half": {
+      "trades": 23,
+      "win_rate": 60.86956521739131,
+      "avg_win_pct": 23.501077282451696,
+      "avg_loss_pct": -75.91881495461108,
+      "expectancy_pct": -15.402358810312005,
+      "total_pnl": -2211.174984117619,
+      "max_drawdown": -2845.248070210507,
+      "start": "04/08/2026",
+      "end": "05/20/2026"
+    },
+    "second_half": {
+      "trades": 20,
+      "win_rate": 70.0,
+      "avg_win_pct": 62.841489322331896,
+      "avg_loss_pct": -76.34655381207743,
+      "expectancy_pct": 21.085076382009092,
+      "total_pnl": 2813.032698035018,
+      "max_drawdown": -2346.6049641969485,
+      "start": "05/21/2026",
+      "end": "07/02/2026"
+    },
+    "fresh_tail_after_06_18": {
+      "trades": 3,
+      "win_rate": 66.66666666666666,
+      "avg_win_pct": 77.1410936285433,
+      "avg_loss_pct": -78.79960562609632,
+      "expectancy_pct": 25.160860543663432,
+      "total_pnl": 1086.488274927976,
+      "max_drawdown": -518.9785833214971,
+      "start": "06/23/2026",
+      "end": "07/02/2026"
+    },
+    "last_10_sessions": {
+      "trades": 10,
+      "win_rate": 90.0,
+      "avg_win_pct": 38.57717111313574,
+      "avg_loss_pct": -78.79960562609632,
+      "expectancy_pct": 26.83949343921254,
+      "total_pnl": 3019.620362169358,
+      "max_drawdown": -518.9785833214971,
+      "start": "06/10/2026",
+      "end": "07/02/2026"
+    }
+  }
+}

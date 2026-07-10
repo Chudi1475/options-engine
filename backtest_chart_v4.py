@@ -56,6 +56,11 @@ import market_tools as mt
 
 CACHE = (r"C:/Users/Chudi/AppData/Local/Temp/claude/C--Users-Chudi/"
          r"57d7f2c7-4e77-45b8-b3fa-04ab441a1a92/scratchpad/r4cache")
+# the frozen dataset now lives in the repo; prefer it (survives scratchpad GC)
+_REPO_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "data", "backtest_frozen", "r4cache")
+if os.path.isdir(_REPO_CACHE):
+    CACHE = _REPO_CACHE
 
 SYMBOLS = [
     ("Gold",    "GC=F",     2, "gold"),

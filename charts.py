@@ -72,8 +72,19 @@ def render_fvg(r: dict, bars=None):
         import fvg as fvg_mod
 
         # ---------------- data ----------------
+        if bars is None and symbol:
+            try:  # reuse the bars the read just fetched (skips a download)
+                import market_tools as _mt
+                bars = _mt.cached_m5(symbol)
+            except Exception:
+                bars = None
         if bars is not None:
             df = bars.copy()
+            if df is not None and not df.empty and getattr(df.index, "tz", None) is not None:
+                try:
+                    df.index = df.index.tz_convert(CT)
+                except (TypeError, ValueError):
+                    pass
         else:
             df = yf.download(symbol, period="2d", interval="5m", prepost=True,
                              progress=False, auto_adjust=False)

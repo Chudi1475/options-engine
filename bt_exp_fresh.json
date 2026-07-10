@@ -1,0 +1,371 @@
+{
+  "experiment": "data_drift_check",
+  "generated": "2026-07-02T14:31:08",
+  "pricing": "approximated (Black-Scholes, realized vol) \u2014 optimistic; trust relative moves",
+  "rules": {
+    "tp_half_pct": 25.0,
+    "stop_pct": -70.0,
+    "runner_giveback_pct": 40.0,
+    "direction": "both"
+  },
+  "floor_pct": 70.0,
+  "eligible_setups_in_committed": [
+    "QCOM:call",
+    "SPX:call",
+    "SPY:call",
+    "TSLA:put"
+  ],
+  "committed_window": {
+    "start": "03/25/2026",
+    "end": "06/18/2026"
+  },
+  "fresh_window_bars": {
+    "SPX": {
+      "first_bar": "2026-04-08 09:30:00-04:00",
+      "last_bar": "2026-07-02 15:30:00-04:00",
+      "sessions": 60
+    },
+    "SPY": {
+      "first_bar": "2026-04-08 09:30:00-04:00",
+      "last_bar": "2026-07-02 15:30:00-04:00",
+      "sessions": 60
+    },
+    "TSLA": {
+      "first_bar": "2026-04-08 09:30:00-04:00",
+      "last_bar": "2026-07-02 15:30:00-04:00",
+      "sessions": 60
+    },
+    "QCOM": {
+      "first_bar": "2026-04-08 09:30:00-04:00",
+      "last_bar": "2026-07-02 15:30:00-04:00",
+      "sessions": 60
+    }
+  },
+  "fresh_overall": {
+    "trades": 383,
+    "win_rate": 66.57963446475196,
+    "avg_win_pct": 52.03442097618767,
+    "avg_loss_pct": -73.65112883706584,
+    "expectancy_pct": 10.029850803612078,
+    "total_pnl": 31234.66659879728,
+    "max_drawdown": -14445.206697930007,
+    "start": "04/08/2026",
+    "end": "07/02/2026"
+  },
+  "committed_overall": {
+    "trades": 384,
+    "win_rate": 65.36458333333334,
+    "avg_win_pct": 50.48238587885629,
+    "avg_loss_pct": -71.78650479959725,
+    "expectancy_pct": 8.134046138662734,
+    "total_pnl": 21600.197998955733,
+    "max_drawdown": -13228.813491128647,
+    "start": "03/25/2026",
+    "end": "06/18/2026"
+  },
+  "fresh_per_setup": {
+    "QCOM:call": {
+      "trades": 56,
+      "win_rate": 71.42857142857143,
+      "avg_win_pct": 58.781233345064756,
+      "avg_loss_pct": -73.56358582054409,
+      "expectancy_pct": 20.96842786917652,
+      "total_pnl": 4404.759271673658,
+      "max_drawdown": -5334.77222598372,
+      "start": "04/08/2026",
+      "end": "07/02/2026"
+    },
+    "QCOM:put": {
+      "trades": 38,
+      "win_rate": 71.05263157894737,
+      "avg_win_pct": 38.322083843228704,
+      "avg_loss_pct": -54.049394604458435,
+      "expectancy_pct": 11.582971661003473,
+      "total_pnl": 1207.189182978596,
+      "max_drawdown": -4916.203514372886,
+      "start": "04/08/2026",
+      "end": "07/02/2026"
+    },
+    "SPX:call": {
+      "trades": 60,
+      "win_rate": 80.0,
+      "avg_win_pct": 56.59814396994048,
+      "avg_loss_pct": -74.01966202622835,
+      "expectancy_pct": 30.474582770706707,
+      "total_pnl": 37755.21709758542,
+      "max_drawdown": -3283.405158394853,
+      "start": "04/08/2026",
+      "end": "07/02/2026"
+    },
+    "SPX:put": {
+      "trades": 36,
+      "win_rate": 44.44444444444444,
+      "avg_win_pct": 42.00625012314075,
+      "avg_loss_pct": -77.02393405831529,
+      "expectancy_pct": -24.12162997766816,
+      "total_pnl": -15281.177796915246,
+      "max_drawdown": -19791.981706779825,
+      "start": "04/09/2026",
+      "end": "06/29/2026"
+    },
+    "TSLA:call": {
+      "trades": 55,
+      "win_rate": 60.0,
+      "avg_win_pct": 61.15237209000959,
+      "avg_loss_pct": -75.07852221403542,
+      "expectancy_pct": 6.660014368391585,
+      "total_pnl": 835.6246725495323,
+      "max_drawdown": -5320.129284193379,
+      "start": "04/08/2026",
+      "end": "07/01/2026"
+    },
+    "TSLA:put": {
+      "trades": 43,
+      "win_rate": 65.11627906976744,
+      "avg_win_pct": 43.17128330239179,
+      "avg_loss_pct": -76.08991049759763,
+      "expectancy_pct": 1.5685412791396687,
+      "total_pnl": 601.857713917399,
+      "max_drawdown": -4942.237881970701,
+      "start": "04/08/2026",
+      "end": "07/02/2026"
+    },
+    "SPY:call": {
+      "trades": 60,
+      "win_rate": 76.66666666666667,
+      "avg_win_pct": 55.58597677450495,
+      "avg_loss_pct": -74.43795920027704,
+      "expectancy_pct": 25.247058380389145,
+      "total_pnl": 2770.9917433336814,
+      "max_drawdown": -359.1986214624362,
+      "start": "04/08/2026",
+      "end": "07/02/2026"
+    },
+    "SPY:put": {
+      "trades": 35,
+      "win_rate": 48.57142857142857,
+      "avg_win_pct": 41.778923280363394,
+      "avg_loss_pct": -77.32564316161157,
+      "expectancy_pct": -19.474853746938006,
+      "total_pnl": -1059.7952863257726,
+      "max_drawdown": -1428.7087874769536,
+      "start": "04/08/2026",
+      "end": "06/29/2026"
+    }
+  },
+  "committed_per_setup": {
+    "TSLA:call": {
+      "trades": 56,
+      "win_rate": 55.35714285714286,
+      "avg_win_pct": 61.395880165033844,
+      "avg_loss_pct": -74.98810017615452,
+      "expectancy_pct": 0.5101746555747498,
+      "total_pnl": -1680.1289694529135,
+      "max_drawdown": -4141.322696685629,
+      "start": "03/25/2026",
+      "end": "06/18/2026"
+    },
+    "TSLA:put": {
+      "trades": 46,
+      "win_rate": 67.3913043478261,
+      "avg_win_pct": 42.64131741333601,
+      "avg_loss_pct": -70.95446215206861,
+      "expectancy_pct": 5.599215381138852,
+      "total_pnl": 1941.2771200198792,
+      "max_drawdown": -4942.237881970701,
+      "start": "03/26/2026",
+      "end": "06/18/2026"
+    },
+    "SPX:call": {
+      "trades": 60,
+      "win_rate": 78.33333333333333,
+      "avg_win_pct": 56.69458225566852,
+      "avg_loss_pct": -63.454691211668056,
+      "expectancy_pct": 30.662239671078932,
+      "total_pnl": 37034.833793437814,
+      "max_drawdown": -4003.42412480488,
+      "start": "03/25/2026",
+      "end": "06/18/2026"
+    },
+    "SPX:put": {
+      "trades": 38,
+      "win_rate": 42.10526315789473,
+      "avg_win_pct": 36.99626424179941,
+      "avg_loss_pct": -76.81211922394237,
+      "expectancy_pct": -28.892799869945843,
+      "total_pnl": -20758.30783192318,
+      "max_drawdown": -20758.30783192318,
+      "start": "03/25/2026",
+      "end": "06/18/2026"
+    },
+    "SPY:call": {
+      "trades": 60,
+      "win_rate": 78.33333333333333,
+      "avg_win_pct": 52.419688404741706,
+      "avg_loss_pct": -70.11025512210016,
+      "expectancy_pct": 25.87153397392598,
+      "total_pnl": 2730.5942494777046,
+      "max_drawdown": -359.48604823011965,
+      "start": "03/25/2026",
+      "end": "06/18/2026"
+    },
+    "SPY:put": {
+      "trades": 36,
+      "win_rate": 50.0,
+      "avg_win_pct": 35.924884929191734,
+      "avg_loss_pct": -76.77973743280548,
+      "expectancy_pct": -20.427426251806864,
+      "total_pnl": -1291.9405946732552,
+      "max_drawdown": -1461.5956712093503,
+      "start": "03/25/2026",
+      "end": "06/18/2026"
+    },
+    "QCOM:call": {
+      "trades": 55,
+      "win_rate": 70.9090909090909,
+      "avg_win_pct": 54.713136478325836,
+      "avg_loss_pct": -75.36226012226732,
+      "expectancy_pct": 16.873021103607833,
+      "total_pnl": 4616.2193274411775,
+      "max_drawdown": -5334.77222598372,
+      "start": "03/25/2026",
+      "end": "06/18/2026"
+    },
+    "QCOM:put": {
+      "trades": 33,
+      "win_rate": 66.66666666666666,
+      "avg_win_pct": 42.96156956251017,
+      "avg_loss_pct": -54.049394604458435,
+      "expectancy_pct": 10.624581506853964,
+      "total_pnl": -992.3490953714796,
+      "max_drawdown": -4916.203514372886,
+      "start": "03/31/2026",
+      "end": "06/17/2026"
+    }
+  },
+  "drift": {
+    "QCOM:call": {
+      "old_win": 70.9090909090909,
+      "new_win": 71.42857142857143,
+      "old_exp": 16.873021103607833,
+      "new_exp": 20.96842786917652,
+      "old_trades": 55,
+      "new_trades": 56,
+      "old_pnl": 4616.2193274411775,
+      "new_pnl": 4404.759271673658,
+      "win_drift": 0.5194805194805241,
+      "exp_drift": 4.095406765568686,
+      "eligible_in_committed": true,
+      "below_floor_now": false,
+      "negative_exp_now": false
+    },
+    "QCOM:put": {
+      "old_win": 66.66666666666666,
+      "new_win": 71.05263157894737,
+      "old_exp": 10.624581506853964,
+      "new_exp": 11.582971661003473,
+      "old_trades": 33,
+      "new_trades": 38,
+      "old_pnl": -992.3490953714796,
+      "new_pnl": 1207.189182978596,
+      "win_drift": 4.385964912280713,
+      "exp_drift": 0.9583901541495088,
+      "eligible_in_committed": false,
+      "below_floor_now": false,
+      "negative_exp_now": false
+    },
+    "SPX:call": {
+      "old_win": 78.33333333333333,
+      "new_win": 80.0,
+      "old_exp": 30.662239671078932,
+      "new_exp": 30.474582770706707,
+      "old_trades": 60,
+      "new_trades": 60,
+      "old_pnl": 37034.833793437814,
+      "new_pnl": 37755.21709758542,
+      "win_drift": 1.6666666666666714,
+      "exp_drift": -0.18765690037222527,
+      "eligible_in_committed": true,
+      "below_floor_now": false,
+      "negative_exp_now": false
+    },
+    "SPX:put": {
+      "old_win": 42.10526315789473,
+      "new_win": 44.44444444444444,
+      "old_exp": -28.892799869945843,
+      "new_exp": -24.12162997766816,
+      "old_trades": 38,
+      "new_trades": 36,
+      "old_pnl": -20758.30783192318,
+      "new_pnl": -15281.177796915246,
+      "win_drift": 2.33918128654971,
+      "exp_drift": 4.771169892277683,
+      "eligible_in_committed": false,
+      "below_floor_now": true,
+      "negative_exp_now": true
+    },
+    "SPY:call": {
+      "old_win": 78.33333333333333,
+      "new_win": 76.66666666666667,
+      "old_exp": 25.87153397392598,
+      "new_exp": 25.247058380389145,
+      "old_trades": 60,
+      "new_trades": 60,
+      "old_pnl": 2730.5942494777046,
+      "new_pnl": 2770.9917433336814,
+      "win_drift": -1.6666666666666572,
+      "exp_drift": -0.624475593536836,
+      "eligible_in_committed": true,
+      "below_floor_now": false,
+      "negative_exp_now": false
+    },
+    "SPY:put": {
+      "old_win": 50.0,
+      "new_win": 48.57142857142857,
+      "old_exp": -20.427426251806864,
+      "new_exp": -19.474853746938006,
+      "old_trades": 36,
+      "new_trades": 35,
+      "old_pnl": -1291.9405946732552,
+      "new_pnl": -1059.7952863257726,
+      "win_drift": -1.4285714285714306,
+      "exp_drift": 0.9525725048688578,
+      "eligible_in_committed": false,
+      "below_floor_now": true,
+      "negative_exp_now": true
+    },
+    "TSLA:call": {
+      "old_win": 55.35714285714286,
+      "new_win": 60.0,
+      "old_exp": 0.5101746555747498,
+      "new_exp": 6.660014368391585,
+      "old_trades": 56,
+      "new_trades": 55,
+      "old_pnl": -1680.1289694529135,
+      "new_pnl": 835.6246725495323,
+      "win_drift": 4.642857142857139,
+      "exp_drift": 6.149839712816835,
+      "eligible_in_committed": false,
+      "below_floor_now": true,
+      "negative_exp_now": false
+    },
+    "TSLA:put": {
+      "old_win": 67.3913043478261,
+      "new_win": 65.11627906976744,
+      "old_exp": 5.599215381138852,
+      "new_exp": 1.5685412791396687,
+      "old_trades": 46,
+      "new_trades": 43,
+      "old_pnl": 1941.2771200198792,
+      "new_pnl": 601.857713917399,
+      "win_drift": -2.2750252780586493,
+      "exp_drift": -4.030674101999184,
+      "eligible_in_committed": true,
+      "below_floor_now": true,
+      "negative_exp_now": false
+    }
+  },
+  "eligible_flags": [
+    "TSLA:put: win 65.1% < 70% floor (was 67.4% / +5.6%)"
+  ]
+}

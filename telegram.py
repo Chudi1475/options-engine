@@ -6,10 +6,20 @@ state.json so commands aren't replayed after a restart.
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
 import config
+
+# One shared HTTP session: keeps the TLS connection to api.telegram.org open
+# so every send skips the ~200-500ms handshake a fresh request pays.
+_session = requests.Session()
+_session.mount("https://", requests.adapters.HTTPAdapter(
+    pool_connections=4, pool_maxsize=16))
+
+# Broadcasts fan out to all chats at once instead of one-at-a-time.
+_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tg")
 
 
 def _token() -> str:
@@ -55,14 +65,28 @@ def primary_owner_id():
 def send_to(chat_id, text: str):
     """Send to one chat. Returns an error string or None."""
     try:
-        r = requests.post(
+        r = _session.post(
             f"https://api.telegram.org/bot{_token()}/sendMessage",
             json={"chat_id": chat_id, "text": text}, timeout=10)
+        if r.status_code == 429:  # flood limit: honor Telegram's wait once
+            wait = min(_retry_after(r), 5)
+            import time as _t
+            _t.sleep(wait)
+            r = _session.post(
+                f"https://api.telegram.org/bot{_token()}/sendMessage",
+                json={"chat_id": chat_id, "text": text}, timeout=10)
         if not r.ok:
             return f"{chat_id}: {r.status_code} {r.text[:200]}"
     except requests.RequestException as e:
         return f"{chat_id}: {e}"
     return None
+
+
+def _retry_after(r) -> int:
+    try:
+        return int(r.json()["parameters"]["retry_after"])
+    except Exception:
+        return 1
 
 
 def send_chat_action(chat_id, action: str = "typing"):
@@ -71,7 +95,7 @@ def send_chat_action(chat_id, action: str = "typing"):
     Short timeout so a stall can't push the next refresh past Telegram's ~5s
     typing-status expiry and make the indicator flicker off."""
     try:
-        requests.post(
+        _session.post(
             f"https://api.telegram.org/bot{_token()}/sendChatAction",
             json={"chat_id": chat_id, "action": action}, timeout=3)
     except requests.RequestException:
@@ -81,30 +105,73 @@ def send_chat_action(chat_id, action: str = "typing"):
 def send_photo(chat_id, image_bytes: bytes, caption: str = ""):
     """Send a generated image (e.g. a chart) to one chat. Returns an error
     string or None. Telegram caps captions at 1024 chars."""
+    err, _fid = _send_photo_raw(chat_id, image_bytes, caption)
+    return err
+
+
+def _send_photo_raw(chat_id, photo, caption: str = ""):
+    """Send one photo. `photo` is bytes (multipart upload) or a Telegram
+    file_id string (instant, no upload). Returns (error|None, file_id|None)
+    so a broadcast can upload once and reuse the file_id everywhere else."""
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{_token()}/sendPhoto",
-            data={"chat_id": chat_id, "caption": caption[:1024]},
-            files={"photo": ("chart.png", image_bytes, "image/png")},
-            timeout=30)
+        if isinstance(photo, (bytes, bytearray)):
+            r = _session.post(
+                f"https://api.telegram.org/bot{_token()}/sendPhoto",
+                data={"chat_id": chat_id, "caption": caption[:1024]},
+                files={"photo": ("chart.png", photo, "image/png")},
+                timeout=30)
+        else:
+            r = _session.post(
+                f"https://api.telegram.org/bot{_token()}/sendPhoto",
+                json={"chat_id": chat_id, "caption": caption[:1024],
+                      "photo": photo},
+                timeout=10)
         if not r.ok:
-            return f"{chat_id}: {r.status_code} {r.text[:200]}"
+            return f"{chat_id}: {r.status_code} {r.text[:200]}", None
+        try:  # largest rendition's file_id, for re-sends without re-upload
+            fid = r.json()["result"]["photo"][-1]["file_id"]
+        except Exception:
+            fid = None
+        return None, fid
     except requests.RequestException as e:
-        return f"{chat_id}: {e}"
-    return None
+        return f"{chat_id}: {e}", None
 
 
-def send(text: str) -> list:
-    """Send to every configured chat. Returns a list of error strings."""
+def send_photo_all(image_bytes: bytes, caption: str = "") -> list:
+    """Broadcast a photo to every configured chat, fast: upload the bytes
+    ONCE to the first chat, then fan the returned file_id out to everyone
+    else in parallel (file_id sends carry no payload, they land in ~100ms).
+    Returns a list of error strings."""
     ids = chat_ids()
     if not ids:
         raise RuntimeError("TELEGRAM_CHAT_IDS not set — run scanner.py --setup")
     errors = []
-    for cid in ids:
-        err = send_to(cid, text)
-        if err:
-            errors.append(err)
+    err, fid = _send_photo_raw(ids[0], image_bytes, caption)
+    if err:
+        errors.append(err)
+    rest = ids[1:]
+    if not rest:
+        return errors
+    payload = fid or image_bytes  # no file_id? fall back to re-upload
+    futures = [_pool.submit(_send_photo_raw, cid, payload, caption)
+               for cid in rest]
+    for f in futures:
+        e, _ = f.result()
+        if e:
+            errors.append(e)
     return errors
+
+
+def send(text: str) -> list:
+    """Send to every configured chat, all at once. Returns error strings."""
+    ids = chat_ids()
+    if not ids:
+        raise RuntimeError("TELEGRAM_CHAT_IDS not set — run scanner.py --setup")
+    if len(ids) == 1:
+        err = send_to(ids[0], text)
+        return [err] if err else []
+    futures = [_pool.submit(send_to, cid, text) for cid in ids]
+    return [f.result() for f in futures if f.result()]
 
 
 def _parse_update(upd: dict, authorized: set):
@@ -152,7 +219,7 @@ def get_messages(timeout: int = 0):
     it — replay is the safe direction here."""
     offset = int(config.state_get("tg_offset", 0))
     try:
-        r = requests.get(
+        r = _session.get(
             f"https://api.telegram.org/bot{_token()}/getUpdates",
             params={"offset": offset + 1, "timeout": timeout},
             timeout=timeout + 10)
@@ -171,10 +238,10 @@ def get_messages(timeout: int = 0):
 def download_file(file_id: str, max_bytes: int = 10 * 1024 * 1024):
     """Fetch a photo/document the user sent. Returns bytes or None."""
     try:
-        r = requests.get(f"https://api.telegram.org/bot{_token()}/getFile",
+        r = _session.get(f"https://api.telegram.org/bot{_token()}/getFile",
                          params={"file_id": file_id}, timeout=15)
         path = r.json()["result"]["file_path"]
-        f = requests.get(f"https://api.telegram.org/file/bot{_token()}/{path}",
+        f = _session.get(f"https://api.telegram.org/file/bot{_token()}/{path}",
                          timeout=60)
         f.raise_for_status()
         return f.content if len(f.content) <= max_bytes else None

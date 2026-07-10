@@ -208,6 +208,18 @@ class Service:
             return (keep + extra)[-50:]
         config.state_update("pending_sends", _merge, default=[])
 
+    def flush_pending_bg(self):
+        """Run flush_pending on its own thread (single flight) so a retry
+        backlog never delays the entry/exit scans or command pickup."""
+        t = getattr(self, "_flush_thread", None)
+        if t and t.is_alive():
+            return  # previous flush still working through the backlog
+        if not config.state_get("pending_sends", []):
+            return
+        self._flush_thread = threading.Thread(
+            target=self.flush_pending, daemon=True, name="flush-pending")
+        self._flush_thread.start()
+
     def reset_day(self, now: datetime):
         if self.day != now.date():
             self.day = now.date()
@@ -950,7 +962,43 @@ class Service:
             return None
         return stats
 
+    def gap_up_pct(self, now: datetime):
+        """SPX open vs yesterday's close, computed once per day (cached).
+        Returns the gap in percent, or None if it can't be read."""
+        cache = getattr(self, "_gap_cache", None)
+        if cache and cache[0] == now.date():
+            return cache[1]
+        gap = None
+        try:
+            spx = yf.download("^GSPC", period="2d", interval="1d",
+                              progress=False, auto_adjust=False)
+            if hasattr(spx.columns, "levels"):
+                spx.columns = spx.columns.get_level_values(0)
+            if spx is not None and len(spx) >= 2:
+                gap = (float(spx["Open"].iloc[-1])
+                       / float(spx["Close"].iloc[-2]) - 1) * 100
+        except Exception as e:
+            print(f"{now:%H:%M:%S} gap check failed (rule skipped): {e}")
+        self._gap_cache = (now.date(), gap)
+        return gap
+
     def scan_entries(self, now: datetime):
+        # Verified regime rule: big gap-UP opens are historically toxic for
+        # this call-heavy playbook (won 56.7% and lost money; skipping them
+        # lifted the whole book to 76.7% win rate in walk-forward). Stand
+        # aside for the day and say so once.
+        if config.GAP_UP_SKIP_PCT > 0:
+            gap = self.gap_up_pct(now)
+            if gap is not None and gap >= config.GAP_UP_SKIP_PCT:
+                if getattr(self, "_gap_skip_told", None) != now.date():
+                    self._gap_skip_told = now.date()
+                    self.notify(
+                        f"⏭️ Standing aside today: SPX opened {gap:+.1f}% "
+                        "above yesterday's close. Big gap-up days lose money "
+                        "for this playbook (won just 57 of 100 in testing vs "
+                        "our usual 74). No entry alerts today; open positions "
+                        "still get managed to the close.")
+                return
         opened = self.book.opened_today(now.date())
         # a weekly (TSLA/QCOM) opened earlier in the week is not dated today, so
         # also skip any ticker with a live position: no stacking a fresh entry
@@ -1166,6 +1214,92 @@ class Service:
             print(f"{now:%H:%M:%S} {pos.ticker}: {ev['type']} at {ev['pct']:+.1f}%")
         self.book.save()
 
+    # ---------- sniper watch (own thread, all-day) ----------
+    # The verified 79% pattern used to fire ONLY when someone happened to
+    # text the bot at the right minute. This thread watches the verified
+    # symbols continuously (07:00-16:00 ET weekdays), texts EVERYONE the
+    # moment the pattern forms, sends the marked-up chart, and records every
+    # candidate to the forward ledger so the bot grades itself nightly.
+
+    SNIPER_WATCH_SECONDS = 240  # 5m bars: checking ~every 4 min misses nothing
+
+    def start_sniper_watch(self):
+        """Safe to call repeatedly; the thread gates its own hours."""
+        t = getattr(self, "_sniper_thread", None)
+        if t and t.is_alive():
+            return
+        self._sniper_stop = threading.Event()
+        self._sniper_thread = threading.Thread(
+            target=self._sniper_worker, name="sniper-watch", daemon=True)
+        self._sniper_thread.start()
+
+    def _sniper_worker(self):
+        while not self._sniper_stop.is_set():
+            try:
+                now = et_now()
+                if now.weekday() < 5 and 7 <= now.hour < 16:
+                    self._scan_snipers_once(now)
+            except Exception as e:
+                print(f"{et_now():%H:%M:%S} sniper watch error (continuing): {e}")
+            self._sniper_stop.wait(self.SNIPER_WATCH_SECONDS)
+
+    def _scan_snipers_once(self, now: datetime):
+        import fvg as fvg_mod
+        import market_tools
+        alerted = config.state_get("sniper_alerted", {})
+        day = f"{now:%Y-%m-%d}"
+        for yfs in sorted(fvg_mod.SNIPER_SYMBOLS):
+            key = f"{day}:{yfs}"
+            if key in alerted:
+                continue
+            try:
+                r = market_tools.read_any(yfs)
+            except Exception:
+                continue
+            if not isinstance(r, dict) or r.get("conviction") != "high":
+                continue
+            ticket = ((r.get("fvg") or {}).get("confirming") or {}).get("ticket")
+            if not ticket:
+                continue
+            alerted[key] = f"{now:%H:%M}"
+            config.state_set("sniper_alerted",
+                             {k: v for k, v in alerted.items()
+                              if k.startswith(day)})
+            m = ticket.get("measured", {})
+            d = (r.get("plan") or {}).get("direction", "")
+            dec = int(r.get("decimals", 2))
+            lines = [
+                f"🎯 SNIPER · {r.get('instrument', yfs)} {d}",
+                f"This is the verified pattern: wins {m.get('win_rate', 0):.0f}"
+                f" of 100 ({m.get('trades', 0)} replays).",
+                f"Enter now: {ticket['entry']:.{dec}f}",
+                f"Stop: {ticket['stop']:.{dec}f}",
+                f"Take profit: {ticket['target']:.{dec}f} (all out, no greed)",
+            ]
+            if ticket.get("target_1r"):
+                lines.append(
+                    f"Stretch map (no track record yet, being graded nightly): "
+                    f"1R {ticket['target_1r']:.{dec}f} · "
+                    f"2R {ticket.get('target_2r', 0):.{dec}f}"
+                    + (f" · structure {ticket['target_structure']:.{dec}f}"
+                       if ticket.get("target_structure") else ""))
+            lines.append("One trade per symbol per day. Your call.")
+            self.notify("\n".join(lines))
+            try:  # chart to everyone: upload once, fan out by file_id
+                import charts
+                img, _ = charts.render_fvg(r)
+                if img:
+                    telegram.send_photo_all(
+                        img, caption=f"{r.get('instrument', yfs)} {d} · "
+                        "SNIPER setup, levels drawn.")
+            except Exception as e:
+                print(f"{now:%H:%M:%S} sniper chart skipped: {e}")
+
+    def stop_sniper_watch(self):
+        ev = getattr(self, "_sniper_stop", None)
+        if ev:
+            ev.set()
+
     # ---------- breaking news (own thread, instant-send) ----------
 
     def start_news_watch(self):
@@ -1241,10 +1375,15 @@ class Service:
             # 1) RAW alert goes out INSTANTLY — nothing slow runs before it
             self.notify(f"🚨 BREAKING — {outlet}: {title}")
             print(f"{now:%H:%M:%S} breaking news alert: {title[:60]}")
-            # 2) AI 'read' is a best-effort FOLLOW-UP — never blocks the alert
-            take = self._news_take(title)
-            if take:
-                self.notify(f"🧠 Quick read: {take}")
+            # 2) AI 'read' is a best-effort FOLLOW-UP on its OWN thread, so a
+            # slow read on headline #1 never delays the RAW alert for #2
+            threading.Thread(target=self._news_take_and_send, args=(title,),
+                             daemon=True, name="news-take").start()
+
+    def _news_take_and_send(self, title: str):
+        take = self._news_take(title)
+        if take:
+            self.notify(f"🧠 Quick read: {take}")
 
     def _news_take(self, title: str):
         try:
@@ -1398,6 +1537,7 @@ class Service:
             self.morning_report(now)
         keep_awake(True)
         self.start_news_watch()  # instant breaking-news alerts, own thread
+        self.start_sniper_watch()  # verified-pattern watch, own thread
         try:
             while True:
                 now = et_now()
@@ -1411,14 +1551,20 @@ class Service:
                     return
                 t0 = time_mod.monotonic()
                 try:  # one bad cycle must never end the trading day
-                    self.flush_pending()
-                    # money-critical FIRST: entries + exits must never wait on a
+                    # money-critical FIRST: entries + exits must never wait on
+                    # a retry backlog (each queued send can block ~10s) or a
                     # slow chat command (a photo/assistant reply can block secs)
                     if self.cfg.entry_start <= now.time() <= self.cfg.entry_end:
                         self.scan_entries(now)
                     if now.time() >= MONITOR_START:
                         self.monitor_positions(now)
+                    self.flush_pending_bg()
                     self.handle_commands()
+                    try:  # announce "brain is back" when the 5h05m wait ends
+                        import assistant
+                        assistant.check_cooldown_recovery()
+                    except Exception:
+                        pass
                     self.maybe_recap(now)
                     self.maybe_request_digest(now)
                     self.maybe_weekly(now)
@@ -1426,9 +1572,21 @@ class Service:
                 except Exception as e:
                     print(f"{now:%H:%M:%S} cycle error (continuing): {e}")
                 # adaptive sleep: data-fetch time counts toward the cadence,
-                # so a slow cycle doesn't push the next look further out
+                # so a slow cycle doesn't push the next look further out.
+                # Sleep in short slices and peek for commands between them so
+                # a text gets picked up in ~3s instead of a full cycle.
                 elapsed = time_mod.monotonic() - t0
-                time_mod.sleep(max(2.0, config.POLL_SECONDS - elapsed))
+                wake_at = time_mod.monotonic() + max(2.0, config.POLL_SECONDS - elapsed)
+                while True:
+                    left = wake_at - time_mod.monotonic()
+                    if left <= 0:
+                        break
+                    time_mod.sleep(min(3.0, left))
+                    if wake_at - time_mod.monotonic() > 0.5:
+                        try:
+                            self.handle_commands()
+                        except Exception as e:
+                            print(f"{now:%H:%M:%S} command peek error: {e}")
         finally:
             self.stop_news_watch()
             keep_awake(False)
@@ -1436,6 +1594,7 @@ class Service:
     def daemon(self):
         print("Daemon mode: running around the clock. Commands answered "
               "any time; sessions run on trading days 8:31-15:12 CT.")
+        self.start_sniper_watch()  # covers 6 AM CT premarket + after-hours
         while True:
             now = et_now()
             try:
@@ -1448,6 +1607,11 @@ class Service:
                         self.run_session()
                         continue
                 self.flush_pending()
+                try:  # announce "brain is back" when the 5h05m wait ends
+                    import assistant
+                    assistant.check_cooldown_recovery()
+                except Exception:
+                    pass
                 self.maybe_recap(now)   # catch-up: a recap missed/STALE during
                                         # the 16:05-16:12 window still goes out
                 self.maybe_request_digest(now)  # catch-up the request rollup too

@@ -94,8 +94,8 @@ def step(pos: Position, now: datetime, mark: float, mark_source: str,
     """Advance one polling cycle. Returns a list of event dicts to alert on.
 
     mark       — best current option price (quote mid, else estimate)
-    est_pct    — estimate-based P&L%, used as an early-warning floor for the
-                 stop because real quotes can lag ~15 min. None if unavailable.
+    est_pct    — estimate-based P&L%, floors the stop ONLY on non-comparable
+                 cycles (a comparable quote outranks it). None if unavailable.
     flipped    — has the 15-min momentum measure turned against the trade?
     comparable — is `mark` priced the same WAY as entry (quote-vs-quote or
                  est-vs-est)? When False (a real quote on an estimate entry, or

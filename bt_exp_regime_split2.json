@@ -1,0 +1,771 @@
+{
+  "experiment": "regime split v2 (verification + per-setup tables + walk-forward)",
+  "window": "2026-04-08 .. 2026-07-02",
+  "exit_params": {
+    "half": 25,
+    "giveback": 40,
+    "stop": -70
+  },
+  "pricing": "approximated Black-Scholes (optimistic for 0DTE) - relative only",
+  "sizing_fair": "acct ret/trade = ret_pct * 1.0 / 70.0",
+  "baseline": {
+    "portfolio": {
+      "trades": 219,
+      "win_rate": 73.97260273972603,
+      "expectancy_pct": 20.93597125453262,
+      "acct_ret_total": 65.49968149632346,
+      "pnl_total": 45532.82582651015
+    },
+    "per_setup": {
+      "QCOM:call": {
+        "trades": 56,
+        "win_rate": 71.42857142857143,
+        "expectancy_pct": 20.96842786917652,
+        "acct_ret_total": 16.77474229534121,
+        "pnl_total": 4404.759271673658
+      },
+      "SPX:call": {
+        "trades": 60,
+        "win_rate": 80.0,
+        "expectancy_pct": 30.474582770706707,
+        "acct_ret_total": 26.121070946320025,
+        "pnl_total": 37755.21709758542
+      },
+      "SPY:call": {
+        "trades": 60,
+        "win_rate": 76.66666666666667,
+        "expectancy_pct": 25.247058380389145,
+        "acct_ret_total": 21.64033575461926,
+        "pnl_total": 2770.9917433336814
+      },
+      "TSLA:put": {
+        "trades": 43,
+        "win_rate": 65.11627906976744,
+        "expectancy_pct": 1.5685412791396687,
+        "acct_ret_total": 0.9635325000429417,
+        "pnl_total": 601.857713917399
+      }
+    }
+  },
+  "regime_tables_pooled": {
+    "vix_bucket": {
+      "VIX 15-20": {
+        "trades": 197,
+        "win_rate": 73.09644670050761,
+        "expectancy_pct": 19.017821359778303,
+        "acct_ret_total": 53.521582969661786,
+        "pnl_total": 35080.83358651708
+      },
+      "VIX 20-30": {
+        "trades": 22,
+        "win_rate": 81.81818181818183,
+        "expectancy_pct": 38.11213167574164,
+        "acct_ret_total": 11.978098526661658,
+        "pnl_total": 10451.992239993078
+      }
+    },
+    "gap_bucket": {
+      "gap down >1%": {
+        "trades": 25,
+        "win_rate": 80.0,
+        "expectancy_pct": 28.693984558802864,
+        "acct_ret_total": 10.24785162814388,
+        "pnl_total": 5101.774493665714
+      },
+      "no big gap": {
+        "trades": 164,
+        "win_rate": 76.21951219512195,
+        "expectancy_pct": 25.455877582023522,
+        "acct_ret_total": 59.6394846207408,
+        "pnl_total": 43424.74020785384
+      },
+      "gap up >1%": {
+        "trades": 30,
+        "win_rate": 56.666666666666664,
+        "expectancy_pct": -10.237861089309593,
+        "acct_ret_total": -4.387654752561254,
+        "pnl_total": -2993.6888750094113
+      }
+    },
+    "prior_trend": {
+      "prior-day UP": {
+        "trades": 118,
+        "win_rate": 72.03389830508475,
+        "expectancy_pct": 17.350797651878683,
+        "acct_ret_total": 29.248487470309765,
+        "pnl_total": 18062.39108558281
+      },
+      "prior-day DOWN": {
+        "trades": 101,
+        "win_rate": 76.23762376237624,
+        "expectancy_pct": 25.124589919019368,
+        "acct_ret_total": 36.25119402601371,
+        "pnl_total": 27470.434740927354
+      }
+    }
+  },
+  "regime_tables_per_setup": {
+    "vix_bucket": {
+      "QCOM:call": {
+        "VIX 15-20": {
+          "trades": 50,
+          "win_rate": 72.0,
+          "expectancy_pct": 23.884809716128206,
+          "acct_ret_total": 17.060578368662995,
+          "pnl_total": 4989.785958066475
+        },
+        "VIX 20-30": {
+          "trades": 6,
+          "win_rate": 66.66666666666666,
+          "expectancy_pct": -3.3347541887541943,
+          "acct_ret_total": -0.28583607332178795,
+          "pnl_total": -585.0266863928182
+        }
+      },
+      "SPX:call": {
+        "VIX 15-20": {
+          "trades": 54,
+          "win_rate": 79.62962962962963,
+          "expectancy_pct": 27.400127264810905,
+          "acct_ret_total": 21.137241032854128,
+          "pnl_total": 28606.070250107412
+        },
+        "VIX 20-30": {
+          "trades": 6,
+          "win_rate": 83.33333333333334,
+          "expectancy_pct": 58.144682323768855,
+          "acct_ret_total": 4.983829913465902,
+          "pnl_total": 9149.146847478009
+        }
+      },
+      "SPY:call": {
+        "VIX 15-20": {
+          "trades": 54,
+          "win_rate": 75.92592592592592,
+          "expectancy_pct": 20.872610184202397,
+          "acct_ret_total": 16.101727856384702,
+          "pnl_total": 1865.7502042265762
+        },
+        "VIX 20-30": {
+          "trades": 6,
+          "win_rate": 83.33333333333334,
+          "expectancy_pct": 64.61709214606985,
+          "acct_ret_total": 5.538607898234559,
+          "pnl_total": 905.2415391071061
+        }
+      },
+      "TSLA:put": {
+        "VIX 15-20": {
+          "trades": 39,
+          "win_rate": 61.53846153846154,
+          "expectancy_pct": -1.396346158379576,
+          "acct_ret_total": -0.7779642882400459,
+          "pnl_total": -380.7728258833845
+        },
+        "VIX 20-30": {
+          "trades": 4,
+          "win_rate": 100.0,
+          "expectancy_pct": 30.47619379495227,
+          "acct_ret_total": 1.7414967882829868,
+          "pnl_total": 982.630539800783
+        }
+      }
+    },
+    "gap_bucket": {
+      "QCOM:call": {
+        "gap down >1%": {
+          "trades": 14,
+          "win_rate": 71.42857142857143,
+          "expectancy_pct": 30.439284006553212,
+          "acct_ret_total": 6.0878568013106396,
+          "pnl_total": 2312.8894093126282
+        },
+        "no big gap": {
+          "trades": 24,
+          "win_rate": 79.16666666666666,
+          "expectancy_pct": 35.04712211852412,
+          "acct_ret_total": 12.016156154922555,
+          "pnl_total": 4300.250512085182
+        },
+        "gap up >1%": {
+          "trades": 18,
+          "win_rate": 61.111111111111114,
+          "expectancy_pct": -5.169385903468836,
+          "acct_ret_total": -1.3292706608919862,
+          "pnl_total": -2208.380649724153
+        }
+      },
+      "SPX:call": {
+        "gap down >1%": {
+          "trades": 1,
+          "win_rate": 100.0,
+          "expectancy_pct": 57.77278825922665,
+          "acct_ret_total": 0.8253255465603807,
+          "pnl_total": 1325.7778128654033
+        },
+        "no big gap": {
+          "trades": 57,
+          "win_rate": 80.7017543859649,
+          "expectancy_pct": 31.375315653272523,
+          "acct_ret_total": 25.548471317664756,
+          "pnl_total": 37001.29780542158
+        },
+        "gap up >1%": {
+          "trades": 2,
+          "win_rate": 50.0,
+          "expectancy_pct": -8.845407126679014,
+          "acct_ret_total": -0.2527259179051148,
+          "pnl_total": -571.8585207015622
+        }
+      },
+      "SPY:call": {
+        "gap down >1%": {
+          "trades": 1,
+          "win_rate": 100.0,
+          "expectancy_pct": 54.01101169864377,
+          "acct_ret_total": 0.7715858814091967,
+          "pnl_total": 110.78527390894901
+        },
+        "no big gap": {
+          "trades": 56,
+          "win_rate": 78.57142857142857,
+          "expectancy_pct": 27.853277428180434,
+          "acct_ret_total": 22.282621942544345,
+          "pnl_total": 2877.869519869172
+        },
+        "gap up >1%": {
+          "trades": 3,
+          "win_rate": 33.33333333333333,
+          "expectancy_pct": -32.990348284466386,
+          "acct_ret_total": -1.4138720693342737,
+          "pnl_total": -217.66305044444033
+        }
+      },
+      "TSLA:put": {
+        "gap down >1%": {
+          "trades": 9,
+          "win_rate": 88.88888888888889,
+          "expectancy_pct": 19.935093102272916,
+          "acct_ret_total": 2.563083398863661,
+          "pnl_total": 1352.3219975787342
+        },
+        "no big gap": {
+          "trades": 27,
+          "win_rate": 59.25925925925925,
+          "expectancy_pct": -0.5386494669392192,
+          "acct_ret_total": -0.20776479439084072,
+          "pnl_total": -754.6776295220789
+        },
+        "gap up >1%": {
+          "trades": 7,
+          "win_rate": 57.14285714285714,
+          "expectancy_pct": -13.917861044298787,
+          "acct_ret_total": -1.3917861044298783,
+          "pnl_total": 4.213345860744198
+        }
+      }
+    },
+    "prior_trend": {
+      "QCOM:call": {
+        "prior-day UP": {
+          "trades": 23,
+          "win_rate": 78.26086956521739,
+          "expectancy_pct": 18.953911544520576,
+          "acct_ret_total": 6.2277137931996185,
+          "pnl_total": 757.2425060345547
+        },
+        "prior-day DOWN": {
+          "trades": 33,
+          "win_rate": 66.66666666666666,
+          "expectancy_pct": 22.372484701512477,
+          "acct_ret_total": 10.547028502141597,
+          "pnl_total": 3647.5167656391013
+        }
+      },
+      "SPX:call": {
+        "prior-day UP": {
+          "trades": 38,
+          "win_rate": 71.05263157894737,
+          "expectancy_pct": 18.727526847944517,
+          "acct_ret_total": 10.166371717455595,
+          "pnl_total": 14503.619780402485
+        },
+        "prior-day DOWN": {
+          "trades": 22,
+          "win_rate": 95.45454545454545,
+          "expectancy_pct": 50.764952091841366,
+          "acct_ret_total": 15.954699228864428,
+          "pnl_total": 23251.59731718294
+        }
+      },
+      "SPY:call": {
+        "prior-day UP": {
+          "trades": 34,
+          "win_rate": 70.58823529411765,
+          "expectancy_pct": 15.962218066998403,
+          "acct_ret_total": 7.753077346827794,
+          "pnl_total": 1018.6282940896676
+        },
+        "prior-day DOWN": {
+          "trades": 26,
+          "win_rate": 84.61538461538461,
+          "expectancy_pct": 37.388772636361644,
+          "acct_ret_total": 13.887258407791471,
+          "pnl_total": 1752.3634492440144
+        }
+      },
+      "TSLA:put": {
+        "prior-day UP": {
+          "trades": 23,
+          "win_rate": 69.56521739130434,
+          "expectancy_pct": 15.52577056077708,
+          "acct_ret_total": 5.101324612826755,
+          "pnl_total": 1782.9005050561054
+        },
+        "prior-day DOWN": {
+          "trades": 20,
+          "win_rate": 60.0,
+          "expectancy_pct": -14.482272394743353,
+          "acct_ret_total": -4.137792112783814,
+          "pnl_total": -1181.042791138706
+        }
+      }
+    }
+  },
+  "policies": {
+    "vix_bucket|VIX 15-20|SKIP": {
+      "portfolio": {
+        "trades": 22,
+        "win_rate": 81.81818181818183,
+        "expectancy_pct": 38.11213167574164,
+        "acct_ret_total": 11.978098526661658,
+        "pnl_total": 10451.992239993078
+      },
+      "per_setup": {
+        "QCOM:call": {
+          "trades": 6,
+          "win_rate": 66.66666666666666,
+          "expectancy_pct": -3.3347541887541943,
+          "acct_ret_total": -0.28583607332178795,
+          "pnl_total": -585.0266863928182
+        },
+        "SPX:call": {
+          "trades": 6,
+          "win_rate": 83.33333333333334,
+          "expectancy_pct": 58.144682323768855,
+          "acct_ret_total": 4.983829913465902,
+          "pnl_total": 9149.146847478009
+        },
+        "SPY:call": {
+          "trades": 6,
+          "win_rate": 83.33333333333334,
+          "expectancy_pct": 64.61709214606985,
+          "acct_ret_total": 5.538607898234559,
+          "pnl_total": 905.2415391071061
+        },
+        "TSLA:put": {
+          "trades": 4,
+          "win_rate": 100.0,
+          "expectancy_pct": 30.47619379495227,
+          "acct_ret_total": 1.7414967882829868,
+          "pnl_total": 982.630539800783
+        }
+      },
+      "floor_ok": true,
+      "beats_baseline": false,
+      "half_check": {
+        "first": {
+          "base_acct": 36.80887031172867,
+          "pol_acct": 2.577480191712777,
+          "pol_win": 72.72727272727273,
+          "beats": false
+        },
+        "second": {
+          "base_acct": 28.690811184594786,
+          "pol_acct": 9.40061833494888,
+          "pol_win": 90.9090909090909,
+          "beats": false
+        }
+      },
+      "beats_in_both_halves": false
+    },
+    "vix_bucket|VIX 15-20|HALF-SIZE": {
+      "portfolio": {
+        "trades": 219,
+        "win_rate": 73.97260273972603,
+        "expectancy_pct": 20.93597125453262,
+        "acct_ret_total": 38.73889001149255,
+        "pnl_total": 27992.409033251624
+      },
+      "per_setup": {
+        "QCOM:call": {
+          "trades": 56,
+          "win_rate": 71.42857142857143,
+          "expectancy_pct": 20.96842786917652,
+          "acct_ret_total": 8.244453111009712,
+          "pnl_total": 1909.8662926404193
+        },
+        "SPX:call": {
+          "trades": 60,
+          "win_rate": 80.0,
+          "expectancy_pct": 30.474582770706707,
+          "acct_ret_total": 15.55245042989296,
+          "pnl_total": 23452.18197253172
+        },
+        "SPY:call": {
+          "trades": 60,
+          "win_rate": 76.66666666666667,
+          "expectancy_pct": 25.247058380389145,
+          "acct_ret_total": 13.589471826426916,
+          "pnl_total": 1838.1166412203934
+        },
+        "TSLA:put": {
+          "trades": 43,
+          "win_rate": 65.11627906976744,
+          "expectancy_pct": 1.5685412791396687,
+          "acct_ret_total": 1.352514644162964,
+          "pnl_total": 792.2441268590912
+        }
+      },
+      "floor_ok": true,
+      "beats_baseline": false,
+      "half_check": {
+        "first": {
+          "base_acct": 36.80887031172867,
+          "pol_acct": 19.693175251720724,
+          "pol_win": 78.70370370370371,
+          "beats": false
+        },
+        "second": {
+          "base_acct": 28.690811184594786,
+          "pol_acct": 19.04571475977184,
+          "pol_win": 69.36936936936937,
+          "beats": false
+        }
+      },
+      "beats_in_both_halves": false
+    },
+    "gap_bucket|gap up >1%|SKIP": {
+      "portfolio": {
+        "trades": 189,
+        "win_rate": 76.71957671957672,
+        "expectancy_pct": 25.884198610698043,
+        "acct_ret_total": 69.88733624888472,
+        "pnl_total": 48526.51470151956
+      },
+      "per_setup": {
+        "QCOM:call": {
+          "trades": 38,
+          "win_rate": 76.31578947368422,
+          "expectancy_pct": 33.34949755095588,
+          "acct_ret_total": 18.1040129562332,
+          "pnl_total": 6613.139921397811
+        },
+        "SPX:call": {
+          "trades": 58,
+          "win_rate": 81.03448275862068,
+          "expectancy_pct": 31.830444491306213,
+          "acct_ret_total": 26.37379686422514,
+          "pnl_total": 38327.07561828699
+        },
+        "SPY:call": {
+          "trades": 57,
+          "win_rate": 78.94736842105263,
+          "expectancy_pct": 28.312185046960494,
+          "acct_ret_total": 23.054207823953544,
+          "pnl_total": 2988.6547937781206
+        },
+        "TSLA:put": {
+          "trades": 36,
+          "win_rate": 66.66666666666666,
+          "expectancy_pct": 4.579786175363812,
+          "acct_ret_total": 2.355318604472819,
+          "pnl_total": 597.6443680566549
+        }
+      },
+      "floor_ok": true,
+      "beats_baseline": true,
+      "half_check": {
+        "first": {
+          "base_acct": 36.80887031172867,
+          "pol_acct": 38.75697450777028,
+          "pol_win": 81.44329896907216,
+          "beats": true
+        },
+        "second": {
+          "base_acct": 28.690811184594786,
+          "pol_acct": 31.130361741114417,
+          "pol_win": 71.73913043478261,
+          "beats": true
+        }
+      },
+      "beats_in_both_halves": true
+    },
+    "gap_bucket|gap up >1%|HALF-SIZE": {
+      "portfolio": {
+        "trades": 219,
+        "win_rate": 73.97260273972603,
+        "expectancy_pct": 20.93597125453262,
+        "acct_ret_total": 67.69350887260411,
+        "pnl_total": 47029.67026401484
+      },
+      "per_setup": {
+        "QCOM:call": {
+          "trades": 56,
+          "win_rate": 71.42857142857143,
+          "expectancy_pct": 20.96842786917652,
+          "acct_ret_total": 17.43937762578721,
+          "pnl_total": 5508.949596535733
+        },
+        "SPX:call": {
+          "trades": 60,
+          "win_rate": 80.0,
+          "expectancy_pct": 30.474582770706707,
+          "acct_ret_total": 26.24743390527258,
+          "pnl_total": 38041.1463579362
+        },
+        "SPY:call": {
+          "trades": 60,
+          "win_rate": 76.66666666666667,
+          "expectancy_pct": 25.247058380389145,
+          "acct_ret_total": 22.347271789286403,
+          "pnl_total": 2879.8232685559005
+        },
+        "TSLA:put": {
+          "trades": 43,
+          "win_rate": 65.11627906976744,
+          "expectancy_pct": 1.5685412791396687,
+          "acct_ret_total": 1.6594255522578791,
+          "pnl_total": 599.7510409870274
+        }
+      },
+      "floor_ok": true,
+      "beats_baseline": true,
+      "half_check": {
+        "first": {
+          "base_acct": 36.80887031172867,
+          "pol_acct": 37.78292240974948,
+          "pol_win": 78.70370370370371,
+          "beats": true
+        },
+        "second": {
+          "base_acct": 28.690811184594786,
+          "pol_acct": 29.910586462854603,
+          "pol_win": 69.36936936936937,
+          "beats": true
+        }
+      },
+      "beats_in_both_halves": true
+    },
+    "prior_trend|prior-day UP|SKIP": {
+      "portfolio": {
+        "trades": 101,
+        "win_rate": 76.23762376237624,
+        "expectancy_pct": 25.124589919019368,
+        "acct_ret_total": 36.25119402601371,
+        "pnl_total": 27470.434740927354
+      },
+      "per_setup": {
+        "QCOM:call": {
+          "trades": 33,
+          "win_rate": 66.66666666666666,
+          "expectancy_pct": 22.372484701512477,
+          "acct_ret_total": 10.547028502141597,
+          "pnl_total": 3647.5167656391013
+        },
+        "SPX:call": {
+          "trades": 22,
+          "win_rate": 95.45454545454545,
+          "expectancy_pct": 50.764952091841366,
+          "acct_ret_total": 15.954699228864428,
+          "pnl_total": 23251.59731718294
+        },
+        "SPY:call": {
+          "trades": 26,
+          "win_rate": 84.61538461538461,
+          "expectancy_pct": 37.388772636361644,
+          "acct_ret_total": 13.887258407791471,
+          "pnl_total": 1752.3634492440144
+        },
+        "TSLA:put": {
+          "trades": 20,
+          "win_rate": 60.0,
+          "expectancy_pct": -14.482272394743353,
+          "acct_ret_total": -4.137792112783814,
+          "pnl_total": -1181.042791138706
+        }
+      },
+      "floor_ok": true,
+      "beats_baseline": false,
+      "half_check": {
+        "first": {
+          "base_acct": 36.80887031172867,
+          "pol_acct": 20.452495241617783,
+          "pol_win": 84.78260869565217,
+          "beats": false
+        },
+        "second": {
+          "base_acct": 28.690811184594786,
+          "pol_acct": 15.798698784395908,
+          "pol_win": 69.0909090909091,
+          "beats": false
+        }
+      },
+      "beats_in_both_halves": false
+    },
+    "prior_trend|prior-day UP|HALF-SIZE": {
+      "portfolio": {
+        "trades": 219,
+        "win_rate": 73.97260273972603,
+        "expectancy_pct": 20.93597125453262,
+        "acct_ret_total": 50.875437761168584,
+        "pnl_total": 36501.63028371871
+      },
+      "per_setup": {
+        "QCOM:call": {
+          "trades": 56,
+          "win_rate": 71.42857142857143,
+          "expectancy_pct": 20.96842786917652,
+          "acct_ret_total": 13.660885398741403,
+          "pnl_total": 4026.138018656378
+        },
+        "SPX:call": {
+          "trades": 60,
+          "win_rate": 80.0,
+          "expectancy_pct": 30.474582770706707,
+          "acct_ret_total": 21.037885087592223,
+          "pnl_total": 30503.407207384174
+        },
+        "SPY:call": {
+          "trades": 60,
+          "win_rate": 76.66666666666667,
+          "expectancy_pct": 25.247058380389145,
+          "acct_ret_total": 17.763797081205375,
+          "pnl_total": 2261.6775962888473
+        },
+        "TSLA:put": {
+          "trades": 43,
+          "win_rate": 65.11627906976744,
+          "expectancy_pct": 1.5685412791396687,
+          "acct_ret_total": -1.5871298063704387,
+          "pnl_total": -289.59253861065304
+        }
+      },
+      "floor_ok": true,
+      "beats_baseline": false,
+      "half_check": {
+        "first": {
+          "base_acct": 36.80887031172867,
+          "pol_acct": 28.63068277667323,
+          "pol_win": 78.70370370370371,
+          "beats": false
+        },
+        "second": {
+          "base_acct": 28.690811184594786,
+          "pol_acct": 22.24475498449535,
+          "pol_win": 69.36936936936937,
+          "beats": false
+        }
+      },
+      "beats_in_both_halves": false
+    }
+  },
+  "walkforward": {
+    "split_date": "2026-05-20",
+    "second_half_baseline": {
+      "trades": 111,
+      "win_rate": 69.36936936936937,
+      "expectancy_pct": 18.09330435064535,
+      "acct_ret_total": 28.690811184594786,
+      "pnl_total": 20351.207030492544
+    },
+    "vix_bucket": {
+      "picked_bucket": "VIX 20-30",
+      "first_half_exp": 16.402146674535857,
+      "first_half_n": 11,
+      "results": {
+        "SKIP": {
+          "portfolio": {
+            "trades": 100,
+            "win_rate": 67.0,
+            "expectancy_pct": 13.503134994752129,
+            "acct_ret_total": 19.290192849645898,
+            "pnl_total": 12784.440517571726
+          },
+          "beats": false,
+          "floor_ok": false
+        },
+        "HALF-SIZE": {
+          "portfolio": {
+            "trades": 111,
+            "win_rate": 69.36936936936937,
+            "expectancy_pct": 18.09330435064535,
+            "acct_ret_total": 23.990502017120345,
+            "pnl_total": 16567.82377403213
+          },
+          "beats": false,
+          "floor_ok": false
+        }
+      }
+    },
+    "gap_bucket": {
+      "picked_bucket": "gap up >1%",
+      "first_half_exp": -12.397026702083032,
+      "first_half_n": 11,
+      "results": {
+        "SKIP": {
+          "portfolio": {
+            "trades": 92,
+            "win_rate": 71.73913043478261,
+            "expectancy_pct": 23.68614480302184,
+            "acct_ret_total": 31.130361741114417,
+            "pnl_total": 21684.129428733435
+          },
+          "beats": true,
+          "floor_ok": true
+        },
+        "HALF-SIZE": {
+          "portfolio": {
+            "trades": 111,
+            "win_rate": 69.36936936936937,
+            "expectancy_pct": 18.09330435064535,
+            "acct_ret_total": 29.910586462854603,
+            "pnl_total": 21017.66822961299
+          },
+          "beats": true,
+          "floor_ok": false
+        }
+      }
+    },
+    "prior_trend": {
+      "picked_bucket": "prior-day UP",
+      "first_half_exp": 18.466875079157454,
+      "first_half_n": 62,
+      "results": {
+        "SKIP": {
+          "portfolio": {
+            "trades": 55,
+            "win_rate": 69.0909090909091,
+            "expectancy_pct": 20.107434816503883,
+            "acct_ret_total": 15.798698784395908,
+            "pnl_total": 15340.46104257525
+          },
+          "beats": false,
+          "floor_ok": false
+        },
+        "HALF-SIZE": {
+          "portfolio": {
+            "trades": 111,
+            "win_rate": 69.36936936936937,
+            "expectancy_pct": 18.09330435064535,
+            "acct_ret_total": 22.24475498449535,
+            "pnl_total": 17845.8340365339
+          },
+          "beats": false,
+          "floor_ok": false
+        }
+      }
+    }
+  },
+  "n_trades": 219
+}

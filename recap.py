@@ -83,21 +83,21 @@ def kelechi_tag(reason: str = "", banked_half: bool = False) -> str:
     strategy IS the Kelechi momentum read (spot the 15-min turn, ride the
     continuation, bank half, trail the flip), so a clean win earns the name."""
     if reason == "momentum flip" or banked_half:
-        return (" Classic Kelechi-style trade — caught the momentum turn, "
+        return (" Classic Kelechi-style trade: caught the momentum turn, "
                 "banked half into strength, and trailed the rest.")
-    return " Kelechi style — spotted the push early and rode the continuation."
+    return " Kelechi style: spotted the push early and rode the continuation."
 
 
 def position_story(p):
     """Grade a real tracked position. Returns (verdict, story)."""
     est_note = ""
     if p.entry_source == "estimate" or "estimat" in (p.last_mark_source or ""):
-        est_note = " (some prices were estimates from the stock move — your broker shows real fills)"
+        est_note = " (some prices were estimates from the stock move; your broker shows real fills)"
 
     if p.state != "closed" or p.final_pnl_pct is None:
         cur = p.last_mark_pct if p.last_mark_pct is not None else 0.0
         return (f"STILL OPEN ({cur:+.0f}% so far)",
-                "This one doesn't expire today — I'm still watching it and "
+                "This one doesn't expire today. I'm still watching it and "
                 "will text the exits as they come." + est_note)
 
     total = p.final_pnl_pct
@@ -108,31 +108,35 @@ def position_story(p):
     if reason == "stop":
         mins = _minutes_between(p.time_et, exit_t)
         if mins <= 30:
-            why = ("the move flipped against us almost right away — sometimes "
+            why = ("the move flipped against us almost right away. Sometimes "
                    "the first push is a fake-out")
         else:
-            why = ("the move ran out of gas and the option bled — an option "
+            why = ("the move ran out of gas and the option bled. An option "
                    "that goes nowhere loses value every minute (time decay)")
-        peaked = (f" It even peaked at {p.mfe_pct:+.0f}% first — a reminder "
+        peaked = (f" It even peaked at {p.mfe_pct:+.0f}% first, a reminder "
                   "the half-target matters."
                   if p.mfe_pct is not None and p.mfe_pct >= 10 else "")
         story = (f"It hit the {config.STOP_PCT:g}% stop at {_t(exit_t)}. "
-                 f"Why it failed: {why}. The stop did its job — it kept a bad "
+                 f"Why it failed: {why}. The stop did its job: it kept a bad "
                  f"trade small.{peaked}")
     elif reason in ("momentum flip", "runner give-back"):
         h = p.half_exit or {}
+        trigger = (f"once its gain dropped {config.RUNNER_GIVEBACK_PCT:g} "
+                   "points from its peak"
+                   if reason == "runner give-back" else
+                   "once the momentum flipped")
         story = (f"We banked HALF at {h.get('pct', 0):+.0f}% at "
                  f"{_t(h.get('time', exit_t))}, let the rest RUN, and sold the "
                  f"remainder at {(p.final_exit or {}).get('pct', 0):+.0f}% at "
-                 f"{_t(exit_t)} once it gave back from its peak. "
+                 f"{_t(exit_t)} {trigger}. "
                  f"Whole trade: {total:+.0f}%.")
     elif "expir" in reason:
         h_note = (f" (half was banked at {p.half_exit['pct']:+.0f}% earlier)"
                   if p.half_exit else "")
         story = (f"It ran into the closing bell and was closed at "
                  f"{total:+.0f}%{h_note}. That's why the bot warns "
-                 f"{config.EXPIRY_WARN_MINUTES} minutes before expiry — "
-                 "0DTE options don't get a tomorrow.")
+                 f"{config.EXPIRY_WARN_MINUTES} minutes before expiry: "
+                 "same-day (0DTE) options don't get a tomorrow.")
     else:
         story = f"Closed at {total:+.0f}% ({reason})."
     tag = kelechi_tag(reason, banked_half=bool(p.half_exit)) if total > 0 else ""
@@ -177,8 +181,8 @@ def grade_alert(rec, bars, daily_closes, bracket):
     if outcome == "target":
         verdict = "RIGHT ✅"
         story = (f"It hit the +{target:g}% profit target at {t_str}. "
-                 "Why it worked: the move kept going after we spotted it — "
-                 "that's exactly what this setup bets on." + kelechi_tag())
+                 "Why it worked: the move kept going after we spotted it. "
+                 "That's exactly what this setup bets on." + kelechi_tag())
     elif outcome == "stop":
         verdict = "WRONG ❌"
         minutes = int((outcome_time - alert_ts).total_seconds() / 60)
@@ -187,18 +191,18 @@ def grade_alert(rec, bars, daily_closes, bracket):
               ("the move ran out of gas, and an option that goes nowhere "
                "loses value every minute (that's called time decay).")
         story = (f"It dropped to the {stop:g}% stop at {t_str}. Why it failed: {why} "
-                 "The stop did its job — it kept a bad trade small.")
+                 "The stop did its job: it kept a bad trade small.")
     else:
         if final_ret is not None and final_ret > 0:
             verdict = "RIGHT ✅ (small win)"
             story = (f"Never hit the target, but ended the day up {final_ret:+.0f}%. "
-                     "The move was real, just slower than usual — Kelechi style, "
+                     "The move was real, just slower than usual. Kelechi style, "
                      "we still got paid.")
         else:
             verdict = "WRONG ❌ (slow loss)"
             story = (f"Never hit the stop, but bled to {final_ret:+.0f}% by the close. "
                      "The market went sideways and time decay ate the option. "
-                     + (f"(It actually peaked at +{best_ret:.0f}% during the day — "
+                     + (f"(It actually peaked at +{best_ret:.0f}% during the day, "
                         "a reminder of why taking profits fast matters.)"
                         if best_ret >= 5 else ""))
     return verdict, story
@@ -216,7 +220,7 @@ def market_story(spx_day):
         mood = "a DOWN day"
     else:
         mood = "a sideways, choppy day"
-    return (f"The S&P opened at {o:,.0f} and closed at {c:,.0f} ({move:+.1f}%) — {mood}. "
+    return (f"The S&P opened at {o:,.0f} and closed at {c:,.0f} ({move:+.1f}%), {mood}. "
             f"High of the day came at {hi_t} CT, low at {lo_t} CT.")
 
 
@@ -239,7 +243,7 @@ def main(require_date=None):
     day_name = pd.Timestamp(session).strftime("%A %#m/%#d") if sys.platform.startswith("win") \
         else pd.Timestamp(session).strftime("%A %-m/%-d")
 
-    lines = [f"📋 DAILY RECAP — {day_name}", ""]
+    lines = [f"📋 DAILY RECAP: {day_name}", ""]
     lines.append("THE MARKET TODAY: " + market_story(spx_day))
     lines.append("")
 
@@ -294,16 +298,16 @@ def main(require_date=None):
             why_quiet = ("the morning was moving DOWN, and the only setups that "
                          "pass our filter right now are call (up) setups")
         else:
-            why_quiet = ("no setup cleared the 70% win-rate bar during the "
-                         "morning window")
+            why_quiet = ("no setup cleared our quality bar (wins at least 70 "
+                         "of 100 in testing) during the morning window")
         lines.append(f"OUR TRADES TODAY: none. The bot stayed quiet because {why_quiet}. "
                      "No text = no trade. Sitting out is a position too.")
 
     lines.append("")
     lines.append(f"Tomorrow: same plan. Wait for the text, sell half at "
                  f"+{config.TP_HALF_PCT:g}%, let the rest run and sell when I say "
-                 f"it gave back from its peak, and honor the "
-                 f"{config.STOP_PCT:g}% stop.")
+                 f"its gain dropped {config.RUNNER_GIVEBACK_PCT:g} points from "
+                 f"its peak, and honor the {config.STOP_PCT:g}% stop.")
     msg = "\n".join(lines)
     if dry:
         print(msg)

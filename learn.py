@@ -100,6 +100,17 @@ def review_history(max_new: int = 25) -> int:
             if getattr(p, "state", "") == "closed"
             and getattr(p, "final_pnl_pct", None) is not None
             and p.id not in seen]
+    # brain paused (usage-limit countdown)? DEFER the whole batch to the next
+    # night instead of permanently writing cause='unknown' for every trade —
+    # once an id lands in trade_reviews.jsonl it is never re-reviewed.
+    if todo and assistant is not None:
+        try:
+            if assistant.cooldown_left_s() > 0:
+                print("learn: brain is in its usage-limit countdown; "
+                      f"deferring {len(todo)} trade reviews to tomorrow night")
+                return 0
+        except Exception:
+            pass
     done = 0
     for p in todo[:max_new]:
         verdict, story = recap.position_story(p)
@@ -114,8 +125,13 @@ def review_history(max_new: int = 25) -> int:
                  f"Story: {story}")
         if news:
             brief += "\nBreaking news the bot flagged that day:\n" + "\n".join(news)
-        parsed = None
+        parsed, brain_live = None, False
         if assistant is not None:
+            try:
+                brain_live = assistant.enabled()
+            except Exception:
+                brain_live = False
+        if brain_live:
             raw = assistant.complete(CAUSE_SYSTEM, brief, max_tokens=500)
             if raw:
                 try:
@@ -124,7 +140,19 @@ def review_history(max_new: int = 25) -> int:
                     parsed = json.loads(t[s:e + 1]) if s != -1 else None
                 except (json.JSONDecodeError, ValueError):
                     parsed = None
+            if parsed is None:
+                # the brain exists but this call failed: do NOT freeze this
+                # trade as cause='unknown' forever. Usage limit -> stop the
+                # batch; one-off hiccup -> retry this trade tomorrow night.
+                try:
+                    if assistant.cooldown_left_s() > 0:
+                        print("learn: usage limit mid-batch; deferring the rest")
+                        break
+                except Exception:
+                    pass
+                continue
         if parsed is None:
+            # no brain at all (no API key): keep the honest deterministic record
             parsed = {"why": story, "cause": "unknown", "cause_detail": "",
                       "lesson": ""}
         entry = {"id": p.id, "date": p.date, "ticker": p.ticker,
@@ -432,6 +460,19 @@ def run(require_date=None, dry=False):
         except Exception as e:
             print(f"learn: deep review skipped ({e})")
 
+    # grade today's sniper candidates (hits/misses at every target tier) so
+    # the forward ledger keeps earning real win rates for bigger targets
+    ledger_note = ""
+    if not dry:
+        try:
+            import forward_ledger
+            graded = forward_ledger.fill_outcomes()
+            ledger_note = forward_ledger.nightly_summary()
+            if graded:
+                print(f"learn: graded {graded} sniper candidate(s) forward")
+        except Exception as e:
+            print(f"learn: sniper forward grading skipped ({e})")
+
     record = grade_day(session)
     lesson = synthesize(record)
     entry = {
@@ -451,6 +492,8 @@ def run(require_date=None, dry=False):
         msg += (f"\n\n🔎 DEEP REVIEW: went back over {reviewed} past trade(s), "
                 "attributed the real cause (setup vs news vs macro), and folded "
                 "the lessons into my playbook.")
+    if ledger_note:
+        msg += "\n\n🎯 " + ledger_note
 
     if dry:
         print("----- would append to lessons.jsonl -----")
