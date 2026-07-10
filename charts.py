@@ -49,6 +49,33 @@ def available() -> bool:
     return _mpl() is not None
 
 
+def _stored_confirming(r: dict):
+    """The confirming FVG the read already computed — the exact gap whose
+    numbers the text card quoted. The chart must draw THESE, not a fresh
+    recompute on a different bar window. Returns the dict, or None when the
+    read carries no usable confirming FVG."""
+    conf = (r.get("fvg") or {}).get("confirming")
+    if not isinstance(conf, dict):
+        return None
+    need = ("time", "top", "bottom", "ce", "polarity", "label", "grade")
+    if any(conf.get(k) is None for k in need):
+        return None
+    return conf
+
+
+def _anchor_pos(index, time_str):
+    """Position in `index` of the bar stamped `time_str`, or None. tz-safe:
+    aware timestamps match by instant across zones; a naive/aware mismatch
+    (or any parse trouble) returns None instead of raising."""
+    try:
+        import numpy as np
+        import pandas as pd
+        pos = np.where(index == pd.Timestamp(time_str))[0]
+        return int(pos[0]) if len(pos) else None
+    except Exception:
+        return None
+
+
 def render_fvg(r: dict, bars=None):
     """TradingView-light FVG chart (see module docstring). Pass `bars` (OHLC
     DataFrame) to chart a specific series; otherwise downloads 5m bars for
@@ -97,7 +124,21 @@ def render_fvg(r: dict, bars=None):
                     pass
         if df is None or df.empty or not {"Open", "High", "Low", "Close"}.issubset(df.columns):
             return None, "no intraday candles to chart"
-        df = df.dropna(subset=["Open", "High", "Low", "Close"]).tail(64)
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        # The text card quoted the confirming FVG the read computed. Locate
+        # that gap's candle in these bars (by its timestamp) so the picture
+        # boxes the same gap the words describe.
+        stored = _stored_confirming(r)
+        anchor = _anchor_pos(df.index, stored["time"]) if stored else None
+        start = max(0, len(df) - 64)
+        if anchor is not None and anchor < start:
+            if len(df) - anchor <= 96:  # stretch to keep the gap candle in frame
+                start = max(0, anchor - 4)
+            else:
+                anchor = None  # formed too far back to chart
+        df = df.iloc[start:]
+        if anchor is not None:
+            anchor -= start
         if len(df) < 8:
             return None, "not enough candles to chart"
 
@@ -127,7 +168,18 @@ def render_fvg(r: dict, bars=None):
         bias = r.get("bias")
         fvgs = [f for f in fvg_mod.find_fvgs(df, atr, bias) if f["state"] != "filled"]
         fvgs.sort(key=lambda f: (f["score"], f["i"]), reverse=True)
-        conf = fvg_mod.confirming_fvg(df, direction, price, atr, bias)
+        if anchor is not None:
+            conf = dict(stored)  # the exact gap the text quoted
+            conf["i"] = anchor
+        elif "confirming" in rfvg:
+            # the read ran FVG detection: honor its verdict. Either it found
+            # no confirming gap, or its gap candle isn't in these bars; in
+            # both cases boxing a recomputed different gap would contradict
+            # the words. Tags below still use the stored/plan levels.
+            conf = None
+        else:
+            # no FVG info on the read (chart-only callers): recompute here
+            conf = fvg_mod.confirming_fvg(df, direction, price, atr, bias)
         tk = (conf or {}).get("ticket")
         hi_r, lo_r = float(np.max(h)), float(np.min(low))
         span = max(hi_r - lo_r, 1e-9)
@@ -191,8 +243,16 @@ def render_fvg(r: dict, bars=None):
         except Exception:
             pass
 
-        # FVG boxes (the bot's own edge), light tint + badge, CE dashed
-        for f in ([conf] if conf else []) + [f for f in fvgs if not (conf and f["i"] == conf["i"])][:2]:
+        # FVG boxes (the bot's own edge), light tint + badge, CE dashed.
+        # A context gap that IS the confirming one (same candle, or same
+        # edges under a duplicated timestamp) must not draw twice.
+        def _same_gap(f):
+            return conf is not None and (
+                f["i"] == conf["i"]
+                or (abs(f["top"] - conf["top"]) < 1e-9
+                    and abs(f["bottom"] - conf["bottom"]) < 1e-9))
+
+        for f in ([conf] if conf else []) + [f for f in fvgs if not _same_gap(f)][:2]:
             i = f["i"]
             if i >= n:
                 continue
@@ -322,8 +382,13 @@ def render_fvg(r: dict, bars=None):
                      color=_MUT, fontsize=9.5, ha="left", va="top")
 
         ax.set_xlim(-1.5, right + 0.5)
-        ymin = min(zone_lo, float(np.min(low)), sl_lvl or zone_lo, price)
-        ymax = max(zone_hi, float(np.max(h)), entry_lvl or zone_hi, price)
+        # the stored target can sit beyond this window's own range (it is the
+        # READ's dealing-range extreme); keep it in frame or the Target label
+        # floats outside the axes and the path arrow clips away
+        ymin = min(zone_lo, float(np.min(low)), sl_lvl or zone_lo, price,
+                   tp_lvl if tp_lvl is not None else zone_lo)
+        ymax = max(zone_hi, float(np.max(h)), entry_lvl or zone_hi, price,
+                   tp_lvl if tp_lvl is not None else zone_hi)
         pad = (ymax - ymin) * 0.05
         ax.set_ylim(ymin - pad, ymax + pad)
         step = max(1, n // 5)
