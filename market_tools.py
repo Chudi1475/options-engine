@@ -552,16 +552,11 @@ def _do_read(disp, yfs, dec, kind, source):
     # crypto precision depends on the live price (SHIB needs 8 dp, BTC needs 2)
     dec = _adaptive_dec(price, kind, dec)
 
-    mom15 = None
-    if have_5m:
-        c = m5["Close"].dropna()
-        if len(c) >= 4:  # 15 min = 3 bars back
-            mom15 = round((price / float(c.iloc[-4]) - 1) * 100, 2)
-
-    # recent session high/low for structure. Prefer the last ET day of 5m bars;
-    # fall back to the last DAILY bar when intraday is empty (market closed /
-    # weekend) so the level fields aren't null when someone chats after hours.
-    hi = lo = None
+    # bars from the last ET session only. Both the 15-min momentum and the
+    # session high/low must come from this slice: the m5 frame is a 2-day
+    # CONTINUOUS series, so early in a session a lookback of 3 bars lands on
+    # YESTERDAY's closes and the "momentum" is really the overnight gap —
+    # which flips the bias (and the plan direction) on any stock that gapped.
     day_bars = None
     if have_5m:
         try:
@@ -569,9 +564,23 @@ def _do_read(disp, yfs, dec, kind, source):
             day_bars = m5[[d == last_day for d in m5.index.date]]
         except Exception:
             day_bars = m5
-        if day_bars is not None and not day_bars.empty:
-            hi = _nan_none(day_bars["High"].max(), dec)
-            lo = _nan_none(day_bars["Low"].min(), dec)
+
+    # same 15-min momentum definition the live scanner trades (strategy.py).
+    # Fewer than 4 bars this session = momentum not readable yet -> None,
+    # which keeps the bias neutral (chop = wait) instead of reading the gap.
+    mom15 = None
+    if day_bars is not None and not day_bars.empty:
+        m15 = momentum_pct(day_bars.dropna(subset=["Close"]), _cfg)
+        if m15 is not None:
+            mom15 = round(m15, 2)
+
+    # recent session high/low for structure. Prefer the last ET day of 5m bars;
+    # fall back to the last DAILY bar when intraday is empty (market closed /
+    # weekend) so the level fields aren't null when someone chats after hours.
+    hi = lo = None
+    if day_bars is not None and not day_bars.empty:
+        hi = _nan_none(day_bars["High"].max(), dec)
+        lo = _nan_none(day_bars["Low"].min(), dec)
     if hi is None or lo is None:  # intraday gap -> use the last completed day
         try:
             hi = _nan_none(d1["High"].dropna().iloc[-1], dec)

@@ -263,6 +263,83 @@ check("ledger: tool path logs + uppercases ticker",
       '"SPX"' in tool_out and assistant.score("u1")["entries"] == 3)
 assistant.TRADES_FILE.unlink()
 
+# --- market_tools: 15-min momentum is session-scoped, never the overnight gap ---
+import pandas as pd
+
+import forward_ledger
+import market_tools as mt
+import risk_gate
+
+_orig_yf = mt.yf
+_orig_ev = risk_gate.upcoming_events
+_orig_rec = forward_ledger.record_candidate
+
+
+class _FakeYF:
+    """Stands in for yfinance: serves one daily and one 5m frame, offline."""
+    def __init__(self, d1, m5):
+        self.d1, self.m5 = d1, m5
+
+    def download(self, symbol, period=None, interval=None, **kw):
+        return self.d1 if interval == "1d" else self.m5
+
+
+def _daily(last=105.0, n=25):
+    idx = pd.date_range(end="2026-06-11", periods=n, freq="B")
+    close = [100.0] * (n - 1) + [last]
+    return pd.DataFrame({"Open": close, "High": [x + 1 for x in close],
+                         "Low": [x - 1 for x in close], "Close": close,
+                         "Volume": [0] * n}, index=idx)
+
+
+def _m5_frame(closes_yday, closes_today):
+    idx = (pd.date_range("2026-06-10 15:30", periods=len(closes_yday),
+                         freq="5min", tz=ET)
+           .append(pd.date_range("2026-06-11 09:30", periods=len(closes_today),
+                                 freq="5min", tz=ET)))
+    cl = list(closes_yday) + list(closes_today)
+    return pd.DataFrame({"Open": cl, "High": [x + 0.2 for x in cl],
+                         "Low": [x - 0.2 for x in cl], "Close": cl,
+                         "Volume": [0] * len(cl)}, index=idx)
+
+
+try:
+    risk_gate.upcoming_events = lambda *a, **k: []
+    forward_ledger.record_candidate = lambda *a, **k: None
+
+    # stock gapped up overnight, only 2 bars into today's session: a 3-bar
+    # lookback lands on yesterday, so the old read called the gap "+5%
+    # momentum" and flipped the bias. Session-scoped, momentum is simply not
+    # readable yet: None, and the bias stays neutral (chop = wait).
+    mt.yf = _FakeYF(_daily(), _m5_frame([100.0] * 6, [105.0, 105.0]))
+    r = mt._do_read("TSLA", "TSLA", 2, "stock", "test")
+    check("mom15: overnight gap not read as momentum",
+          r.get("momentum_15min_pct") is None,
+          f"got {r.get('momentum_15min_pct')}")
+    check("mom15: bias neutral right after a gap-up open",
+          r.get("bias") == "neutral", f"got {r.get('bias')}")
+
+    # enough bars today: momentum, high and low all come from TODAY only
+    mt.yf = _FakeYF(_daily(last=110.0),
+                    _m5_frame([100.0] * 6,
+                              [105.0, 106.0, 107.0, 108.0, 109.0, 110.0]))
+    r = mt._do_read("TSLA", "TSLA", 2, "stock", "test")
+    check("mom15: session-scoped value (110 vs 107 = +2.8%)",
+          r.get("momentum_15min_pct") is not None
+          and abs(r["momentum_15min_pct"] - 2.8) < 0.011,
+          f"got {r.get('momentum_15min_pct')}")
+    check("mom15: clean same-session push reads bullish",
+          str(r.get("bias")).startswith("bull"), f"got {r.get('bias')}")
+    check("mom15: session hi/lo from today's bars only",
+          r.get("recent_session_high") is not None
+          and abs(r["recent_session_high"] - 110.2) < 1e-9
+          and abs(r["recent_session_low"] - 104.8) < 1e-9,
+          f"got {r.get('recent_session_high')}/{r.get('recent_session_low')}")
+finally:
+    mt.yf = _orig_yf
+    risk_gate.upcoming_events = _orig_ev
+    forward_ledger.record_candidate = _orig_rec
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")
