@@ -473,6 +473,18 @@ def run(require_date=None, dry=False):
         except Exception as e:
             print(f"learn: sniper forward grading skipped ({e})")
 
+    # the coach: a second agent that reviews the WHOLE day (trades, sniper
+    # candidates, news, skips), reconstructs the perfect scenario for every
+    # imperfection, and feeds the lesson back into the brain's playbook.
+    # Runs AFTER the ledger grading so it sees today's graded outcomes.
+    coach_note = ""
+    if not dry:
+        try:
+            import coach
+            coach_note = coach.reflect(session).get("summary", "")
+        except Exception as e:
+            print(f"learn: coach session skipped ({e})")
+
     record = grade_day(session)
     lesson = synthesize(record)
     entry = {
@@ -494,6 +506,8 @@ def run(require_date=None, dry=False):
                 "the lessons into my playbook.")
     if ledger_note:
         msg += "\n\n🎯 " + ledger_note
+    if coach_note:
+        msg += "\n\n🧑‍🏫 COACH: " + coach_note
 
     if dry:
         print("----- would append to lessons.jsonl -----")

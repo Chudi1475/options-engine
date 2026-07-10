@@ -992,6 +992,10 @@ class Service:
             if gap is not None and gap >= config.GAP_UP_SKIP_PCT:
                 if getattr(self, "_gap_skip_told", None) != now.date():
                     self._gap_skip_told = now.date()
+                    try:  # on the record so the nightly coach can judge it
+                        config.state_set("gap_up_skip_date", f"{now.date()}")
+                    except Exception:
+                        pass
                     self.notify(
                         f"⏭️ Standing aside today: SPX opened {gap:+.1f}% "
                         "above yesterday's close. Big gap-up days lose money "
