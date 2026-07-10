@@ -31,7 +31,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import threading
 import time as time_mod
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import yfinance as yf
@@ -50,6 +50,7 @@ from positions import Position, PositionBook
 from strategy import Setup, StrategyConfig, detect_setup
 
 ET = ZoneInfo("America/New_York")
+CT = ZoneInfo("America/Chicago")  # display timezone ONLY — logic stays ET
 SESSION_END = time(16, 12)      # loop exits after settle + weekly are done
 MONITOR_START = time(9, 45)
 WEEKLY_AT = time(16, 5)
@@ -60,6 +61,21 @@ LEARN_END = time(23, 45)        # inside this window (kept before midnight ET so
 
 def et_now() -> datetime:
     return datetime.now(ET)
+
+
+def ct_wall(t: time) -> time:
+    """ET wall-clock time -> CT wall-clock time, DISPLAY ONLY (ET is always
+    CT+1, same DST switch dates). All internal logic stays on ET."""
+    return (datetime.combine(date(2000, 1, 3), t) - timedelta(hours=1)).time()
+
+
+def ct_hm(hms: str) -> str:
+    """Stored ET wall-clock 'HH:MM:SS' -> 'HH:MM' in CT, DISPLAY ONLY."""
+    try:
+        return (datetime.strptime(hms, "%H:%M:%S")
+                - timedelta(hours=1)).strftime("%H:%M")
+    except (TypeError, ValueError):
+        return (hms or "?")[:5]
 
 
 def learn_target(day) -> time:
@@ -301,7 +317,8 @@ class Service:
         if gap >= self.DOWNTIME_MIN and last.time() <= time(16, 0):
             self._hb_owner(
                 f"⚠️ Heartbeat: I was down ~{gap:.0f} min "
-                f"({last:%I:%M}–{now:%I:%M %p} ET) during market hours. "
+                f"({last.astimezone(CT):%I:%M}–{now.astimezone(CT):%I:%M %p} CT) "
+                "during market hours. "
                 "Back up now — check for any missed alerts.")
 
     def health_check(self, now: datetime):
@@ -339,7 +356,7 @@ class Service:
         if self._hb_warned_once("eod", today):
             return
         n = len(self.book.for_date(now.date()))
-        feed = (f"OK (last {self._last_feed_ok:%I:%M %p})"
+        feed = (f"OK (last {self._last_feed_ok.astimezone(CT):%I:%M %p} CT)"
                 if self._last_feed_ok else "NO DATA seen")
         warns = [k for k in (config.state_get("hb_warned", {}) or {}).get(today, [])
                  if k != "eod"]
@@ -358,11 +375,15 @@ class Service:
         open_n = sum(1 for p in self.book.positions if p.state != "closed")
         warns = [w for w in (config.state_get("hb_warned", {}) or {}).get(today, [])
                  if w != "eod"]
+        try:  # heartbeat ts is stored as an ET iso string — show it in CT
+            hb_disp = f"{datetime.fromisoformat(hb['ts']).astimezone(CT):%a %I:%M %p CT}"
+        except (KeyError, TypeError, ValueError):
+            hb_disp = "n/a"
         lines = [
             "🩺 BOT HEALTH",
-            f"Now: {now:%a %I:%M %p ET}",
-            f"Last heartbeat: {hb.get('ts', 'n/a')}",
-            (f"Feed last OK: {last_ok:%I:%M %p ET}" if last_ok
+            f"Now: {now.astimezone(CT):%a %I:%M %p CT}",
+            f"Last heartbeat: {hb_disp}",
+            (f"Feed last OK: {last_ok.astimezone(CT):%I:%M %p CT}" if last_ok
              else "Feed last OK: not yet this run"),
             f"Morning card today: "
             f"{'sent' if config.state_get('morning_sent') == today else 'NOT sent'}",
@@ -424,9 +445,10 @@ class Service:
         if (not self.dry and now.weekday() < 5 and now.time() > self.cfg.entry_start
                 and not self._hb_warned_once("late_open", str(today))):
             self._hb_owner(
-                f"⚠️ Heartbeat: morning card went out at {now:%I:%M %p} ET, after "
-                f"the {self.cfg.entry_start:%H:%M} entry window opened — I may have "
-                "missed early setups today.")
+                f"⚠️ Heartbeat: morning card went out at "
+                f"{now.astimezone(CT):%I:%M %p} CT, after the "
+                f"{ct_wall(self.cfg.entry_start):%H:%M} entry window opened — "
+                "I may have missed early setups today.")
 
     # ---------- telegram commands ----------
 
@@ -880,7 +902,7 @@ class Service:
             for p in open_pos:
                 pct = p.last_mark_pct if p.last_mark_pct is not None else 0.0
                 lines.append(f"  {cards.contract_str(p)}: {pct:+.1f}% "
-                             f"({p.state}, in since {p.time_et[:5]} ET)")
+                             f"({p.state}, in since {ct_hm(p.time_et)} CT)")
         else:
             lines.append("Open positions: none")
         return "\n".join(lines)
@@ -1363,7 +1385,8 @@ class Service:
         self.check_downtime_on_start(now)  # were we silently down mid-session?
         mode_src = "live alerts" if not self.dry else "dry-run"
         print(f"Scanner running ({mode_src}). Entry window "
-              f"{self.cfg.entry_start}-{self.cfg.entry_end} ET, polling every "
+              f"{ct_wall(self.cfg.entry_start):%H:%M}-"
+              f"{ct_wall(self.cfg.entry_end):%H:%M} CT, polling every "
               f"{config.POLL_SECONDS}s. Watchlist: {', '.join(self.cfg.watchlist)}. "
               f"Min win rate {config.MIN_WINRATE:.0f}%. Exits: half at "
               f"+{config.TP_HALF_PCT:g}%, give-back {config.RUNNER_GIVEBACK_PCT:g} "
@@ -1412,7 +1435,7 @@ class Service:
 
     def daemon(self):
         print("Daemon mode: running around the clock. Commands answered "
-              "any time; sessions run on trading days 9:31-16:12 ET.")
+              "any time; sessions run on trading days 8:31-15:12 CT.")
         while True:
             now = et_now()
             try:

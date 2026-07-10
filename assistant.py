@@ -190,7 +190,7 @@ Hard rules:
   a few sentences unless they ask for detail.
 - Chart screenshots: describe what you actually see (trend, levels,
   candles) and connect it to the bot's strategy: 15-minute momentum turns,
-  morning entry window 9:45-10:30 ET, sell half +25%, then let the runner run
+  morning entry window 8:45-9:30 AM CT, sell half +25%, then let the runner run
   and sell it when it gives back ~40 points from its peak, -70% stop.
 - Member commands: /setaccount /risk /status /score /calls /test /help.
   /calls [ticker] shows the live call/put setup per stock (BUY type, strike,
@@ -661,7 +661,7 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True,
     after the reply."""
     from datetime import datetime as _dt
     from zoneinfo import ZoneInfo as _zi
-    now_et = _dt.now(_zi("America/Chicago"))
+    now_ct = _dt.now(_zi("America/Chicago"))
     chat_id = item["chat_id"]
     who_line = ("This chat IS the owner (Chudi) himself."
                 if telegram.is_owner(chat_id)
@@ -672,7 +672,7 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True,
     else:
         req_line = ("This chat is NOT a trusted requester — chat normally, do "
                     "NOT log requests.")
-    context_text = (f"Right now it is {now_et:%A %Y-%m-%d %I:%M %p} ET.\n"
+    context_text = (f"Right now it is {now_ct:%A %Y-%m-%d %I:%M %p} CT.\n"
                     f"{who_line}\n{req_line}\n"
                     + context_text)
     blocks = []

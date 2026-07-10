@@ -23,6 +23,7 @@ from positions import PositionBook
 from strategy import StrategyConfig, detect_setup, momentum_pct
 
 ET = ZoneInfo("America/New_York")
+CT = ZoneInfo("America/Chicago")  # display timezone ONLY — logic stays ET
 _cfg = StrategyConfig()
 _feed = DataFeed()
 
@@ -186,8 +187,8 @@ def analyze_day(ticker="SPX", date_str=None):
         p = real[0]
         overview["result"] = {
             "actually_traded_live": True,
-            "time": datetime.strptime(p.time_et, "%H:%M:%S").strftime(
-                "%I:%M %p ET").lstrip("0"),
+            "time": (datetime.strptime(p.time_et, "%H:%M:%S")
+                     - timedelta(hours=1)).strftime("%I:%M %p CT").lstrip("0"),
             "direction": p.direction, "strike": p.strike,
             "entry_price": p.entry_mid, "entry_source": p.entry_source,
             "half_sold_at_pct": p.half_exit["pct"] if p.half_exit else None,
@@ -212,7 +213,7 @@ def analyze_day(ticker="SPX", date_str=None):
         s = detect_setup(ticker, upto, now, _cfg)
         if s and not any(f["direction"] == s.direction for f in formed):
             ok, stats = _gate_ok(ticker, s.direction)
-            formed.append({"time": now.strftime("%I:%M %p ET").lstrip("0"),
+            formed.append({"time": now.astimezone(CT).strftime("%I:%M %p CT").lstrip("0"),
                            "direction": s.direction, "strike": s.strike,
                            "mom_pct": round(s.mom_pct, 2), "passes_filter": ok,
                            "setup": s, "now": now,
@@ -220,7 +221,7 @@ def analyze_day(ticker="SPX", date_str=None):
 
     if not formed:
         overview["result"] = ("No setup triggered in the morning window "
-                              "(9:45-10:30 ET). The 15-min momentum never lined "
+                              "(8:45-9:30 AM CT). The 15-min momentum never lined "
                               "up the way the strategy needs, so the bot would "
                               "have stayed silent. No text = no trade.")
         return overview
@@ -270,7 +271,7 @@ def market_now(ticker="SPX"):
             r.setdefault("disclaimer", "")
             r["note_session"] = ("After-hours/pre-market read: thinner volume, "
                                  "wider spreads, RTH open can gap. No 0DTE "
-                                 "alerts fire outside 9:45-10:30 ET.")
+                                 "alerts fire outside 8:45-9:30 AM CT.")
             return r
     try:
         bars = _feed.today_bars(yfs, now)
@@ -282,7 +283,7 @@ def market_now(ticker="SPX"):
     o = float(bars["Open"].iloc[0])
     mom = momentum_pct(bars, _cfg)
     out = {
-        "ticker": ticker, "time": now.strftime("%I:%M %p ET").lstrip("0"),
+        "ticker": ticker, "time": now.astimezone(CT).strftime("%I:%M %p CT").lstrip("0"),
         "price": round(price or float(bars["Close"].iloc[-1]), 2),
         "day_open": round(o, 2),
         "move_from_open_pct": round(((price or float(bars["Close"].iloc[-1])) / o - 1) * 100, 2),
@@ -521,7 +522,10 @@ def _do_read(disp, yfs, dec, kind, source):
     if have_5m:
         try:
             last_ts = m5.index[-1].to_pydatetime()
-            asof = last_ts.strftime("%a %I:%M %p ET").replace(" 0", " ")
+            # display in CT (tz-aware -> convert; naive ET wall -> minus 1h)
+            asof_dt = (last_ts.astimezone(CT) if last_ts.tzinfo
+                       else last_ts - timedelta(hours=1))
+            asof = asof_dt.strftime("%a %I:%M %p CT").replace(" 0", " ")
             stale = (datetime.now(ET) - last_ts) > timedelta(minutes=90)
         except (AttributeError, ValueError, TypeError):
             stale = False  # can't tell -> don't falsely flag a live read

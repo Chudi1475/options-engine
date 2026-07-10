@@ -40,6 +40,7 @@ import yfinance as yf
 import config
 
 ET = ZoneInfo("America/New_York")
+CT = ZoneInfo("America/Chicago")  # display timezone ONLY — logic stays ET
 REPORTS_DIR = Path(__file__).parent / "reports"
 EVENT_FILE = Path(__file__).parent / "data" / "event_days.txt"
 CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
@@ -121,13 +122,13 @@ def calendar_check(today: date):
             continue
         impact = (ev.get("impact") or "").lower()
         title = ev.get("title", "scheduled release")
-        when = datetime.fromisoformat(ev["date"]).astimezone(ET).strftime("%I:%M %p").lstrip("0")
+        when = datetime.fromisoformat(ev["date"]).astimezone(CT).strftime("%I:%M %p").lstrip("0")
         if impact == "high" and RED_EVENTS.search(title):
             mode = _worse(mode, "red")
-            reasons.append(f"{title} at {when} ET (major release)")
+            reasons.append(f"{title} at {when} CT (major release)")
         elif impact == "high":
             mode = _worse(mode, "yellow")
-            reasons.append(f"{title} at {when} ET")
+            reasons.append(f"{title} at {when} CT")
     return mode, reasons
 
 
@@ -165,7 +166,7 @@ def upcoming_events(currencies, within_hours: int = 24, high_only: bool = True):
         if high_only and impact != "high":
             continue
         out.append({
-            "when": when.strftime("%a %I:%M %p ET").replace(" 0", " "),
+            "when": when.astimezone(CT).strftime("%a %I:%M %p CT").replace(" 0", " "),
             "title": ev.get("title", "scheduled release"),
             "currency": ev.get("country"),
             "impact": impact,

@@ -35,6 +35,7 @@ from scoreboard import load_report
 from strategy import StrategyConfig
 
 ET = ZoneInfo("America/New_York")
+CT = ZoneInfo("America/Chicago")  # display timezone ONLY — logic stays ET
 ALERTS_FILE = config.ALERTS_JSONL
 
 
@@ -66,7 +67,7 @@ def pct(a, b):
 
 
 def _t(hms: str) -> str:
-    """'10:42:15' -> '10:42 AM ET'"""
+    """ET wall clock '10:42:15' -> '9:42 AM CT' (display only)"""
     return (datetime.strptime(hms, "%H:%M:%S") - timedelta(hours=1)).strftime("%I:%M %p CT").lstrip("0")
 
 
@@ -172,7 +173,7 @@ def grade_alert(rec, bars, daily_closes, bracket):
             outcome, outcome_time, final_ret = "target", ts, target
             break
 
-    t_str = outcome_time.strftime("%I:%M %p ET").lstrip("0")
+    t_str = outcome_time.tz_convert(CT).strftime("%I:%M %p CT").lstrip("0")
     if outcome == "target":
         verdict = "RIGHT ✅"
         story = (f"It hit the +{target:g}% profit target at {t_str}. "
@@ -206,8 +207,8 @@ def grade_alert(rec, bars, daily_closes, bracket):
 def market_story(spx_day):
     o = float(spx_day["Open"].iloc[0])
     c = float(spx_day["Close"].iloc[-1])
-    hi_t = spx_day["High"].idxmax().strftime("%I:%M %p").lstrip("0")
-    lo_t = spx_day["Low"].idxmin().strftime("%I:%M %p").lstrip("0")
+    hi_t = spx_day["High"].idxmax().tz_convert(CT).strftime("%I:%M %p").lstrip("0")
+    lo_t = spx_day["Low"].idxmin().tz_convert(CT).strftime("%I:%M %p").lstrip("0")
     move = pct(c, o)
     if move > 0.3:
         mood = "an UP day"
@@ -216,7 +217,7 @@ def market_story(spx_day):
     else:
         mood = "a sideways, choppy day"
     return (f"The S&P opened at {o:,.0f} and closed at {c:,.0f} ({move:+.1f}%) — {mood}. "
-            f"High of the day came at {hi_t} ET, low at {lo_t} ET.")
+            f"High of the day came at {hi_t} CT, low at {lo_t} CT.")
 
 
 def main(require_date=None):
@@ -249,11 +250,11 @@ def main(require_date=None):
         lines.append("OUR ALERTS TODAY:")
         for p in pos_today:
             verdict, story = position_story(p)
-            t = datetime.strptime(p.time_et, "%H:%M:%S").strftime("%I:%M %p").lstrip("0")
+            t = _t(p.time_et)
             lines.append("")
             tag = "[PAPER] " if p.paper else ""
             head = (f"{tag}{p.ticker} {p.strike:g} {p.direction.upper()} "
-                    f"(texted {t} ET): ")
+                    f"(texted {t}): ")
             head += verdict if verdict.startswith("STILL") else f"WE WERE {verdict}"
             lines.append(head)
             lines.append(story)
@@ -277,10 +278,11 @@ def main(require_date=None):
             verdict, story = grade_alert(rec, bars, daily_cache[yfs], bracket)
             if verdict is None:
                 continue
-            t = pd.Timestamp(f"{rec['date']} {rec['time']}").strftime("%I:%M %p").lstrip("0")
+            t = (pd.Timestamp(f"{rec['date']} {rec['time']}")
+                 - pd.Timedelta(hours=1)).strftime("%I:%M %p").lstrip("0")
             lines.append("")
             lines.append(f"{rec['ticker']} {rec['strike']:g} "
-                         f"{rec['direction'].upper()} (texted {t} ET): "
+                         f"{rec['direction'].upper()} (texted {t} CT): "
                          f"WE WERE {verdict}")
             lines.append(story)
 

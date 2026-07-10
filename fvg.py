@@ -310,9 +310,10 @@ def sniper_check(bars, direction, price, atr, conf, yf_symbol, now_et):
                                f"{_SNIPER_MAX_GAP_ATR:g} ATR cap")
 
         if now_et is None or not hasattr(now_et, "hour"):
-            reasons.append("no ET clock")
+            reasons.append("no session clock")
         elif now_et.hour < _SNIPER_MIN_HOUR_ET:
-            reasons.append(f"before {_SNIPER_MIN_HOUR_ET:02d}:00 ET")
+            # gate stays 07:00 ET internally; the user-facing label is CT
+            reasons.append(f"before {_SNIPER_MIN_HOUR_ET - 1}:00 AM CT")
 
         # today's session only: bars may span days when intraday fell back
         db = bars

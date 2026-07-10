@@ -57,7 +57,7 @@ def option_line(ticker: str, mn: dict, expiry=None) -> str:
     pstr = f"${price:g}" if price is not None else "?"
     if not setup:
         if not mn.get("in_entry_window"):
-            return f"{disp}  no setup yet (entry window is 9:45-10:30 ET, {pstr})"
+            return f"{disp}  no setup yet (entry window is 8:45-9:30 AM CT, {pstr})"
         mom = mn.get("momentum_15min_pct")
         mtxt = f"{mom:+.2f}%" if mom is not None else "n/a"
         return f"{disp}  no live setup ({pstr}, 15m momentum {mtxt})"
@@ -409,7 +409,7 @@ def stop_card(pos, ev: dict) -> str:
 def expiry_card(pos, ev: dict) -> str:
     return "\n".join([
         f"{_paper(pos)}⏰ CLOSE BEFORE EXPIRY",
-        f"{contract_str(pos)} expires TODAY at 4 PM ET and is still open "
+        f"{contract_str(pos)} expires TODAY at 3 PM CT and is still open "
         f"(now {ev['pct']:+.0f}%, {ev['source']}).",
         f"Close it in the next {config.EXPIRY_WARN_MINUTES} minutes. "
         "0DTE options can go to $0 at the bell.",
@@ -419,7 +419,7 @@ def expiry_card(pos, ev: dict) -> str:
 
 def morning_card(mode: str, reason: str, today: date) -> str:
     effects = {
-        "green": "Standard rules. Entry window 9:45-10:30 ET; "
+        "green": "Standard rules. Entry window 8:45-9:30 AM CT; "
                  "I'll watch every position until the close.",
         "yellow": "Setups still fire, with a warning banner — consider smaller size.",
         "red": "HIGH-RISK DAY — consider sitting out. Any alert today is HALF size.",
