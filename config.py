@@ -39,10 +39,17 @@ def _f(name: str, default: float) -> float:
 
 # ---------------------------- CONFIG ----------------------------
 TP_HALF_PCT = _f("TP_HALF_PCT", 25.0)        # sell HALF when option is +25% over entry mid
-STOP_PCT = _f("STOP_PCT", -70.0)             # sell EVERYTHING at -70% (half already
-                                             # banked at +25%; backtest: wider stop =
-                                             # fewer noise stop-outs -> 72% win rate,
-                                             # higher total return, lower drawdown)
+STOP_PCT = _f("STOP_PCT", -90.0)             # sell EVERYTHING at -90%. Walk-forward
+                                             # validated (bt_exp_stop_walkforward):
+                                             # -90 beat the old -70 on BOTH win rate
+                                             # and expectancy in BOTH halves
+                                             # (76.8% vs 73.2% win overall) and kept
+                                             # the second half above the 70% floor.
+                                             # Tradeoff, on record: deeper paper
+                                             # drawdown per trade, and risk-based
+                                             # sizing shrinks positions ~7/9, so
+                                             # account compounding is slightly
+                                             # slower. Win rate is the priority.
 RUNNER_GIVEBACK_PCT = _f("RUNNER_GIVEBACK_PCT", 40.0)  # after banking half at +25%,
                                              # let the runner RUN; sell it only when
                                              # it gives back this many points from its

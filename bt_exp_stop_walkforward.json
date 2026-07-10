@@ -1,0 +1,158 @@
+{
+  "experiment": "stop-level walk-forward (half +25 / give-back 40 fixed; stop in {-70,-80,-90})",
+  "generated": "2026-07-10T06:29:48",
+  "verdict": "adopt -90",
+  "why": "stop -90 beat -70 on both win rate and expectancy in BOTH halves (overall 76.8% / +21.8%/tr vs 73.2% / +19.6%/tr)",
+  "rule": "a candidate beats the live -70 only if it improves BOTH win rate AND expectancy in BOTH halves (same bar as the gap-up rule); anything mixed = keep -70",
+  "exit_params_fixed": {
+    "half": 25,
+    "giveback": 40
+  },
+  "live_stop": -70,
+  "candidates": [
+    -80,
+    -90
+  ],
+  "allow_list": [
+    "SPX:call",
+    "SPY:call",
+    "QCOM:call",
+    "TSLA:put"
+  ],
+  "window": {
+    "first_session": "2026-04-14",
+    "last_session": "2026-07-09",
+    "split_at": "2026-05-27",
+    "sessions_total": 60,
+    "sessions_first_half": 30,
+    "sessions_second_half": 30
+  },
+  "pricing": "approximated (Black-Scholes, realized vol) \u2014 optimistic; trust relative moves",
+  "sizing_note": "total_pnl/max_drawdown = fixed 2 contracts (backtester standard); acct_ret_pct_per_trade_sizing_fair = expectancy% x RISK_PER_TRADE_PCT / |stop| (live risk-based sizing)",
+  "results_by_stop": {
+    "-70": {
+      "overall": {
+        "trades": 220,
+        "win_rate": 73.18181818181819,
+        "avg_win_pct": 54.09683397393591,
+        "avg_loss_pct": -74.64026615897913,
+        "expectancy_pct": 19.57188439283599,
+        "total_pnl": 41539.19632088093,
+        "max_drawdown": -4092.352498628403,
+        "start": "04/14/2026",
+        "end": "07/09/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.2795983484690856
+      },
+      "first_half": {
+        "trades": 110,
+        "win_rate": 77.27272727272727,
+        "avg_win_pct": 53.45562020314779,
+        "avg_loss_pct": -76.53850608173124,
+        "expectancy_pct": 23.911500592947995,
+        "total_pnl": 24940.674579084,
+        "max_drawdown": -3708.0109629535673,
+        "start": "04/14/2026",
+        "end": "05/26/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.3415928656135428
+      },
+      "second_half": {
+        "trades": 110,
+        "win_rate": 69.0909090909091,
+        "avg_win_pct": 54.81398095442271,
+        "avg_loss_pct": -73.24450150989671,
+        "expectancy_pct": 15.232268192723966,
+        "total_pnl": 16598.521741796925,
+        "max_drawdown": -4092.3524986284015,
+        "start": "05/27/2026",
+        "end": "07/09/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.2176038313246281
+      }
+    },
+    "-80": {
+      "overall": {
+        "trades": 220,
+        "win_rate": 74.54545454545455,
+        "avg_win_pct": 56.095207436807314,
+        "avg_loss_pct": -81.73945276345663,
+        "expectancy_pct": 21.01002120401288,
+        "total_pnl": 42667.49382571164,
+        "max_drawdown": -4446.321428173353,
+        "start": "04/14/2026",
+        "end": "07/09/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.262625265050161
+      },
+      "first_half": {
+        "trades": 110,
+        "win_rate": 79.0909090909091,
+        "avg_win_pct": 57.491188532899685,
+        "avg_loss_pct": -82.91983876116953,
+        "expectancy_pct": 28.13251918959428,
+        "total_pnl": 28677.57448993742,
+        "max_drawdown": -4000.0781624101037,
+        "start": "04/14/2026",
+        "end": "05/26/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.3516564898699285
+      },
+      "second_half": {
+        "trades": 110,
+        "win_rate": 70.0,
+        "avg_win_pct": 54.51793009446925,
+        "avg_loss_pct": -80.91675949232341,
+        "expectancy_pct": 13.88752321843145,
+        "total_pnl": 13989.91933577418,
+        "max_drawdown": -4446.321428173351,
+        "start": "05/27/2026",
+        "end": "07/09/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.17359404023039313
+      }
+    },
+    "-90": {
+      "overall": {
+        "trades": 220,
+        "win_rate": 76.81818181818181,
+        "avg_win_pct": 55.20991054546261,
+        "avg_loss_pct": -88.9998345026018,
+        "expectancy_pct": 21.779469647956784,
+        "total_pnl": 44833.33022627329,
+        "max_drawdown": -5092.061625459446,
+        "start": "04/14/2026",
+        "end": "07/09/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.24199410719951983
+      },
+      "first_half": {
+        "trades": 110,
+        "win_rate": 80.0,
+        "avg_win_pct": 57.10583721421738,
+        "avg_loss_pct": -89.34682707603379,
+        "expectancy_pct": 27.81530435616713,
+        "total_pnl": 29128.990211812554,
+        "max_drawdown": -4431.790118819156,
+        "start": "04/14/2026",
+        "end": "05/26/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.30905893729074585
+      },
+      "second_half": {
+        "trades": 110,
+        "win_rate": 73.63636363636363,
+        "avg_win_pct": 53.15013836212415,
+        "avg_loss_pct": -88.73659875723962,
+        "expectancy_pct": 15.743634939746428,
+        "total_pnl": 15704.340014460708,
+        "max_drawdown": -5092.061625459446,
+        "start": "05/27/2026",
+        "end": "07/09/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.17492927710829365
+      }
+    }
+  },
+  "both_halves_pass": {
+    "-80": false,
+    "-90": true
+  },
+  "caveats": [
+    "~60 trading days of 5m data total, so each half is only ~6 weeks; small per-half samples make single trades move win rate several points",
+    "approximated Black-Scholes 0DTE pricing (optimistic) \u2014 trust relative ranking between stops, not the dollar levels",
+    "total_pnl/max_drawdown use the backtester's standard fixed 2 contracts; LIVE sizing is risk-based, so a wider stop trades a smaller position \u2014 see acct_ret_pct_per_trade_sizing_fair for the sizing-fair comparison",
+    "a deeper stop means deeper per-trade drawdown before exit even when the summary stats improve"
+  ]
+}

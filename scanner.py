@@ -1243,6 +1243,11 @@ class Service:
                 print(f"{et_now():%H:%M:%S} sniper watch error (continuing): {e}")
             self._sniper_stop.wait(self.SNIPER_WATCH_SECONDS)
 
+    # resolve() speaks human names, not raw Yahoo symbols; map the verified
+    # sniper universe onto the names it understands
+    SNIPER_READS = {"EURUSD=X": "eurusd", "JPY=X": "usdjpy",
+                    "^GSPC": "spx", "TSLA": "tsla", "SPY": "spy"}
+
     def _scan_snipers_once(self, now: datetime):
         import fvg as fvg_mod
         import market_tools
@@ -1253,7 +1258,7 @@ class Service:
             if key in alerted:
                 continue
             try:
-                r = market_tools.read_any(yfs)
+                r = market_tools.read_any(self.SNIPER_READS.get(yfs, yfs))
             except Exception:
                 continue
             if not isinstance(r, dict) or r.get("conviction") != "high":
