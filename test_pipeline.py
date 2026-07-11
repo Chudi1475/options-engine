@@ -340,6 +340,61 @@ finally:
     risk_gate.upcoming_events = _orig_ev
     forward_ledger.record_candidate = _orig_rec
 
+# --- telegram splitting: a long reply must arrive in parts, not vanish ---
+# Telegram rejects >4096-char messages with HTTP 400; send_to used to post
+# the whole text in one call, so a long deep answer was silently dropped.
+import telegram
+
+short = "short reply"
+check("tg split: short text untouched", telegram.split_message(short) == [short])
+
+paras = [f"para {i} " + "x" * 500 for i in range(20)]
+long_text = "\n\n".join(paras)
+parts = telegram.split_message(long_text)
+check("tg split: long text becomes several parts", len(parts) > 1)
+check("tg split: every part fits the limit",
+      all(0 < len(p) <= telegram.TG_MAX_CHARS for p in parts),
+      f"part lengths {[len(p) for p in parts]}")
+check("tg split: cuts land on paragraph boundaries",
+      all(p.startswith("para ") for p in parts),
+      f"starts {[p[:8] for p in parts]}")
+check("tg split: no content lost",
+      "".join(long_text.split()) == "".join(" ".join(parts).split()))
+
+prose = "This is a sentence about the trade. " * 300  # no newlines anywhere
+sparts = telegram.split_message(prose)
+check("tg split: sentence-boundary cuts keep the period",
+      len(sparts) > 1 and all(p.endswith(".") for p in sparts),
+      f"tails {[p[-10:] for p in sparts]}")
+
+blob = "y" * 9001  # one unbroken run: hard cut is the only option
+bparts = telegram.split_message(blob)
+check("tg split: unbroken run is hard-cut, nothing dropped",
+      all(len(p) <= telegram.TG_MAX_CHARS for p in bparts)
+      and "".join(bparts) == blob)
+
+_orig_send_one = telegram._send_one
+sent = []
+telegram._send_one = lambda cid, t: sent.append((cid, t)) or None
+try:
+    err = telegram.send_to("123", long_text)
+finally:
+    telegram._send_one = _orig_send_one
+check("tg send_to: long reply goes out in order with no error",
+      err is None and [t for _, t in sent] == parts)
+
+calls = []
+def _fail_second(cid, t):
+    calls.append(t)
+    return "400 boom" if len(calls) == 2 else None
+telegram._send_one = _fail_second
+try:
+    err = telegram.send_to("123", long_text)
+finally:
+    telegram._send_one = _orig_send_one
+check("tg send_to: a part's send error is reported, later parts skipped",
+      err == "400 boom" and len(calls) == 2)
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")

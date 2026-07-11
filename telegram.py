@@ -62,8 +62,50 @@ def primary_owner_id():
     return owners[0] if owners else None
 
 
+# Telegram rejects sendMessage texts over 4096 chars with HTTP 400, so a
+# long reply used to vanish whole. Split a hair below that limit — Telegram
+# counts some characters (emoji, non-BMP) as more than Python's len does.
+TG_MAX_CHARS = 4000
+
+
+def split_message(text: str, limit: int = TG_MAX_CHARS) -> list:
+    """Break a long text into send-sized parts on the most natural boundary
+    available: paragraph, then line, then sentence, then word. A single
+    unbroken run longer than the limit is hard-cut. Short texts come back
+    as [text] untouched."""
+    if len(text) <= limit:
+        return [text]
+    parts, rest = [], text
+    while len(rest) > limit:
+        window = rest[:limit]
+        head_end = rest_start = limit  # fallback: hard cut mid-run
+        for sep in ("\n\n", "\n", ". ", " "):
+            i = window.rfind(sep)
+            if i >= limit // 2:  # a boundary isn't worth a half-empty part
+                head_end = i + (1 if sep == ". " else 0)  # keep the period
+                rest_start = i + len(sep)
+                break
+        head, rest = rest[:head_end].rstrip(), rest[rest_start:].lstrip()
+        if head:
+            parts.append(head)
+    rest = rest.rstrip()
+    if rest:
+        parts.append(rest)
+    return parts
+
+
 def send_to(chat_id, text: str):
-    """Send to one chat. Returns an error string or None."""
+    """Send to one chat, splitting texts over Telegram's length limit into
+    several sequential messages. Returns an error string or None."""
+    for part in split_message(text):
+        err = _send_one(chat_id, part)
+        if err:
+            return err
+    return None
+
+
+def _send_one(chat_id, text: str):
+    """Send one already-fitting message. Returns an error string or None."""
     try:
         r = _session.post(
             f"https://api.telegram.org/bot{_token()}/sendMessage",
