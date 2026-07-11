@@ -263,6 +263,84 @@ check("ledger: tool path logs + uppercases ticker",
       '"SPX"' in tool_out and assistant.score("u1")["entries"] == 3)
 assistant.TRADES_FILE.unlink()
 
+# --- chat brain: a computed deep answer must survive to the user ---
+# respond() used to run at max_tokens=1200 (starving the always-on thinking of
+# the Fable 5 brain), could burn all 5 rounds on tool calls, and threw away an
+# already-computed ask_deep answer whenever the relay pass died or came back
+# blank, deflecting with "came back empty".
+assistant.HISTORY_FILE = config.DATA_DIR / "chat_history_test.json"
+if assistant.HISTORY_FILE.exists():
+    assistant.HISTORY_FILE.unlink()
+_orig_post = assistant._post_anthropic
+_orig_deep = assistant.deep_think
+_msg = {"chat_id": "u9", "kind": "text", "text": "why did SPX rip today?"}
+
+
+def _scripted(responses):
+    """Fake _post_anthropic: pops scripted (body, err) pairs, records payloads."""
+    seen = []
+
+    def fake(payload, timeout):
+        seen.append(payload)
+        return responses.pop(0)
+    return fake, seen
+
+
+def _tooluse(name, args, tid="t1"):
+    return ({"stop_reason": "tool_use",
+             "content": [{"type": "tool_use", "id": tid, "name": name,
+                          "input": args}]}, None)
+
+
+def _text(t):
+    return ({"stop_reason": "end_turn",
+             "content": [{"type": "text", "text": t}]}, None)
+
+
+try:
+    assistant.deep_think = lambda q, context="": "THE DEEP ANSWER"
+
+    # relay call errors AFTER ask_deep already answered: hand the answer over
+    assistant._post_anthropic, seen = _scripted(
+        [_tooluse("ask_deep", {"question": "why"}), (None, "529 overloaded")])
+    r = assistant.respond(_msg, "ctx")
+    check("brain: deep answer survives a dead relay call",
+          r == "THE DEEP ANSWER", f"got {r!r}")
+    check("brain: thinking headroom (max_tokens >= 4000)",
+          all(p["max_tokens"] >= 4000 for p in seen),
+          f"got {[p['max_tokens'] for p in seen]}")
+
+    # relay call comes back blank: same fallback
+    assistant._post_anthropic, seen = _scripted(
+        [_tooluse("ask_deep", {"question": "why"}), _text("")])
+    r = assistant.respond(_msg, "ctx")
+    check("brain: deep answer survives a blank relay",
+          r == "THE DEEP ANSWER", f"got {r!r}")
+
+    # model keeps calling tools every round: the final pass must force text
+    responses = [_tooluse("get_score", {}, tid=f"t{i}") for i in range(5)]
+    responses.append(_text("final words"))
+    assistant._post_anthropic, seen = _scripted(responses)
+    r = assistant.respond(_msg, "ctx")
+    check("brain: exhausted tool loop still ends in text",
+          r == "final words", f"got {r!r}")
+    check("brain: last pass forces text via tool_choice none",
+          seen[-1].get("tool_choice") == {"type": "none"}
+          and all("tool_choice" not in p for p in seen[:-1]),
+          f"got {seen[-1].get('tool_choice')}")
+
+    # nothing computed and a blank reply: the honest deflection remains
+    assistant._post_anthropic, seen = _scripted([_text("")])
+    r = assistant.respond(_msg, "ctx")
+    check("brain: blank with no deep answer still deflects honestly",
+          "came back empty" in r, f"got {r!r}")
+finally:
+    assistant._post_anthropic = _orig_post
+    assistant.deep_think = _orig_deep
+    if assistant.HISTORY_FILE.exists():
+        assistant.HISTORY_FILE.unlink()
+    assistant.HISTORY_FILE = config.DATA_DIR / "chat_history.json"
+
 # --- market_tools: 15-min momentum is session-scoped, never the overnight gap ---
 import pandas as pd
 

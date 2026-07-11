@@ -818,10 +818,14 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True,
     history = _load_history().get(chat_id, [])
     messages = history + [{"role": "user", "content": blocks}]
     reply = ""
-    for _ in range(5):  # room for tool calls (data lookups, scorekeeping)
+    deep_answer = ""  # raw ask_deep result, kept so a dead relay can't eat it
+    force_text = False
+    for round_no in range(6):  # 5 tool rounds + a guaranteed text finish
         # system is split so the big fixed prefix gets prompt-cached: replies
         # come back faster and cost a fraction after the first message.
-        payload = {"model": model(), "max_tokens": 1200,
+        # max_tokens covers thinking + text combined (thinking is always on
+        # for the Fable 5 brain), so 1200 starved real answers.
+        payload = {"model": model(), "max_tokens": 6000,
                    "system": [
                        {"type": "text", "text": SYSTEM,
                         "cache_control": {"type": "ephemeral"}},
@@ -832,22 +836,39 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True,
                        os.environ.get("BOT_BRAIN_EFFORT", "high").strip()},
                    "messages": messages}
         if tools_enabled:
+            # tools stay in the payload even on the forced-text pass: the
+            # tool_use/tool_result blocks already in messages require them.
             payload["tools"] = TOOLS
+            if force_text:
+                payload["tool_choice"] = {"type": "none"}
         body, err = _post_anthropic(payload, timeout=120)
         if body is None:
+            if deep_answer:  # the deep brain already answered; hand it over
+                reply = deep_answer
+                break
             return f"My brain is unavailable right now: {err}"
         content = body.get("content", [])
         if body.get("stop_reason") == "tool_use":
             messages.append({"role": "assistant", "content": content})
-            results = [{"type": "tool_result", "tool_use_id": b["id"],
-                        "content": _run_tool(b["name"], b.get("input", {}),
-                                             chat_id, attachments)}
-                       for b in content if b.get("type") == "tool_use"]
+            results = []
+            for b in content:
+                if b.get("type") != "tool_use":
+                    continue
+                out = _run_tool(b["name"], b.get("input", {}), chat_id,
+                                attachments)
+                if b["name"] == "ask_deep" and out:
+                    deep_answer = out
+                results.append({"type": "tool_result", "tool_use_id": b["id"],
+                                "content": out})
             messages.append({"role": "user", "content": results})
+            force_text = round_no >= 4  # last pass must produce text
             continue
         reply = "".join(b.get("text", "") for b in content
                         if b.get("type") == "text").strip()
         break
+    if not reply:
+        # the relay pass came back blank; a computed deep answer beats a shrug
+        reply = deep_answer
     if not reply:
         return "I read it but came back empty — try rephrasing?"
     # history stores text only (never base64 blobs)
