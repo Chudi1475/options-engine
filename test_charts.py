@@ -205,6 +205,35 @@ check("validator rejects non-dict",
 check("validator survives fvg=None",
       charts._stored_confirming({"fvg": None}) is None)
 
+# 11) right-axis tag de-collision (_spread): clustered levels get pushed
+# apart, isolated levels stay put, order survives, edges clamp
+ty = charts._spread([100.0, 100.02, 100.04], [1.0, 1.0, 2.0], 90.0, 110.0)
+check("clustered tags separate",
+      ty[1] - ty[0] >= 1.0 * 1.12 - 1e-9 and ty[2] - ty[1] >= 1.5 * 1.12 - 1e-9,
+      f"ty={ty}")
+check("cluster keeps price order", ty[0] < ty[1] < ty[2], f"ty={ty}")
+check("lowest tag of a cluster is not moved", ty[0] == 100.0, f"ty={ty}")
+ty = charts._spread([100.0, 105.0], [1.0, 1.0], 90.0, 110.0)
+check("tags with room stay at their level", ty == [100.0, 105.0], f"ty={ty}")
+ty = charts._spread([109.9, 109.95], [1.0, 1.0], 90.0, 110.0)
+check("stack pulled back inside the top edge",
+      max(ty) + 0.5 <= 110.0 + 1e-9 and ty[1] - ty[0] >= 1.12 - 1e-9, f"ty={ty}")
+ty = charts._spread([90.05], [2.0], 90.0, 110.0)
+check("lone tag lifted off the bottom edge", ty[0] - 1.0 >= 90.0 - 1e-9,
+      f"ty={ty}")
+ty = charts._spread([100.04, 100.0], [1.0, 1.0], 90.0, 110.0)
+check("unsorted input keeps per-index mapping", ty[0] > ty[1], f"ty={ty}")
+check("no tags is fine", charts._spread([], [], 0.0, 1.0) == [])
+
+# 12) end-to-end: a read whose entry/SL hug the live price (the CE-tap
+# case that used to stack three unreadable boxes) still renders
+bars = make_bars(90)
+px = float(bars["Close"].iloc[-1])
+r = make_r(stored=None)
+r["plan"].update(entry=round(px - 0.01, 2), stop=round(px - 0.03, 2))
+png, why = render(r, bars, boom)
+check("clustered entry/SL/price read renders", png is not None, str(why))
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")

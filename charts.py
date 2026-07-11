@@ -76,6 +76,38 @@ def _anchor_pos(index, time_str):
         return None
 
 
+def _spread(ys, hs, lo, hi, pad=1.12):
+    """De-collide the right-axis price tags. ys are the true level prices,
+    hs the box heights (same units). Returns one tag-center y per level:
+    order preserved, neighbors at least their two half-heights (plus a
+    little breathing room) apart, the stack nudged back inside [lo, hi]
+    when a shove pushed it past an edge. A tag with room around it stays
+    exactly at its level."""
+    order = sorted(range(len(ys)), key=lambda k: float(ys[k]))
+    ty = [float(v) for v in ys]
+
+    def need(a, b):
+        return (hs[a] + hs[b]) / 2.0 * pad
+
+    for a, b in zip(order, order[1:]):  # shove upward where boxes touch
+        if ty[b] - ty[a] < need(a, b):
+            ty[b] = ty[a] + need(a, b)
+    if order:
+        top = order[-1]
+        over = (ty[top] + hs[top] / 2.0) - hi
+        if over > 0:  # poked out the top: pull back and shove downward
+            ty[top] -= over
+            for b, a in zip(order[::-1], order[::-1][1:]):
+                if ty[b] - ty[a] < need(a, b):
+                    ty[a] = ty[b] - need(a, b)
+        bot = order[0]
+        under = lo - (ty[bot] - hs[bot] / 2.0)
+        if under > 0:  # slid out the bottom: lift the whole stack as one
+            for k in order:
+                ty[k] += under
+    return ty
+
+
 def render_fvg(r: dict, bars=None):
     """TradingView-light FVG chart (see module docstring). Pass `bars` (OHLC
     DataFrame) to chart a specific series; otherwise downloads 5m bars for
@@ -294,21 +326,20 @@ def render_fvg(r: dict, bars=None):
         except Exception:
             pass
 
-        # red alert lines + red right-axis tags (entry/CE and SL), like the app
+        # red alert lines (entry/CE and SL), like the app. The right-axis
+        # price boxes are only QUEUED here: on a live setup entry, SL and
+        # the current price routinely sit within a fraction of a percent
+        # of each other, so the boxes are drawn after the y-window is
+        # final and _spread has pushed any that touch apart.
+        tag_q = []
+
         def red_tag(y, two_line=None, dotted=False):
             if y is None:
                 return
             ax.plot([0, right], [y, y], color=_RED,
                     linewidth=1.2 if dotted else 2.2,
                     linestyle=(0, (2, 3)) if dotted else "-", zorder=6)
-            txt = two_line if two_line else fmt(y)
-            ax.annotate(txt, xy=(right, y), xytext=(8, 0),
-                        textcoords="offset points", va="center", ha="left",
-                        fontsize=9, fontweight="bold", color="#ffffff",
-                        linespacing=1.3,
-                        bbox=dict(boxstyle="round,pad=0.32", facecolor=_RED,
-                                  edgecolor="none"),
-                        annotation_clip=False, zorder=9)
+            tag_q.append((float(y), two_line if two_line else fmt(y)))
 
         if sniper:
             entry_lvl, sl_lvl, tp_lvl = stk["entry"], stk["stop"], stk["target"]
@@ -398,6 +429,25 @@ def render_fvg(r: dict, bars=None):
                  f"{now_et:%a %b %d %I:%M %p CT}  ·  ~15m delayed, your call",
                  color=_MUT, fontsize=7, ha="right", va="bottom")
         fig.subplots_adjust(top=0.885, bottom=0.055, left=0.03, right=0.87)
+
+        # draw the queued right-axis price tags, de-collided. The alert
+        # line stays at the true price; only the box slides, offset in
+        # points from its anchor so it still hugs the right edge.
+        fs, lsp, bpad = 9, 1.3, 0.32  # tag font metrics, mirrored below
+        y0, y1 = ax.get_ylim()
+        ax_pt = fig.get_figheight() * ax.get_position().height * 72.0
+        per = max(y1 - y0, 1e-9) / max(ax_pt, 1e-9)  # data units per point
+        hts = [(fs * lsp * (t.count("\n") + 1) + 2 * bpad * fs) * per
+               for _, t in tag_q]
+        for (y, txt), ty in zip(tag_q, _spread([y for y, _ in tag_q], hts,
+                                               y0, y1)):
+            ax.annotate(txt, xy=(right, y), xytext=(8, (ty - y) / per),
+                        textcoords="offset points", va="center", ha="left",
+                        fontsize=fs, fontweight="bold", color="#ffffff",
+                        linespacing=lsp,
+                        bbox=dict(boxstyle=f"round,pad={bpad}", facecolor=_RED,
+                                  edgecolor="none"),
+                        annotation_clip=False, zorder=9)
 
         buf = io.BytesIO()
         fig.savefig(buf, format="png", facecolor=fig.get_facecolor(),
