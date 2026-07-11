@@ -634,6 +634,96 @@ finally:
             f.unlink()
     learn.LESSONS_LOG, learn.LESSONS_DIGEST = _orig_llog, _orig_ldig
 
+# --- learn brief: the reviewer sees what it already learned ---
+# _day_brief carried only today's market and calls, so the nightly model
+# re-derived lessons from scratch, restated ones it already had, and could
+# never notice a repeated mistake. The brief now opens with the digest
+# playbook plus the last few nightly reads and an explicit do-not-repeat
+# instruction, before today's session.
+learn.LESSONS_LOG = config.DATA_DIR / "lessons_test.jsonl"
+learn.LESSONS_DIGEST = config.DATA_DIR / "lessons_digest_test.md"
+
+
+def _lread(day, review):
+    e = _lentry(day, ["lesson " + day])
+    e["review"] = review
+    return e
+
+
+def _quiet_record(day):
+    return {"session": day, "day_name": "Thu 6/11", "market": "",
+            "trades": [], "wins": 0, "losses": 0}
+
+
+try:
+    for f in (learn.LESSONS_LOG, learn.LESSONS_DIGEST):
+        if f.exists():
+            f.unlink()
+
+    brief = learn._day_brief(_quiet_record("2026-06-11"))
+    check("brief: first night has no playbook block",
+          brief.startswith("Session:") and "ALREADY LEARNED" not in brief,
+          f"got {brief[:80]!r}")
+
+    # an empty digest placeholder must not fabricate a playbook
+    learn.LESSONS_DIGEST.write_text("header\n\n- (none yet)\n", encoding="utf-8")
+    brief = learn._day_brief(_quiet_record("2026-06-11"))
+    check("brief: '(none yet)' digest adds no block",
+          "ALREADY LEARNED" not in brief)
+
+    learn._append_lesson(_lread("2026-06-01", "read one"))
+    learn._append_lesson(_lread("2026-06-02", "read two"))
+    learn._append_lesson(_lread("2026-06-02", "read two rerun"))  # same session
+    learn._append_lesson(_lread("2026-06-03",
+                                "deep review SPX 2026-06-03: cause note"))
+    learn._append_lesson(_lread("2026-06-04", "read four " + "y" * 300))
+    learn._append_lesson(_lread("2026-06-05", "read five"))
+    learn._append_lesson(_lread("2026-06-11", "tonight's own earlier read"))
+    learn._rebuild_digest()
+    brief = learn._day_brief(_quiet_record("2026-06-11"))
+    check("brief: playbook and nightly reads lead the brief",
+          brief.index("WHAT I ALREADY LEARNED") <
+          brief.index("MY LAST FEW NIGHTLY READS") < brief.index("Session:"),
+          f"got {brief[:120]!r}")
+    check("brief: digest bullets included",
+          f"- ({_tag('2026-06-05')}) lesson 2026-06-05" in brief)
+    reads = [ln for ln in brief.splitlines() if ln.startswith("- 2026-")]
+    check("brief: last 3 sessions newest first, one per session",
+          [r[:12] for r in reads] == ["- 2026-06-05", "- 2026-06-04",
+                                      "- 2026-06-02"], f"got {reads}")
+    check("brief: rerun keeps the newest read for its session",
+          any("read two rerun" in r for r in reads), f"got {reads}")
+    check("brief: deep-review rows and tonight's own read stay out",
+          "cause note" not in brief and "tonight's own" not in brief)
+    check("brief: long reads truncate",
+          all(len(r) <= 260 for r in reads),
+          f"longest {max(len(r) for r in reads)}")
+    check("brief: do-not-repeat instruction present before today",
+          "Do not repeat a lesson" in brief.split("Session:")[0])
+
+    # today's calls still render after the block on a trade day
+    trade_rec = {
+        "session": "2026-06-11", "day_name": "Thu 6/11", "market": "chopped",
+        "wins": 1, "losses": 0,
+        "trades": [{"ticker": "SPX", "direction": "call", "strike": 7300.0,
+                    "texted": "09:50:00", "verdict": "RIGHT", "story": "ran",
+                    "won": True, "closed": True,
+                    "features": {"mom_pct": 0.2, "win_rate_quoted": 72.0,
+                                 "risk_mode": "green", "entry_source": "quote"},
+                    "outcome": {"final_pnl_pct": 40.0, "mfe_pct": 55.0,
+                                "mae_pct": -5.0, "exit_reason": "trail",
+                                "banked_half": True}}]}
+    brief = learn._day_brief(trade_rec)
+    check("brief: trade day keeps block plus calls",
+          "WHAT I ALREADY LEARNED" in brief and "SPX 7300 CALL" in brief
+          and brief.index("ALREADY LEARNED") < brief.index("SPX 7300"),
+          f"got {brief[-200:]!r}")
+finally:
+    for f in (learn.LESSONS_LOG, learn.LESSONS_DIGEST):
+        if f.exists():
+            f.unlink()
+    learn.LESSONS_LOG, learn.LESSONS_DIGEST = _orig_llog, _orig_ldig
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")

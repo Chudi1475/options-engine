@@ -280,9 +280,56 @@ to a specific string ONLY if a real trade-rule or threshold change is warranted
 null."""
 
 
+def _prior_learning_block(session: str) -> list:
+    """Lines reminding the reviewer what it already learned, so it builds on
+    prior lessons instead of re-deriving them from scratch every night, and
+    can flag when today confirms or violates one. The playbook bullets come
+    from the digest (already deduped and capped by _rebuild_digest); the
+    nightly reads come from lessons.jsonl, newest first, one per session."""
+    lines = []
+    try:
+        if LESSONS_DIGEST.exists():
+            bullets = [ln.strip() for ln in
+                       LESSONS_DIGEST.read_text(encoding="utf-8-sig").splitlines()
+                       if ln.strip().startswith("- ")]
+            bullets = [b for b in bullets if b != "- (none yet)"]
+            if bullets:
+                lines.append("WHAT I ALREADY LEARNED (my playbook, newest first):")
+                lines += bullets
+    except OSError:
+        pass
+    reads, seen_days = [], set()
+    for entry in reversed(_all_lessons()):
+        review = (entry.get("review") or "").strip()
+        day = entry.get("session", "")
+        # skip tonight's own session (a re-run would echo itself) and the
+        # per-trade deep-review rows, which are cause notes, not nightly reads
+        if (not review or not day or day == session or day in seen_days
+                or review.startswith("deep review ")):
+            continue
+        seen_days.add(day)
+        reads.append(f"- {day}: {review[:240]}")
+        if len(reads) == 3:
+            break
+    if reads:
+        lines.append("MY LAST FEW NIGHTLY READS:")
+        lines += reads
+    if lines:
+        lines.append("Do not repeat a lesson already in the playbook above, "
+                     "only add genuinely new ones. If today confirms or "
+                     "violates one of those lessons, name it in your review "
+                     "instead of restating it.")
+    return lines
+
+
 def _day_brief(record) -> str:
-    """Compact text the reviewer model reasons over."""
-    lines = [f"Session: {record['day_name']} ({record['session']})"]
+    """Compact text the reviewer model reasons over: what it already learned
+    first, so tonight's lessons build on prior ones instead of repeating them,
+    then today's session."""
+    lines = _prior_learning_block(record["session"])
+    if lines:
+        lines.append("")
+    lines.append(f"Session: {record['day_name']} ({record['session']})")
     if record["market"]:
         lines.append(f"Market: {record['market']}")
     if not record["trades"]:
