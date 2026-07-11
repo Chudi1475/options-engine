@@ -327,6 +327,21 @@ class Service:
         config.state_update("hb_warned", upd, default={})
         return False
 
+    def _warn_conflict(self, description: str):
+        """Telegram answered getUpdates with 409 Conflict: another process is
+        polling the same bot token, so commands are being split between the
+        two instances and alerts can go out twice. This used to be swallowed
+        as an empty poll; now the owner hears about it, once per day."""
+        if self._hb_warned_once("tg_conflict", str(et_now().date())):
+            return
+        print(f"telegram getUpdates conflict: {description}")
+        self._hb_owner(
+            "⚠️ Heartbeat: Telegram reports another copy of this bot is "
+            "polling with the same token (409 Conflict). Two running "
+            "instances split commands between them and can send every alert "
+            "twice. Check for a stray instance: an old deploy still up, or a "
+            "local run alongside the cloud one. Telegram said: " + description)
+
     def health_stamp(self, now: datetime):
         """Throttled 'I'm alive' stamp to state.json (~once a minute)."""
         t = time_mod.monotonic()
@@ -495,6 +510,9 @@ class Service:
             items, max_id = telegram.get_messages(timeout=timeout)
         except RuntimeError:
             return
+        conflict = telegram.poll_conflict()
+        if conflict:
+            self._warn_conflict(conflict)
         for item in items:
             try:
                 reply = self.handle_item(item)

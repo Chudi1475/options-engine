@@ -254,18 +254,41 @@ def _parse_update(upd: dict, authorized: set):
     return None
 
 
+# Telegram allows exactly ONE getUpdates consumer per bot token. A second
+# process polling the same token (an old deploy still up, a local run next to
+# the cloud daemon) makes Telegram answer 409 Conflict, and the two instances
+# then split commands between them and can both fire alerts. That 409 used to
+# be indistinguishable from a quiet chat (the body has no "result", so it
+# parsed as zero updates). get_messages() records it here; the scanner reads
+# it via poll_conflict() and warns the owner.
+_conflict = None  # Telegram's 409 description from the last poll, or None
+
+
+def poll_conflict():
+    """The 409 Conflict description seen on the most recent getUpdates poll,
+    or None if that poll was clean. Reading clears it."""
+    global _conflict
+    c, _conflict = _conflict, None
+    return c
+
+
 def get_messages(timeout: int = 0):
     """Poll for new messages of every kind. Returns (items, max_id) from
     authorized chats only. The caller persists max_id (via ack_offset)
     AFTER processing, so a crash mid-message replays it instead of losing
     it — replay is the safe direction here."""
+    global _conflict
     offset = int(config.state_get("tg_offset", 0))
     try:
         r = _session.get(
             f"https://api.telegram.org/bot{_token()}/getUpdates",
             params={"offset": offset + 1, "timeout": timeout},
             timeout=timeout + 10)
-        updates = r.json().get("result", [])
+        body = r.json()
+        if r.status_code == 409 or body.get("error_code") == 409:
+            _conflict = body.get("description") or "409 Conflict on getUpdates"
+            return [], offset
+        updates = body.get("result", [])
     except (requests.RequestException, ValueError):
         return [], offset
     out, authorized, max_id = [], set(chat_ids()), offset

@@ -824,6 +824,108 @@ finally:
     learn.LESSONS_LOG, learn.LESSONS_DIGEST = _orig_llog, _orig_ldig
     learn.et_now = _orig_et_now
 
+# --- telegram 409 conflict: a second bot instance must not be invisible ---
+# Two processes polling the same token make Telegram answer 409 Conflict.
+# That body has no "result", so it used to parse as a quiet chat and the
+# owner never learned commands were being split (and alerts possibly
+# doubled). get_messages now records the conflict, and handle_commands DMs
+# the owner about it once per day.
+import os
+
+from scanner import Service
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status_code = status
+        self._body = body
+
+    def json(self):
+        return self._body
+
+
+class _Sess:
+    def __init__(self):
+        self.resp = None
+
+    def get(self, *a, **k):
+        if isinstance(self.resp, Exception):
+            raise self.resp
+        return self.resp
+
+
+_CONFLICT_BODY = {"ok": False, "error_code": 409,
+                  "description": "Conflict: terminated by other getUpdates "
+                                 "request; make sure that only one bot "
+                                 "instance is running"}
+_orig_tg_session = telegram._session
+_orig_tg_token = telegram._token
+_orig_tg_send_to = telegram.send_to
+_orig_state_file = config.STATE_FILE
+_orig_env = {k: os.environ.get(k) for k in ("TELEGRAM_CHAT_IDS", "OWNER_CHAT_ID")}
+sess = _Sess()
+dm = []
+try:
+    telegram._session = sess
+    telegram._token = lambda: "TEST"
+    config.STATE_FILE = config.DATA_DIR / "state_conflict_test.json"
+    if config.STATE_FILE.exists():
+        config.STATE_FILE.unlink()
+    os.environ["TELEGRAM_CHAT_IDS"] = "111"
+    os.environ["OWNER_CHAT_ID"] = "111"
+
+    # a 409 poll yields no items but raises the flag
+    sess.resp = _Resp(409, _CONFLICT_BODY)
+    items, max_id = telegram.get_messages()
+    check("409: poll returns no items and keeps the offset",
+          items == [] and max_id == 0)
+    c = telegram.poll_conflict()
+    check("409: conflict recorded with Telegram's description",
+          c is not None and "one bot instance" in c, f"got {c!r}")
+    check("409: reading the conflict clears it",
+          telegram.poll_conflict() is None)
+
+    # a clean poll parses normally and leaves no flag
+    sess.resp = _Resp(200, {"ok": True, "result": [
+        {"update_id": 7, "message": {"chat": {"id": 111}, "text": "/status"}}]})
+    items, max_id = telegram.get_messages()
+    check("409: clean poll still parses messages",
+          len(items) == 1 and items[0]["kind"] == "command" and max_id == 7)
+    check("409: clean poll leaves no conflict flag",
+          telegram.poll_conflict() is None)
+
+    # a network error stays a quiet empty poll, not a conflict
+    import requests as _rq
+    sess.resp = _rq.RequestException("boom")
+    items, _ = telegram.get_messages()
+    check("409: network error returns empty and flags nothing",
+          items == [] and telegram.poll_conflict() is None)
+
+    # end to end: handle_commands warns the owner once per day, not per poll
+    svc = Service.__new__(Service)
+    svc.dry = False
+    telegram.send_to = lambda cid, text: dm.append((str(cid), text)) or None
+    sess.resp = _Resp(409, _CONFLICT_BODY)
+    svc.handle_commands()
+    check("409: owner warned about the second instance",
+          len(dm) == 1 and dm[0][0] == "111"
+          and "another copy" in dm[0][1] and "409" in dm[0][1],
+          f"got {dm!r}")
+    svc.handle_commands()
+    check("409: same-day repeat polls do not re-warn", len(dm) == 1)
+finally:
+    telegram._session = _orig_tg_session
+    telegram._token = _orig_tg_token
+    telegram.send_to = _orig_tg_send_to
+    if config.STATE_FILE.exists():
+        config.STATE_FILE.unlink()
+    config.STATE_FILE = _orig_state_file
+    for k, v in _orig_env.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")
