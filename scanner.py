@@ -89,6 +89,22 @@ def learn_target(day) -> time:
     return time(m // 60, m % 60)
 
 
+def learn_session_due(now: datetime) -> date:
+    """The session whose nightly self-review is due at this tick: today once
+    the random 21:00-23:45 window opens on a weekday, otherwise the most
+    recent prior weekday. Weekend ticks and post-outage restarts therefore
+    point back at the session that may have been missed instead of forgetting
+    it; catch-up is bounded to that single most recent session, so a long
+    outage can never backfill a week of owner DMs."""
+    d = now.date()
+    if d.weekday() < 5 and now.time() >= learn_target(d):
+        return d
+    d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
 def keep_awake(on: bool):
     """Stop the PC from sleeping mid-session (Windows only; no-op anywhere
     else, so this stays cloud-safe). Released when the session ends."""
@@ -1523,32 +1539,45 @@ class Service:
         fired from the daemon outer loop (the only loop alive at night). It
         grades the day's own calls, writes lessons the brain then reads on every
         reply, and texts the OWNER a 'what I learned' digest. Self-guards to
-        once per weekday; never in dry mode. Weekends have no new trades, so it
-        skips them, same as recap/weekly."""
-        if self.dry or now.weekday() >= 5 or now.time() < learn_target(now.date()):
+        once per session; never in dry mode. A review missed while the bot was
+        down across the whole window (redeploy, crash loop, a Friday outage
+        rolling into the weekend) is caught up on a later tick, recap/weekly
+        style, but only the single most recent session, and only when there is
+        evidence the bot actually ran that day (tracked positions, or that
+        day's recap went out), so an outage day is never graded as if the bot
+        had deliberately stayed out."""
+        if self.dry:
             return
-        today = str(now.date())
-        if config.state_get("learn_sent") == today:
+        key = str(learn_session_due(now))
+        if config.state_get("learn_sent") == key:
+            return
+        if key != str(now.date()) and not self.book.for_date(key) \
+                and config.state_get("recap_sent") != key:
+            # catch-up with no sign the bot was up that day: grading it would
+            # invent a "stayed out, being picky" story about an outage.
+            config.state_set("learn_sent", key)
+            print(f"{now:%H:%M:%S} learn: {key} review was missed and left no "
+                  "positions or recap; skipping catch-up")
             return
         try:
             import learn
-            errs = learn.run(require_date=today)
+            errs = learn.run(require_date=key)
             if errs == "STALE":
-                print(f"{now:%H:%M:%S} learn: data not caught up to {today}; will retry")
+                print(f"{now:%H:%M:%S} learn: data not caught up to {key}; will retry")
                 return
             if not errs:
-                config.state_set("learn_sent", today)
+                config.state_set("learn_sent", key)
                 return
             # delivery errors: bounded retries, then mark done so a permanently
             # unreachable owner can't re-run the review every 45s all night.
             tries = config.state_get("learn_tries", {})
-            n = (tries.get(today, 0) if isinstance(tries, dict) else 0) + 1
+            n = (tries.get(key, 0) if isinstance(tries, dict) else 0) + 1
             if n >= 2:
-                config.state_set("learn_sent", today)
+                config.state_set("learn_sent", key)
                 print(f"{now:%H:%M:%S} learn had delivery errors after {n} tries; "
                       f"marking done: {errs}")
             else:
-                config.state_set("learn_tries", {today: n})
+                config.state_set("learn_tries", {key: n})
                 print(f"{now:%H:%M:%S} learn send had errors, will retry once: {errs}")
         except Exception as e:
             print(f"{now:%H:%M:%S} learn failed (will retry): {e}")
@@ -1670,7 +1699,9 @@ class Service:
                 self.health_eod(now)    # close ping even if a restart ended the
                                         # session early (self-guards once/day)
                 self.maybe_learn(now)   # nightly self-review at a random late
-                                        # evening time (self-guards once/day)
+                                        # evening time (self-guards once per
+                                        # session; catches up the most recent
+                                        # missed session after an outage)
                 self.handle_commands(timeout=45)  # long-poll, responsive + cheap
             except Exception as e:
                 print(f"daemon error (continuing): {e}")

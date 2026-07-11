@@ -1055,6 +1055,107 @@ rep = scoreboard.weekly_report(wbook, None, None, TODAY)
 check("weekly: no finished shadow means no verdict at all",
       "winner" not in rep and "OLD exit rules" not in rep, f"got {rep!r}")
 
+# --- learn catch-up: a review missed during an outage is no longer lost ---
+# maybe_learn only ever considered now.date(), so a bot down across the whole
+# 21:00-23:45 window (a Friday-night redeploy rolling into the weekend, a
+# crash loop) lost that session's review forever while recap and weekly both
+# catch up. It now targets the most recent completed weekday session, catches
+# up at most that one session, and only when positions or that day's recap
+# prove the bot actually ran, so an outage day is never graded as a clean
+# stay-out. 2026-06-11 is a Thursday, 6/12 Friday, 6/13-14 the weekend.
+
+check("catchup: weekday past the window reviews today",
+      scannermod.learn_session_due(datetime(2026, 6, 11, 23, 50, tzinfo=ET))
+      == date(2026, 6, 11))
+check("catchup: weekday before the window points at yesterday",
+      scannermod.learn_session_due(datetime(2026, 6, 11, 20, 0, tzinfo=ET))
+      == date(2026, 6, 10))
+check("catchup: Saturday points at Friday",
+      scannermod.learn_session_due(datetime(2026, 6, 13, 9, 0, tzinfo=ET))
+      == date(2026, 6, 12))
+check("catchup: Monday pre-open still points at Friday",
+      scannermod.learn_session_due(datetime(2026, 6, 15, 6, 0, tzinfo=ET))
+      == date(2026, 6, 12))
+check("catchup: Monday past the window reviews Monday",
+      scannermod.learn_session_due(datetime(2026, 6, 15, 23, 50, tzinfo=ET))
+      == date(2026, 6, 15))
+
+_orig_learn_run = learn.run
+_orig_state_file2 = config.STATE_FILE
+lruns = []
+try:
+    config.STATE_FILE = config.DATA_DIR / "state_learn_test.json"
+    if config.STATE_FILE.exists():
+        config.STATE_FILE.unlink()
+    learn.run = lambda require_date=None, dry=False: lruns.append(require_date) or []
+
+    lbook = PositionBook.__new__(PositionBook)  # never touches positions.json
+    lbook.positions = []
+    svc = Service.__new__(Service)
+    svc.dry = False
+    svc.book = lbook
+
+    # the normal same-night path is unchanged: fires once, dedups after
+    svc.maybe_learn(datetime(2026, 6, 11, 23, 50, tzinfo=ET))
+    check("catchup: same night still runs tonight's review",
+          lruns == ["2026-06-11"]
+          and config.state_get("learn_sent") == "2026-06-11")
+    svc.maybe_learn(datetime(2026, 6, 11, 23, 55, tzinfo=ET))
+    check("catchup: once-per-session dedup holds", lruns == ["2026-06-11"])
+
+    # bot down across Friday's whole window, back Saturday: Friday tracked a
+    # position, so the weekend tick backfills that review instead of losing it
+    fri = mk_pos()
+    fri.date = "2026-06-12"
+    lbook.positions = [fri]
+    svc.maybe_learn(datetime(2026, 6, 13, 9, 0, tzinfo=ET))
+    check("catchup: weekend tick backfills the missed Friday review",
+          lruns == ["2026-06-11", "2026-06-12"]
+          and config.state_get("learn_sent") == "2026-06-12")
+    svc.maybe_learn(datetime(2026, 6, 14, 9, 0, tzinfo=ET))
+    check("catchup: Sunday does not run it again", len(lruns) == 2)
+    svc.maybe_learn(datetime(2026, 6, 15, 20, 0, tzinfo=ET))
+    check("catchup: pre-window Monday tick never fires early", len(lruns) == 2)
+
+    # outage day with no positions and no recap: marked handled, never graded
+    lbook.positions = []
+    config.state_set("learn_sent", "2026-06-11")
+    svc.maybe_learn(datetime(2026, 6, 13, 9, 0, tzinfo=ET))
+    check("catchup: a day with no evidence the bot ran is skipped, not graded",
+          len(lruns) == 2 and config.state_get("learn_sent") == "2026-06-12")
+
+    # but a recorded Friday recap proves the bot was alive at the close, so a
+    # quiet (zero-position) Friday still gets its review
+    config.state_set("learn_sent", "2026-06-11")
+    config.state_set("recap_sent", "2026-06-12")
+    svc.maybe_learn(datetime(2026, 6, 13, 9, 0, tzinfo=ET))
+    check("catchup: a quiet day with a recorded recap still gets its review",
+          lruns == ["2026-06-11", "2026-06-12", "2026-06-12"])
+
+    # delivery errors on a catch-up: bounded retries keyed by the session
+    learn.run = lambda require_date=None, dry=False: ["send failed"]
+    config.state_set("learn_sent", "2026-06-11")
+    config.state_set("learn_tries", {})
+    svc.maybe_learn(datetime(2026, 6, 13, 9, 30, tzinfo=ET))
+    check("catchup: first delivery error stays retryable, keyed by session",
+          config.state_get("learn_sent") == "2026-06-11"
+          and config.state_get("learn_tries") == {"2026-06-12": 1})
+    svc.maybe_learn(datetime(2026, 6, 13, 9, 31, tzinfo=ET))
+    check("catchup: second delivery error marks it done, no all-night retries",
+          config.state_get("learn_sent") == "2026-06-12")
+
+    # dry mode never reviews and never touches state
+    svc.dry = True
+    config.state_set("learn_sent", "2026-06-11")
+    svc.maybe_learn(datetime(2026, 6, 13, 10, 0, tzinfo=ET))
+    check("catchup: dry mode never runs or marks",
+          config.state_get("learn_sent") == "2026-06-11")
+finally:
+    learn.run = _orig_learn_run
+    if config.STATE_FILE.exists():
+        config.STATE_FILE.unlink()
+    config.STATE_FILE = _orig_state_file2
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")
