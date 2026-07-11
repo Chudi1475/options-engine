@@ -312,11 +312,11 @@ def _deterministic_review(record) -> dict:
     trades = record["trades"]
     lessons = []
     if not trades:
+        # no lesson on a quiet day: re-learning the same "staying flat is
+        # correct" bullet every no-trade night just crowds the digest window.
         review = ("Quiet day, no setup cleared the filter so the bot stayed out. "
                   "No text is a position too, sitting out a choppy morning "
                   "protects the account.")
-        lessons.append("On a day with no clean 15-min momentum push in the "
-                       "morning window, staying flat is the correct call.")
     else:
         review = (f"{len(trades)} call(s): {record['wins']} right, "
                   f"{record['losses']} wrong.")
@@ -382,7 +382,9 @@ def _all_lessons() -> list:
 
 def _rebuild_digest():
     """Rewrite the distilled playbook the brain reads: the most recent lesson
-    bullets, newest first, capped so the prompt never bloats."""
+    bullets, newest first, capped so the prompt never bloats. A lesson whose
+    text repeats across nights keeps only its newest occurrence, so a stretch
+    of look-alike days cannot fill the window and evict real lessons."""
     bullets = []
     for entry in _all_lessons():
         d = entry.get("session", "")
@@ -393,9 +395,16 @@ def _rebuild_digest():
                     if sys.platform.startswith("win") else "%-m/%-d")
             except ValueError:
                 tag = d
-        for lesson in entry.get("lessons", []):
-            bullets.append((tag, lesson))
-    bullets = bullets[-DIGEST_KEEP:][::-1]  # newest first
+        for lesson in entry.get("lessons") or []:
+            bullets.append((tag, str(lesson)))
+    seen, deduped = set(), []
+    for tag, lesson in reversed(bullets):  # newest first, newest copy wins
+        key = " ".join(lesson.lower().split())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append((tag, lesson))
+    bullets = deduped[:DIGEST_KEEP]
     header = ("These are my own observations from grading my calls night after "
               "night. Apply them when reading setups. They NEVER override the "
               "hard rules (9:45-10:30 entry window, 70% win-rate floor, sell "

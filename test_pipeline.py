@@ -550,6 +550,90 @@ finally:
     import shutil
     shutil.rmtree(_reports, ignore_errors=True)
 
+# --- learn digest: repeated lessons cannot crowd out real ones ---
+# _deterministic_review appended the SAME "staying flat is correct" bullet
+# every quiet night, and _rebuild_digest kept the last DIGEST_KEEP bullets
+# raw, so two slow weeks filled the whole window the brain reads and evicted
+# the real lessons. Quiet days now add no lesson, and the digest keeps only
+# the newest copy of a repeated bullet.
+import learn
+
+_orig_llog, _orig_ldig = learn.LESSONS_LOG, learn.LESSONS_DIGEST
+learn.LESSONS_LOG = config.DATA_DIR / "lessons_test.jsonl"
+learn.LESSONS_DIGEST = config.DATA_DIR / "lessons_digest_test.md"
+
+
+def _lentry(day, lessons):
+    return {"session": day, "graded_at": day + " 21:30:00 EDT", "wins": 0,
+            "losses": 0, "trades": [], "review": "r", "lessons": lessons,
+            "watch_tomorrow": "", "proposed_change": None}
+
+
+def _tag(day):
+    fmt = "%#m/%#d" if sys.platform.startswith("win") else "%-m/%-d"
+    return datetime.strptime(day, "%Y-%m-%d").strftime(fmt)
+
+
+def _digest_bullets():
+    txt = learn.LESSONS_DIGEST.read_text(encoding="utf-8")
+    return [ln for ln in txt.splitlines() if ln.startswith("- ")]
+
+
+try:
+    for f in (learn.LESSONS_LOG, learn.LESSONS_DIGEST):
+        if f.exists():
+            f.unlink()
+
+    quiet = learn._deterministic_review(
+        {"session": "2026-06-11", "day_name": "Thu 6/11", "market": "",
+         "trades": [], "wins": 0, "losses": 0})
+    check("learn: quiet day teaches no lesson",
+          quiet["lessons"] == [] and "stayed out" in quiet["review"])
+
+    learn._append_lesson(_lentry("2026-06-01", ["real lesson A"]))
+    learn._append_lesson(_lentry("2026-06-02", ["Same  old lesson."]))
+    learn._append_lesson(_lentry("2026-06-03", ["same old lesson.", ""]))
+    learn._append_lesson(_lentry("2026-06-03", None))  # legacy null entry
+    learn._append_lesson(_lentry("2026-06-04", ["real lesson B"]))
+    learn._rebuild_digest()
+    got = _digest_bullets()
+    old = [ln for ln in got if "old lesson" in ln]
+    check("learn: repeated lesson keeps one copy, the newest",
+          len(old) == 1 and f"({_tag('2026-06-03')})" in old[0],
+          f"got {old}")
+    check("learn: digest stays newest first",
+          got == [f"- ({_tag('2026-06-04')}) real lesson B",
+                  f"- ({_tag('2026-06-03')}) same old lesson.",
+                  f"- ({_tag('2026-06-01')}) real lesson A"],
+          f"got {got}")
+
+    # a slow stretch repeating one bullet cannot evict the real lessons
+    for _ in range(30):
+        learn._append_lesson(_lentry("2026-06-05", ["repeat me"]))
+    learn._rebuild_digest()
+    got = _digest_bullets()
+    check("learn: 30 identical nights collapse to one bullet",
+          sum("repeat me" in ln for ln in got) == 1, f"got {len(got)} bullets")
+    check("learn: real lessons survive the burst",
+          any("real lesson A" in ln for ln in got)
+          and any("real lesson B" in ln for ln in got), f"got {got}")
+
+    # the window still caps at DIGEST_KEEP, newest distinct bullets win
+    for i in range(25):
+        learn._append_lesson(_lentry("2026-06-08", [f"distinct lesson {i:02d}"]))
+    learn._rebuild_digest()
+    got = _digest_bullets()
+    check("learn: window capped at DIGEST_KEEP distinct bullets",
+          len(got) == learn.DIGEST_KEEP, f"got {len(got)}")
+    check("learn: newest distinct lessons hold the window",
+          "distinct lesson 24" in got[0] and "distinct lesson 05" in got[-1],
+          f"got {got[0]!r} .. {got[-1]!r}")
+finally:
+    for f in (learn.LESSONS_LOG, learn.LESSONS_DIGEST):
+        if f.exists():
+            f.unlink()
+    learn.LESSONS_LOG, learn.LESSONS_DIGEST = _orig_llog, _orig_ldig
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")
