@@ -1005,6 +1005,56 @@ finally:
         else:
             os.environ[k] = v
 
+# --- weekly scoreboard: NEW-vs-OLD verdict scored on one common trade set ---
+# weekly_report summed NEW over every closed trade but OLD only over trades
+# whose old-rules shadow finished, then declared a winner from that
+# apples-to-oranges diff. One trade whose shadow never closed (non-comparable
+# marks all day) could hand NEW a phantom win. The verdict now diffs the two
+# rule sets on the same trades and says how many it covers.
+
+
+def wk_pos(pid, final, old_exit):
+    p = mk_pos()
+    p.id = pid
+    p.state = "closed"
+    p.final_pnl_pct = final
+    if old_exit is not None:
+        p.old_rules = {"status": "closed", "exit_pct": old_exit,
+                       "exit_reason": "old target", "exit_time": "10:00:00"}
+    return p
+
+
+wbook = PositionBook.__new__(PositionBook)  # never touches positions.json
+wbook.positions = [wk_pos("w1", -10.0, 15.0),
+                   wk_pos("w2", 5.0, 15.0),
+                   wk_pos("w3", 80.0, None)]  # shadow never finished
+rep = scoreboard.weekly_report(wbook, None, None, TODAY)
+check("weekly: headline total still counts every trade",
+      "this week: +75%" in rep, f"got {rep!r}")
+check("weekly: verdict diffs only trades both rule sets finished "
+      "(was NEW by 45 on mismatched sets)",
+      "This week's winner: OLD rules by 35 points" in rep, f"got {rep!r}")
+check("weekly: report says which trades the verdict covers",
+      "2 of 3 trades where the old shadow finished: +30%" in rep
+      and "NEW rules on those same 2 trades: -5%" in rep, f"got {rep!r}")
+cmp_lines = [ln for ln in rep.splitlines()
+             if "old shadow" in ln or "those same" in ln or "winner" in ln]
+check("weekly: comparison copy has no em dash",
+      cmp_lines and all("—" not in ln for ln in cmp_lines),
+      f"got {cmp_lines}")
+
+wbook.positions = [wk_pos("w1", 40.0, 26.0), wk_pos("w2", -30.0, -30.0)]
+rep = scoreboard.weekly_report(wbook, None, None, TODAY)
+check("weekly: full-shadow week keeps the exact-same-entries wording",
+      "on the exact same entries: -4%" in rep
+      and "This week's winner: NEW rules by 14 points" in rep, f"got {rep!r}")
+
+wbook.positions = [wk_pos("w1", 40.0, None)]
+wbook.positions[0].old_rules = None  # legacy null record must not crash
+rep = scoreboard.weekly_report(wbook, None, None, TODAY)
+check("weekly: no finished shadow means no verdict at all",
+      "winner" not in rep and "OLD exit rules" not in rep, f"got {rep!r}")
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")

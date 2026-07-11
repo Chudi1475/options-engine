@@ -140,11 +140,21 @@ def weekly_report(book: PositionBook, backtest_old, backtest_new,
             f"give back {config.RUNNER_GIVEBACK_PCT:g} off peak → stop "
             f"{config.STOP_PCT:g}):")
         add(f"  this week: {new_total:+.0f}% (adding up each trade's %)")
-        both = [p for p in week if p.old_rules.get("exit_pct") is not None]
+        # The verdict must compare both rule sets on the SAME trades. A shadow
+        # that never closed (non-comparable marks all day) has no old-rules
+        # result, so its trade stays out of BOTH sides of the diff instead of
+        # silently padding the NEW total.
+        both = [p for p in week if (p.old_rules or {}).get("exit_pct") is not None]
         if both:
             old_total = sum(p.old_rules["exit_pct"] for p in both)
-            add(f"OLD exit rules (+15/-60) on the exact same entries: {old_total:+.0f}%")
-            diff = new_total - old_total
+            new_matched = sum(p.final_pnl_pct for p in both)
+            if len(both) < len(week):
+                add(f"OLD exit rules (+15/-60) on the {len(both)} of {len(week)} "
+                    f"trades where the old shadow finished: {old_total:+.0f}%")
+                add(f"NEW rules on those same {len(both)} trades: {new_matched:+.0f}%")
+            else:
+                add(f"OLD exit rules (+15/-60) on the exact same entries: {old_total:+.0f}%")
+            diff = new_matched - old_total
             winner = "NEW" if diff >= 0 else "OLD"
             add(f"This week's winner: {winner} rules by {abs(diff):.0f} points")
         if any(p.paper for p in week):
