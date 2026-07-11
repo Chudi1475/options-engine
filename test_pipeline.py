@@ -724,6 +724,106 @@ finally:
             f.unlink()
     learn.LESSONS_LOG, learn.LESSONS_DIGEST = _orig_llog, _orig_ldig
 
+# --- learn digest: watch_tomorrow reaches the brain for exactly one session ---
+# Each nightly review writes watch_tomorrow, the one line meant to shape the
+# NEXT session, but _rebuild_digest only pulled the lessons array, so it was
+# texted to the owner once and then evaporated. The newest watch is now pinned
+# at the top of the digest as a dated FOR TODAY line and drops off once its
+# target session (the next weekday after the review) has passed.
+learn.LESSONS_LOG = config.DATA_DIR / "lessons_test.jsonl"
+learn.LESSONS_DIGEST = config.DATA_DIR / "lessons_digest_test.md"
+_orig_et_now = learn.et_now
+
+
+def _lwatch(day, watch):
+    e = _lentry(day, ["lesson " + day])
+    e["watch_tomorrow"] = watch
+    return e
+
+
+def _digest_text():
+    return learn.LESSONS_DIGEST.read_text(encoding="utf-8")
+
+
+try:
+    for f in (learn.LESSONS_LOG, learn.LESSONS_DIGEST):
+        if f.exists():
+            f.unlink()
+
+    # Thursday night's review pins its watch line for Friday's session
+    learn._append_lesson(_lwatch("2026-06-10", "old watch"))
+    learn._append_lesson(_lwatch("2026-06-11", "fade the first spike"))
+    learn.et_now = lambda: datetime(2026, 6, 11, 21, 30, tzinfo=ET)
+    learn._rebuild_digest()
+    txt = _digest_text()
+    check("watch: newest watch pinned as a dated FOR TODAY line",
+          f"FOR TODAY (my watch line from the {_tag('2026-06-11')} review): "
+          "fade the first spike" in txt, f"got {txt!r}")
+    check("watch: pin sits above the lesson bullets",
+          txt.index("FOR TODAY") < txt.index("- ("), f"got {txt!r}")
+    check("watch: pin is not itself a playbook bullet",
+          not any(ln.startswith("- ") and "FOR TODAY" in ln
+                  for ln in txt.splitlines()))
+    check("watch: only the newest session's watch pins",
+          "old watch" not in txt)
+
+    # still valid on the Friday morning it was written for
+    learn.et_now = lambda: datetime(2026, 6, 12, 9, 30, tzinfo=ET)
+    learn._rebuild_digest()
+    check("watch: valid through its target session",
+          "fade the first spike" in _digest_text())
+
+    # Friday night's watch survives the weekend into Monday
+    learn._append_lesson(_lwatch("2026-06-12", "watch the gap fill"))
+    learn.et_now = lambda: datetime(2026, 6, 15, 9, 30, tzinfo=ET)
+    learn._rebuild_digest()
+    check("watch: Friday watch survives the weekend into Monday",
+          "watch the gap fill" in _digest_text())
+
+    # but is gone by Tuesday, no stale guidance labeled as today's
+    learn.et_now = lambda: datetime(2026, 6, 16, 9, 30, tzinfo=ET)
+    learn._rebuild_digest()
+    txt = _digest_text()
+    check("watch: expired watch drops off the digest",
+          "FOR TODAY" not in txt and "watch the gap fill" not in txt,
+          f"got {txt!r}")
+    check("watch: lessons survive the expired pin",
+          f"- ({_tag('2026-06-12')}) lesson 2026-06-12" in txt, f"got {txt!r}")
+
+    # deep-review rows (empty watch) and stale backfills cannot pin
+    learn._append_lesson(_lentry("2026-06-16", ["deep lesson"]))
+    learn._append_lesson(_lwatch("2026-06-01", "ancient backfill"))
+    learn.et_now = lambda: datetime(2026, 6, 16, 21, 30, tzinfo=ET)
+    learn._rebuild_digest()
+    txt = _digest_text()
+    check("watch: empty-watch and stale backfill rows leave no pin",
+          "FOR TODAY" not in txt and "ancient backfill" not in txt,
+          f"got {txt!r}")
+
+    # a re-run of the same session keeps the newest copy of its watch, and a
+    # later-appended backfill for an older date cannot steal the pin
+    learn._append_lesson(_lwatch("2026-06-16", "first cut"))
+    learn._append_lesson(_lwatch("2026-06-16", "second cut"))
+    learn._append_lesson(_lwatch("2026-06-15", "yesterday backfill"))
+    learn._rebuild_digest()
+    txt = _digest_text()
+    check("watch: same-session re-run keeps the newest watch",
+          "second cut" in txt and "first cut" not in txt, f"got {txt!r}")
+    check("watch: backfilled older session cannot steal the pin",
+          "yesterday backfill" not in txt, f"got {txt!r}")
+
+    # the reviewer's playbook block must not ingest the pin as a lesson
+    brief = learn._day_brief(_quiet_record("2026-06-17"))
+    check("watch: FOR TODAY line stays out of the reviewer brief",
+          "FOR TODAY" not in brief and "second cut" not in brief,
+          f"got {brief!r}")
+finally:
+    for f in (learn.LESSONS_LOG, learn.LESSONS_DIGEST):
+        if f.exists():
+            f.unlink()
+    learn.LESSONS_LOG, learn.LESSONS_DIGEST = _orig_llog, _orig_ldig
+    learn.et_now = _orig_et_now
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")

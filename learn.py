@@ -10,7 +10,10 @@ uses, then asks the Claude brain to distill 1-3 concrete lessons: what the good
 calls had in common, what the mistakes had in common, and what to watch
 tomorrow. Lessons are appended to lessons.jsonl and distilled into
 lessons_digest.md, which the conversational brain reads on every reply, so
-accumulated learning actually changes how it reasons.
+accumulated learning actually changes how it reasons. The newest
+watch_tomorrow line is pinned at the top of that digest for exactly its
+target session, so the one time-sensitive output actually shapes the next
+day instead of evaporating overnight.
 
 Guardrail: this NEVER auto-changes a trade rule, threshold, or the allow-list.
 If a lesson implies a rule change, it is PROPOSED to the owner in the nightly
@@ -427,11 +430,43 @@ def _all_lessons() -> list:
     return out
 
 
+def _next_weekday(d):
+    """The next weekday after session date d, the session a watch_tomorrow
+    line was written for. Holidays are ignored on purpose: expiring the line
+    on a market holiday drops it one session early, the safe direction."""
+    nxt = d + timedelta(days=1)
+    while nxt.weekday() >= 5:
+        nxt += timedelta(days=1)
+    return nxt
+
+
+def _latest_watch():
+    """(session_date, text) of the newest non-empty watch_tomorrow in the log,
+    or None. Keyed by session date rather than file position so a backfilled
+    old night cannot steal the pin; a re-run of the same session keeps its
+    newest copy. Deep-review and coach rows write an empty watch, so they
+    never pin."""
+    best = None
+    for entry in _all_lessons():
+        watch = str(entry.get("watch_tomorrow") or "").strip()
+        if not watch:
+            continue
+        try:
+            day = datetime.strptime(entry.get("session", ""), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if best is None or day >= best[0]:
+            best = (day, watch)
+    return best
+
+
 def _rebuild_digest():
     """Rewrite the distilled playbook the brain reads: the most recent lesson
     bullets, newest first, capped so the prompt never bloats. A lesson whose
     text repeats across nights keeps only its newest occurrence, so a stretch
-    of look-alike days cannot fill the window and evict real lessons."""
+    of look-alike days cannot fill the window and evict real lessons. The
+    newest watch_tomorrow is pinned above the bullets as a dated FOR TODAY
+    line that expires once its target session has passed."""
     bullets = []
     for entry in _all_lessons():
         d = entry.get("session", "")
@@ -452,12 +487,24 @@ def _rebuild_digest():
         seen.add(key)
         deduped.append((tag, lesson))
     bullets = deduped[:DIGEST_KEEP]
+    # pin the newest watch_tomorrow: it is the one output written to shape
+    # the NEXT session, and it used to evaporate because only the lessons
+    # array reached the digest. Expires once its target session (the next
+    # weekday after the review) has passed, so a stretch with no nightly
+    # review cannot leave week-old guidance labeled as today's.
+    pin = ""
+    latest = _latest_watch()
+    if latest and _next_weekday(latest[0]) >= et_now().date():
+        tag = latest[0].strftime("%#m/%#d" if sys.platform.startswith("win")
+                                 else "%-m/%-d")
+        pin = (f"FOR TODAY (my watch line from the {tag} review): "
+               f"{latest[1]}\n\n")
     header = ("These are my own observations from grading my calls night after "
               "night. Apply them when reading setups. They NEVER override the "
               "hard rules (9:45-10:30 entry window, 70% win-rate floor, sell "
               "half at +25%, give-back 40 off peak, -70% stop).\n")
     body = "\n".join(f"- ({tag}) {lesson}" for tag, lesson in bullets) or "- (none yet)"
-    LESSONS_DIGEST.write_text(header + "\n" + body + "\n", encoding="utf-8")
+    LESSONS_DIGEST.write_text(header + "\n" + pin + body + "\n", encoding="utf-8")
 
 
 def _owner_message(record, lesson) -> str:
