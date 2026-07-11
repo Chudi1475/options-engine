@@ -307,6 +307,62 @@ finally:
 check("inverted gap renders without an OB", png is not None and not ob_calls,
       f"png={png is not None} calls={ob_calls}")
 
+# 16) killzone helper: an ET premarket->lunch index shades the London tail
+# and the full NY AM window (make_bars runs 04:00-11:25 ET)
+bars = make_bars(90)
+runs = charts._killzone_runs(bars.index)
+check("killzones found on an ET index",
+      runs == [(0, 11, "LONDON KZ"), (54, 83, "NY AM KZ")], f"runs={runs}")
+
+# membership is judged in ET no matter the display timezone (chart is CT)
+runs_ct = charts._killzone_runs(bars.index.tz_convert("America/Chicago"))
+check("killzones identical on the CT-converted index", runs_ct == runs,
+      f"runs_ct={runs_ct}")
+
+# a naive index could mean any zone: skip, never guess
+check("naive index shades nothing",
+      charts._killzone_runs(make_bars(20, naive=True).index) == [])
+# a non-datetime index (backtest frames) skips too, without raising
+check("integer index shades nothing",
+      charts._killzone_runs(pd.RangeIndex(20)) == [])
+
+# two sessions -> two separate NY AM bands, never one bridged blob
+idx2 = pd.date_range("2026-07-09 08:00", periods=60, freq="5min",
+                     tz="America/New_York").append(
+    pd.date_range("2026-07-10 08:00", periods=60, freq="5min",
+                  tz="America/New_York"))
+ny = [r for r in charts._killzone_runs(idx2) if r[2] == "NY AM KZ"]
+check("each session gets its own NY AM band",
+      ny == [(6, 35, "NY AM KZ"), (66, 95, "NY AM KZ")], f"ny={ny}")
+
+# lunch/afternoon-only bars: no bands at all (that IS the signal)
+lunch = pd.date_range("2026-07-10 11:30", periods=40, freq="5min",
+                      tz="America/New_York")
+check("lunch tape shades nothing", charts._killzone_runs(lunch) == [])
+
+# 17) wiring: render calls the helper on the WINDOW-SLICED index and both
+# zones survive when the window stretches for an old gap (gap_at=10 keeps
+# bars from 04:30 ET, so the London tail is still in frame)
+bars = make_bars(90, gap_at=10)
+kz_calls = []
+real_kz = charts._killzone_runs
+
+
+def kz_recorder(index):
+    out = real_kz(index)
+    kz_calls.append(sorted({lab for _, _, lab in out}))
+    return out
+
+
+charts._killzone_runs = kz_recorder
+try:
+    png, why = render(make_r(stored_from(bars, 10)), bars, boom)
+finally:
+    charts._killzone_runs = real_kz
+check("killzone bands drawn from the charted window", png is not None, str(why))
+check("render shades both zones the window shows",
+      kz_calls == [["LONDON KZ", "NY AM KZ"]], f"calls={kz_calls}")
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")

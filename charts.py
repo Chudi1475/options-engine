@@ -6,8 +6,8 @@ analysis zone with a fib-style level ladder (level (price) labels on its left),
 a diagonal trendline, an orange channel around recent price action, red alert
 lines with red price tags pinned to the right axis, a dotted red current-price
 line with a price+time tag, a Target label at the objective, PLUS the FVG boxes
-(BISI/SIBI + grade), the CE line, and the order block behind the confirming
-gap that are the bot's own edge.
+(BISI/SIBI + grade), the CE line, the order block behind the confirming gap,
+and faint London/NY-AM killzone bands that are the bot's own edge.
 
 render_signal(): simple dark price-line fallback with entry/SL/TP.
 
@@ -108,6 +108,38 @@ def _spread(ys, hs, lo, hi, pad=1.12):
             for k in order:
                 ty[k] += under
     return ty
+
+
+# ICT killzones, minutes-of-day in ET: the windows where the plays live.
+# A gap born here reads very differently from a lunch gap.
+_KILLZONES = (("LONDON KZ", 2 * 60, 5 * 60), ("NY AM KZ", 8 * 60 + 30, 11 * 60))
+
+
+def _killzone_runs(index):
+    """Contiguous bar runs inside each ICT killzone (London 02:00-05:00 ET,
+    NY AM 08:30-11:00 ET). Membership is judged in ET — the market clock —
+    no matter what timezone the index displays in. Returns [(x0, x1, label)]
+    positions into `index`. An index that isn't tz-aware datetimes returns []
+    (naive stamps could mean any zone, and backtest integer indexes just
+    skip the shading); never raises."""
+    try:
+        et = index.tz_convert(ET)
+        mins = et.hour * 60 + et.minute
+    except Exception:
+        return []
+    runs = []
+    for label, lo, hi in _KILLZONES:
+        start = None
+        for i, m in enumerate(mins):
+            if lo <= m < hi:
+                if start is None:
+                    start = i
+            elif start is not None:
+                runs.append((start, i - 1, label))
+                start = None
+        if start is not None:
+            runs.append((start, len(mins) - 1, label))
+    return runs
 
 
 def _order_block(o, c, i_mid, kind, max_back=12):
@@ -255,6 +287,23 @@ def render_fvg(r: dict, bars=None):
             lab.set_fontweight("bold")
 
         right = n + 2
+
+        # ICT killzone shading: faint bands behind everything showing WHEN
+        # each candle printed. Nothing else on the chart says whether the
+        # confirming gap formed in a killzone or over lunch, and that is the
+        # first thing an ICT trader checks. Judged in ET even though the
+        # axis labels stay CT.
+        try:
+            from matplotlib.transforms import blended_transform_factory
+            kz_tf = blended_transform_factory(ax.transData, ax.transAxes)
+            for k0, k1, kz in _killzone_runs(df.index):
+                ax.axvspan(k0 - 0.5, k1 + 0.5, color="#3a4a6a", alpha=0.06,
+                           zorder=0)
+                ax.text((k0 + k1) / 2.0, 0.985, kz, transform=kz_tf,
+                        color=_MUT, fontsize=6.8, fontweight="bold",
+                        ha="center", va="top", zorder=6)
+        except Exception:
+            pass
 
         # gray analysis zone anchored at the FVG / swing extreme
         i0 = conf["i"] if conf else (int(np.argmax(h)) if sell else int(np.argmin(low)))
