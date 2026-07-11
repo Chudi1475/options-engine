@@ -234,6 +234,79 @@ r["plan"].update(entry=round(px - 0.01, 2), stop=round(px - 0.03, 2))
 png, why = render(r, bars, boom)
 check("clustered entry/SL/price read renders", png is not None, str(why))
 
+# 13) order block helper: last opposite-close candle at/before the impulse
+o5 = np.array([10.0, 10.2, 10.1, 10.3, 10.5])
+c5 = np.array([10.2, 10.1, 10.3, 10.5, 11.5])  # only candle 1 closes down
+ob = charts._order_block(o5, c5, 4, "bull")
+check("bull OB scans past up-closes to the last down-close",
+      ob == (1, 10.1, 10.2), f"ob={ob}")
+o5 = np.array([10.0, 10.2, 10.3, 10.1, 10.5])
+c5 = np.array([10.2, 10.3, 10.1, 10.0, 9.0])  # candle 3 also closes down
+ob = charts._order_block(o5, c5, 4, "bull")
+check("bull OB takes the candle nearest the impulse",
+      ob == (3, 10.0, 10.1), f"ob={ob}")
+ob = charts._order_block(np.array([10.0, 10.1, 10.3]),
+                         np.array([10.1, 10.3, 9.5]), 2, "bear")
+check("bear OB is the last up-close candle", ob == (1, 10.1, 10.3), f"ob={ob}")
+n20 = np.arange(20, dtype=float)
+ob = charts._order_block(n20, n20 + 0.1, 19, "bull")   # every candle up
+check("no opposite close within reach -> no OB", ob is None, f"ob={ob}")
+flat = np.full(6, 10.0)
+ob = charts._order_block(flat, flat.copy(), 5, "bull")  # dojis everywhere
+check("doji bodies never match", ob is None, f"ob={ob}")
+ob = charts._order_block(np.array([10.2, 10.3]), np.array([10.0, 11.1]),
+                         1, "bull")
+check("OB may be the candle right before the impulse",
+      ob == (0, 10.0, 10.2), f"ob={ob}")
+o14 = np.ones(15) * 10.0
+c14 = o14 + 0.1
+o14[0], c14[0] = 10.2, 10.0                             # down-close, 14 back
+ob = charts._order_block(o14, c14, 14, "bull")
+check("a candle beyond max_back is not this impulse's OB", ob is None,
+      f"ob={ob}")
+
+# 14) wiring: render calls the OB helper with the WINDOW-LOCAL impulse index
+# and finds the down-close candle planted two bars before the gap
+bars = make_bars(90, gap_at=70)
+j = 68                                                  # make bar 68 close down
+op = float(bars["Open"].iloc[j])
+bars.iloc[j, bars.columns.get_loc("Open")] = op + 0.06
+bars.iloc[j, bars.columns.get_loc("Close")] = op - 0.06
+bars.iloc[j, bars.columns.get_loc("High")] = op + 0.08
+bars.iloc[j, bars.columns.get_loc("Low")] = op - 0.08
+ob_calls = []
+real_ob = charts._order_block
+
+
+def ob_recorder(o, c, i_mid, kind, **kw):
+    out = real_ob(o, c, i_mid, kind, **kw)
+    ob_calls.append((i_mid, kind, out and out[0]))
+    return out
+
+
+charts._order_block = ob_recorder
+try:
+    png, why = render(make_r(stored_from(bars, 70)), bars, boom)
+finally:
+    charts._order_block = real_ob
+# 90 bars -> window starts at 26, so impulse 70 -> 44 and OB 68 -> 42
+check("OB drawn from the anchored window", png is not None, str(why))
+check("OB helper got the window-local impulse and found the down candle",
+      ob_calls == [(44, "bull", 42)], f"calls={ob_calls}")
+
+# 15) inverted gap: the OB of the original impulse points the wrong way, skip
+bars = make_bars(90, gap_at=70)
+inv = stored_from(bars, 70)
+inv["inverted"] = True
+ob_calls.clear()
+charts._order_block = ob_recorder
+try:
+    png, why = render(make_r(inv), bars, boom)
+finally:
+    charts._order_block = real_ob
+check("inverted gap renders without an OB", png is not None and not ob_calls,
+      f"png={png is not None} calls={ob_calls}")
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")

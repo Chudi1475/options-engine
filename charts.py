@@ -6,7 +6,8 @@ analysis zone with a fib-style level ladder (level (price) labels on its left),
 a diagonal trendline, an orange channel around recent price action, red alert
 lines with red price tags pinned to the right axis, a dotted red current-price
 line with a price+time tag, a Target label at the objective, PLUS the FVG boxes
-(BISI/SIBI + grade) and CE line that are the bot's own edge.
+(BISI/SIBI + grade), the CE line, and the order block behind the confirming
+gap that are the bot's own edge.
 
 render_signal(): simple dark price-line fallback with entry/SL/TP.
 
@@ -32,6 +33,7 @@ _ORANGE = "#f7931a"
 _LEVEL = "#5d606b"      # dark fib level lines
 _ZONE = "#9598a1"       # gray analysis zone fill
 _LBL = "#4a4e59"        # fib label text
+_OBC = "#7e57c2"        # order block tint: purple, never reads as an FVG
 
 
 def _mpl():
@@ -106,6 +108,25 @@ def _spread(ys, hs, lo, hi, pad=1.12):
             for k in order:
                 ty[k] += under
     return ty
+
+
+def _order_block(o, c, i_mid, kind, max_back=12):
+    """The order block behind a displacement candle: the LAST opposite-close
+    candle at/before the impulse (for a bullish/BISI gap the last down-close,
+    for a bearish/SIBI the last up-close). Traders enter from the OB as much
+    as from the CE, so the chart marks both. Scans at most `max_back` candles
+    back from the impulse; a candle further away is not this impulse's OB.
+    Returns (index, body_low, body_high) or None (doji bodies never match)."""
+    j = int(i_mid) - 1
+    stop = max(0, int(i_mid) - max_back)
+    while j >= stop:
+        if kind == "bull":
+            if c[j] < o[j]:
+                return j, float(c[j]), float(o[j])
+        elif c[j] > o[j]:
+            return j, float(o[j]), float(c[j])
+        j -= 1
+    return None
 
 
 def render_fvg(r: dict, bars=None):
@@ -302,6 +323,28 @@ def render_fvg(r: dict, bars=None):
                     va="bottom", ha="left", zorder=7,
                     bbox=dict(boxstyle="round,pad=0.22", facecolor=_BG,
                               edgecolor=base, linewidth=0.7, alpha=0.95))
+
+        # the order block behind the confirming gap: the refined entry the
+        # CE line alone doesn't show. Confirming FVG only (keeps clutter
+        # low), and never for an inverted gap — the trade there runs against
+        # the original impulse, so its OB would point the wrong way.
+        try:
+            if conf and not conf.get("inverted") and 1 <= conf["i"] < n:
+                kind = "bull" if conf.get("label") == "BISI" else "bear"
+                ob = _order_block(o, c, conf["i"], kind)
+                if ob:
+                    obj, ob_lo, ob_hi = ob
+                    ax.add_patch(Rectangle((obj - 0.5, ob_lo),
+                                           right - (obj - 0.5), ob_hi - ob_lo,
+                                           facecolor=_OBC, alpha=0.10,
+                                           edgecolor=_OBC, linewidth=0.7,
+                                           zorder=2))
+                    ax.text(obj - 0.3, ob_lo, "OB", color=_OBC, fontsize=7.0,
+                            fontweight="bold", va="top", ha="left", zorder=7,
+                            bbox=dict(boxstyle="round,pad=0.18", facecolor=_BG,
+                                      edgecolor=_OBC, linewidth=0.6, alpha=0.95))
+        except Exception:
+            pass
 
         # candlesticks ON TOP of the zone, TradingView colors
         for xi, oo, hh, ll, cc in zip(x, o, h, low, c):
