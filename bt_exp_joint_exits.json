@@ -1,0 +1,519 @@
+{
+  "experiment": "joint TP_HALF x GIVEBACK walk-forward at fixed stop -90 (half in {15,20,25,30} x give-back in {30,40,50})",
+  "generated": "2026-07-10T22:09:51",
+  "verdict": "keep 25/40",
+  "why": "no TP_HALF/GIVEBACK cell beat the incumbent 25/40 on BOTH win rate and expectancy in BOTH half-windows at stop -90; mixed/partial wins do not clear the walk-forward bar, so the live exits stand",
+  "rule": "a challenger beats the incumbent 25/40 only if it improves BOTH win rate AND expectancy in BOTH halves (same bar the stop change had to clear); win rate is the first priority \u2014 if several pass, highest win rate wins, expectancy breaks ties; anything mixed = keep 25/40",
+  "stop_fixed": -90,
+  "incumbent": {
+    "half": 25,
+    "giveback": 40
+  },
+  "grid": {
+    "half": [
+      15,
+      20,
+      25,
+      30
+    ],
+    "giveback": [
+      30,
+      40,
+      50
+    ]
+  },
+  "allow_list": [
+    "SPX:call",
+    "SPY:call",
+    "QCOM:call",
+    "TSLA:put"
+  ],
+  "window": {
+    "first_session": "2026-04-15",
+    "last_session": "2026-07-10",
+    "split_at": "2026-05-28",
+    "sessions_total": 60,
+    "sessions_first_half": 30,
+    "sessions_second_half": 30
+  },
+  "pricing": "approximated (Black-Scholes, realized vol) \u2014 optimistic; trust relative moves",
+  "sizing_note": "total_pnl/max_drawdown = fixed 2 contracts (backtester standard); acct_ret_pct_per_trade_sizing_fair = expectancy% x RISK_PER_TRADE_PCT / |stop| \u2014 constant rescale here because the stop is fixed at -90",
+  "results_by_config": {
+    "15/30": {
+      "overall": {
+        "trades": 221,
+        "win_rate": 75.56561085972851,
+        "avg_win_pct": 42.82986801754756,
+        "avg_loss_pct": -75.93143743449974,
+        "expectancy_pct": 13.811268495327862,
+        "total_pnl": 26121.64461714999,
+        "max_drawdown": -5491.415268620349,
+        "start": "04/15/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.15345853883697624
+      },
+      "first_half": {
+        "trades": 111,
+        "win_rate": 78.37837837837837,
+        "avg_win_pct": 43.732155670551954,
+        "avg_loss_pct": -74.99429544237965,
+        "expectancy_pct": 18.061571646134315,
+        "total_pnl": 18079.408735211782,
+        "max_drawdown": -4295.119802905361,
+        "start": "04/15/2026",
+        "end": "05/27/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.20068412940149238
+      },
+      "second_half": {
+        "trades": 110,
+        "win_rate": 72.72727272727273,
+        "avg_win_pct": 41.848630194905304,
+        "avg_loss_pct": -76.68115102819584,
+        "expectancy_pct": 9.522326224968621,
+        "total_pnl": 8042.235881938208,
+        "max_drawdown": -5491.415268620349,
+        "start": "05/28/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.10580362472187357
+      }
+    },
+    "15/40": {
+      "overall": {
+        "trades": 221,
+        "win_rate": 70.58823529411765,
+        "avg_win_pct": 49.12469513134671,
+        "avg_loss_pct": -63.53208548424697,
+        "expectancy_pct": 15.990347891466222,
+        "total_pnl": 32147.487874644816,
+        "max_drawdown": -5491.415268620349,
+        "start": "04/15/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.17767053212740247
+      },
+      "first_half": {
+        "trades": 111,
+        "win_rate": 72.07207207207207,
+        "avg_win_pct": 51.83230255862899,
+        "avg_loss_pct": -58.413598482890215,
+        "expectancy_pct": 21.04290677225877,
+        "total_pnl": 21800.558245010525,
+        "max_drawdown": -4385.892183981731,
+        "start": "04/15/2026",
+        "end": "05/27/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.23381007524731967
+      },
+      "second_half": {
+        "trades": 110,
+        "win_rate": 69.0909090909091,
+        "avg_win_pct": 46.27458204999696,
+        "avg_loss_pct": -68.19894127960166,
+        "expectancy_pct": 10.891856657211907,
+        "total_pnl": 10346.929629634273,
+        "max_drawdown": -5491.41526862035,
+        "start": "05/28/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.12102062952457675
+      }
+    },
+    "15/50": {
+      "overall": {
+        "trades": 221,
+        "win_rate": 69.23076923076923,
+        "avg_win_pct": 51.45305981555061,
+        "avg_loss_pct": -62.349036106334125,
+        "expectancy_pct": 16.437030301124533,
+        "total_pnl": 29811.81390324811,
+        "max_drawdown": -5491.415268620349,
+        "start": "04/15/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.1826336700124948
+      },
+      "first_half": {
+        "trades": 111,
+        "win_rate": 72.07207207207207,
+        "avg_win_pct": 54.381080570554175,
+        "avg_loss_pct": -59.095951199463194,
+        "expectancy_pct": 22.68929692307186,
+        "total_pnl": 21743.649528163536,
+        "max_drawdown": -5284.139053462164,
+        "start": "04/15/2026",
+        "end": "05/27/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.2521032991452429
+      },
+      "second_half": {
+        "trades": 110,
+        "win_rate": 66.36363636363637,
+        "avg_win_pct": 48.24426994705353,
+        "avg_loss_pct": -65.07459373100978,
+        "expectancy_pct": 10.127924891704938,
+        "total_pnl": 8068.164375084585,
+        "max_drawdown": -5491.41526862035,
+        "start": "05/28/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.11253249879672153
+      }
+    },
+    "20/30": {
+      "overall": {
+        "trades": 221,
+        "win_rate": 76.01809954751131,
+        "avg_win_pct": 45.658600796330774,
+        "avg_loss_pct": -83.81488307959933,
+        "expectancy_pct": 14.608398780836225,
+        "total_pnl": 27794.125079482055,
+        "max_drawdown": -5491.415268620349,
+        "start": "04/15/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.16231554200929138
+      },
+      "first_half": {
+        "trades": 111,
+        "win_rate": 79.27927927927928,
+        "avg_win_pct": 46.64188445306831,
+        "avg_loss_pct": -81.50806065468157,
+        "expectancy_pct": 20.088292223534573,
+        "total_pnl": 18994.915748029136,
+        "max_drawdown": -4799.1393330889705,
+        "start": "04/15/2026",
+        "end": "05/27/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.22320324692816193
+      },
+      "second_half": {
+        "trades": 110,
+        "win_rate": 72.72727272727273,
+        "avg_win_pct": 44.57698877391949,
+        "avg_loss_pct": -85.58344693870296,
+        "expectancy_pct": 9.07868812502246,
+        "total_pnl": 8799.209331452921,
+        "max_drawdown": -5491.415268620349,
+        "start": "05/28/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.10087431250024956
+      }
+    },
+    "20/40": {
+      "overall": {
+        "trades": 221,
+        "win_rate": 75.1131221719457,
+        "avg_win_pct": 49.17473505219051,
+        "avg_loss_pct": -80.87058114039414,
+        "expectancy_pct": 16.810516090235073,
+        "total_pnl": 33796.75109392934,
+        "max_drawdown": -5491.415268620349,
+        "start": "04/15/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.18678351211372302
+      },
+      "first_half": {
+        "trades": 111,
+        "win_rate": 76.57657657657657,
+        "avg_win_pct": 52.35909926652627,
+        "avg_loss_pct": -72.33256828636706,
+        "expectancy_pct": 23.152042001884602,
+        "total_pnl": 22847.871306366895,
+        "max_drawdown": -4573.021184558905,
+        "start": "04/15/2026",
+        "end": "05/27/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.2572449111320511
+      },
+      "second_half": {
+        "trades": 110,
+        "win_rate": 73.63636363636363,
+        "avg_win_pct": 45.83311828406043,
+        "avg_loss_pct": -88.52535128538392,
+        "expectancy_pct": 10.411339943025089,
+        "total_pnl": 10948.879787562406,
+        "max_drawdown": -5491.41526862035,
+        "start": "05/28/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.11568155492250098
+      }
+    },
+    "20/50": {
+      "overall": {
+        "trades": 221,
+        "win_rate": 71.04072398190046,
+        "avg_win_pct": 52.34289543198341,
+        "avg_loss_pct": -70.35337852873326,
+        "expectancy_pct": 16.810942791775872,
+        "total_pnl": 31584.626407165757,
+        "max_drawdown": -5774.880114176565,
+        "start": "04/15/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.18678825324195414
+      },
+      "first_half": {
+        "trades": 111,
+        "win_rate": 74.77477477477478,
+        "avg_win_pct": 54.279317794443315,
+        "avg_loss_pct": -67.51181724789907,
+        "expectancy_pct": 23.557229675654263,
+        "total_pnl": 22390.995240004097,
+        "max_drawdown": -5055.692512124065,
+        "start": "04/15/2026",
+        "end": "05/27/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.26174699639615845
+      },
+      "second_half": {
+        "trades": 110,
+        "win_rate": 67.27272727272727,
+        "avg_win_pct": 50.170962241656746,
+        "avg_loss_pct": -72.56348174715987,
+        "expectancy_pct": 10.003326027134918,
+        "total_pnl": 9193.631167161686,
+        "max_drawdown": -5774.880114176569,
+        "start": "05/28/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.11114806696816576
+      }
+    },
+    "25/30": {
+      "overall": {
+        "trades": 221,
+        "win_rate": 76.47058823529412,
+        "avg_win_pct": 51.96834029030076,
+        "avg_loss_pct": -89.37264247543088,
+        "expectancy_pct": 18.711638463069775,
+        "total_pnl": 38053.91516457042,
+        "max_drawdown": -6064.750728932049,
+        "start": "04/15/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.20790709403410862
+      },
+      "first_half": {
+        "trades": 111,
+        "win_rate": 80.18018018018019,
+        "avg_win_pct": 52.05917332425748,
+        "avg_loss_pct": -89.34682707603379,
+        "expectancy_pct": 24.032758830506044,
+        "total_pnl": 24281.29776234298,
+        "max_drawdown": -4488.94531009779,
+        "start": "04/15/2026",
+        "end": "05/27/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.2670306536722894
+      },
+      "second_half": {
+        "trades": 110,
+        "win_rate": 72.72727272727273,
+        "avg_win_pct": 51.86728854002395,
+        "avg_loss_pct": -89.39157376832209,
+        "expectancy_pct": 13.342144274111387,
+        "total_pnl": 13772.61740222741,
+        "max_drawdown": -6064.750728932064,
+        "start": "05/28/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.14824604749012651
+      }
+    },
+    "25/40": {
+      "overall": {
+        "trades": 221,
+        "win_rate": 76.47058823529412,
+        "avg_win_pct": 54.387290591298076,
+        "avg_loss_pct": -89.37264247543088,
+        "expectancy_pct": 20.561423987361863,
+        "total_pnl": 43166.28329447189,
+        "max_drawdown": -5092.061625459446,
+        "start": "04/15/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.22846026652624293
+      },
+      "first_half": {
+        "trades": 111,
+        "win_rate": 80.18018018018019,
+        "avg_win_pct": 55.58505704982175,
+        "avg_loss_pct": -89.34682707603379,
+        "expectancy_pct": 26.85981875460712,
+        "total_pnl": 28072.129584761,
+        "max_drawdown": -4431.790118819156,
+        "start": "04/15/2026",
+        "end": "05/27/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.29844243060674575
+      },
+      "second_half": {
+        "trades": 110,
+        "win_rate": 72.72727272727273,
+        "avg_win_pct": 53.054775406190586,
+        "avg_loss_pct": -89.39157376832209,
+        "expectancy_pct": 14.20577108586893,
+        "total_pnl": 15094.153709710861,
+        "max_drawdown": -5092.061625459446,
+        "start": "05/28/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.15784190095409922
+      }
+    },
+    "25/50": {
+      "overall": {
+        "trades": 221,
+        "win_rate": 73.7556561085973,
+        "avg_win_pct": 56.050580639291354,
+        "avg_loss_pct": -80.2786785172897,
+        "expectancy_pct": 20.271861041636583,
+        "total_pnl": 39767.527935614686,
+        "max_drawdown": -5525.604345225824,
+        "start": "04/15/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.2252429004626287
+      },
+      "first_half": {
+        "trades": 111,
+        "win_rate": 76.57657657657657,
+        "avg_win_pct": 57.56056236032422,
+        "avg_loss_pct": -75.73421827732969,
+        "expectancy_pct": 26.338361490243134,
+        "total_pnl": 25931.37997227831,
+        "max_drawdown": -4744.006421756799,
+        "start": "04/15/2026",
+        "end": "05/27/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.2926484610027015
+      },
+      "second_half": {
+        "trades": 110,
+        "win_rate": 70.9090909090909,
+        "avg_win_pct": 54.40508773816582,
+        "avg_loss_pct": -83.97105246225723,
+        "expectancy_pct": 14.150210588951813,
+        "total_pnl": 13836.147963336385,
+        "max_drawdown": -5525.604345225838,
+        "start": "05/28/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.1572245620994646
+      }
+    },
+    "30/30": {
+      "overall": {
+        "trades": 221,
+        "win_rate": 74.2081447963801,
+        "avg_win_pct": 55.96775500801685,
+        "avg_loss_pct": -89.96067568830348,
+        "expectancy_pct": 18.330105461907095,
+        "total_pnl": 35471.75667927159,
+        "max_drawdown": -6152.85675206978,
+        "start": "04/15/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.20366783846563438
+      },
+      "first_half": {
+        "trades": 111,
+        "win_rate": 76.57657657657657,
+        "avg_win_pct": 56.25974286365215,
+        "avg_loss_pct": -90.22759940750123,
+        "expectancy_pct": 21.94739242176036,
+        "total_pnl": 21942.952383154043,
+        "max_drawdown": -4393.880574343766,
+        "start": "04/15/2026",
+        "end": "05/27/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.24385991579733732
+      },
+      "second_half": {
+        "trades": 110,
+        "win_rate": 71.81818181818181,
+        "avg_win_pct": 55.653590859548544,
+        "avg_loss_pct": -89.73680418187952,
+        "expectancy_pct": 14.679934075146083,
+        "total_pnl": 13528.804296117527,
+        "max_drawdown": -6152.8567520697825,
+        "start": "05/28/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.16311037861273425
+      }
+    },
+    "30/40": {
+      "overall": {
+        "trades": 221,
+        "win_rate": 74.2081447963801,
+        "avg_win_pct": 58.29108935054801,
+        "avg_loss_pct": -89.96067568830348,
+        "expectancy_pct": 20.054208774916646,
+        "total_pnl": 40554.6072969428,
+        "max_drawdown": -6291.352811431836,
+        "start": "04/15/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.22282454194351828
+      },
+      "first_half": {
+        "trades": 111,
+        "win_rate": 76.57657657657657,
+        "avg_win_pct": 60.14390539755465,
+        "avg_loss_pct": -90.22759940750123,
+        "expectancy_pct": 24.921751118892907,
+        "total_pnl": 25854.453962215164,
+        "max_drawdown": -4336.725383065131,
+        "start": "04/15/2026",
+        "end": "05/27/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.27690834576547674
+      },
+      "second_half": {
+        "trades": 110,
+        "win_rate": 71.81818181818181,
+        "avg_win_pct": 56.29755309743967,
+        "avg_loss_pct": -89.73680418187952,
+        "expectancy_pct": 15.142416045995168,
+        "total_pnl": 14700.153334727616,
+        "max_drawdown": -6291.352811431853,
+        "start": "05/28/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.1682490671777241
+      }
+    },
+    "30/50": {
+      "overall": {
+        "trades": 221,
+        "win_rate": 73.30316742081448,
+        "avg_win_pct": 58.83619753625841,
+        "avg_loss_pct": -86.98795102735654,
+        "expectancy_pct": 19.905768734207367,
+        "total_pnl": 37405.62572969443,
+        "max_drawdown": -5899.645077688587,
+        "start": "04/15/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.22117520815785963
+      },
+      "first_half": {
+        "trades": 111,
+        "win_rate": 75.67567567567568,
+        "avg_win_pct": 60.22522983459217,
+        "avg_loss_pct": -86.89722384839875,
+        "expectancy_pct": 24.438687046837636,
+        "total_pnl": 23679.669332024714,
+        "max_drawdown": -4715.956117583923,
+        "start": "04/15/2026",
+        "end": "05/27/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.27154096718708487
+      },
+      "second_half": {
+        "trades": 110,
+        "win_rate": 70.9090909090909,
+        "avg_win_pct": 57.34031659959131,
+        "avg_loss_pct": -87.06450208460211,
+        "expectancy_pct": 15.331642073280475,
+        "total_pnl": 13725.956397669755,
+        "max_drawdown": -5899.645077688586,
+        "start": "05/28/2026",
+        "end": "07/10/2026",
+        "acct_ret_pct_per_trade_sizing_fair": 0.17035157859200528
+      }
+    }
+  },
+  "both_halves_pass": {
+    "15/30": false,
+    "15/40": false,
+    "15/50": false,
+    "20/30": false,
+    "20/40": false,
+    "20/50": false,
+    "25/30": false,
+    "25/50": false,
+    "30/30": false,
+    "30/40": false,
+    "30/50": false
+  },
+  "caveats": [
+    "~60 trading days of 5m data total, so each half is only ~6 weeks; small per-half samples make single trades move win rate several points",
+    "12-cell joint grid on one small window raises the overfit risk above the 1-D sweeps; the both-halves bar helps but does not eliminate it",
+    "same data window that selected stop -90 \u2014 the stop choice and this sweep are not independent tests",
+    "approximated Black-Scholes 0DTE pricing (optimistic) \u2014 trust relative ranking between cells, not the dollar levels",
+    "total_pnl/max_drawdown use the backtester's standard fixed 2 contracts; LIVE sizing is risk-based, but the stop is fixed at -90 for every cell so acct_ret_pct_per_trade_sizing_fair is a constant rescale of expectancy and cannot change the ranking here"
+  ]
+}
