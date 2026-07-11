@@ -130,10 +130,9 @@ class Service:
         self.feed = DataFeed()
         book_path = (config.DATA_DIR / "positions_dryrun.json") if dry_run else None
         self.book = PositionBook(book_path)
-        self.backtest_old = scoreboard.load_report("backtest_results.json")
-        self.backtest_new = scoreboard.load_report("backtest_new_rules.json")
-        self.old_bracket = (self.backtest_old or {}).get(
-            "bracket", {"target_pct": 15, "stop_pct": -60})
+        self.backtest_old = None  # loaded by reload_tunables()
+        self.backtest_new = None
+        self.reload_tunables()
         self.day = None
         self.skipped_today = set()
         self.daily_closes = {}
@@ -220,11 +219,36 @@ class Service:
             target=self.flush_pending, daemon=True, name="flush-pending")
         self._flush_thread.start()
 
+    def reload_tunables(self):
+        """Pick up the overnight backtest without a redeploy. The daemon
+        lives for weeks, but backtest.py rewrites the report jsons overnight,
+        so re-read them (and rebuild cfg) whenever the trading date flips.
+        A report that is missing or unreadable keeps the previous in-memory
+        stats: stale-but-verified beats wiping the alert gate mid-flight."""
+        for attr, name in (("backtest_old", "backtest_results.json"),
+                           ("backtest_new", "backtest_new_rules.json")):
+            fresh = scoreboard.load_report(name)
+            prev = getattr(self, attr, None)
+            if fresh is not None:
+                setattr(self, attr, fresh)
+                if prev is not None and fresh != prev:
+                    print(f"reloaded {name}: stats changed overnight")
+            elif prev is not None:
+                print(f"{name} unreadable on reload — keeping previous stats")
+        self.old_bracket = (self.backtest_old or {}).get(
+            "bracket", {"target_pct": 15, "stop_pct": -60})
+        self.cfg = StrategyConfig()
+
     def reset_day(self, now: datetime):
         if self.day != now.date():
             self.day = now.date()
             self.skipped_today = set()
             self.daily_closes = {}
+            # Also on the process's FIRST flip: a daemon started the evening
+            # before must not trade its first morning on reports the overnight
+            # backtest already rewrote. Reload is idempotent, so the extra
+            # re-read right after __init__ costs nothing.
+            self.reload_tunables()
 
     def sigma(self, ticker: str) -> float:
         """Realized vol for estimates. Never raises — a throttled download

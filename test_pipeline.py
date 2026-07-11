@@ -395,6 +395,83 @@ finally:
 check("tg send_to: a part's send error is reported, later parts skipped",
       err == "400 boom" and len(calls) == 2)
 
+# --- reload_tunables: the overnight backtest reaches the morning session ---
+# Service used to load backtest_results.json / backtest_new_rules.json once in
+# __init__ and never again, so a daemon alive for weeks gated entries on
+# frozen stats. Now the reports are re-read when the trading date flips.
+import json as _json
+import tempfile
+from pathlib import Path
+
+import scanner as scannermod
+import scoreboard
+
+_reports = Path(tempfile.mkdtemp(prefix="reload_test_"))
+_orig_reports_dir = scoreboard.REPORTS_DIR
+
+
+def _write_report(name, obj):
+    (_reports / name).write_text(_json.dumps(obj), encoding="utf-8")
+
+
+svc = scannermod.Service.__new__(scannermod.Service)  # plumbing only, no feed/book
+svc.day = None
+svc.skipped_today = set()
+svc.daily_closes = {}
+svc.backtest_old = None
+svc.backtest_new = None
+
+try:
+    scoreboard.REPORTS_DIR = _reports
+    _write_report("backtest_results.json",
+                  {"per_setup": {"SPX:call": {"win_rate": 71.0,
+                                              "expectancy_pct": 4.0}},
+                   "bracket": {"target_pct": 15, "stop_pct": -60}})
+    svc.reload_tunables()  # what __init__ does at process start
+    check("reload: initial load picks up report, bracket and cfg",
+          svc.backtest_old["per_setup"]["SPX:call"]["win_rate"] == 71.0
+          and svc.old_bracket == {"target_pct": 15, "stop_pct": -60}
+          and svc.backtest_new is None
+          and isinstance(svc.cfg, scannermod.StrategyConfig))
+
+    # backtest.py rewrites the reports overnight; a daemon started the
+    # evening before must pick that up on its FIRST reset_day of the morning
+    _write_report("backtest_results.json",
+                  {"per_setup": {"SPX:call": {"win_rate": 74.0,
+                                              "expectancy_pct": 6.0}},
+                   "bracket": {"target_pct": 20, "stop_pct": -50}})
+    _write_report("backtest_new_rules.json",
+                  {"per_setup": {"SPX:call": {"win_rate": 73.0,
+                                              "expectancy_pct": 7.5}}})
+    svc.skipped_today = {"SPX:call"}
+    svc.reset_day(datetime(2026, 6, 12, 9, 31, tzinfo=ET))
+    check("reload: date flip picks up the overnight backtest",
+          svc.backtest_old["per_setup"]["SPX:call"]["win_rate"] == 74.0
+          and svc.backtest_new["per_setup"]["SPX:call"]["expectancy_pct"] == 7.5
+          and svc.old_bracket == {"target_pct": 20, "stop_pct": -50})
+    check("reload: date flip still resets the day state",
+          svc.day == date(2026, 6, 12) and svc.skipped_today == set())
+
+    # a corrupt overnight write keeps yesterday's verified stats
+    (_reports / "backtest_results.json").write_text("{not json",
+                                                    encoding="utf-8")
+    svc.reset_day(datetime(2026, 6, 13, 9, 31, tzinfo=ET))
+    check("reload: corrupt report keeps previous stats, gate stays alive",
+          svc.backtest_old["per_setup"]["SPX:call"]["win_rate"] == 74.0
+          and svc.old_bracket == {"target_pct": 20, "stop_pct": -50})
+
+    # same-day cycles must not re-read the files every poll
+    _write_report("backtest_results.json",
+                  {"per_setup": {}, "bracket": {"target_pct": 99,
+                                                "stop_pct": -1}})
+    svc.reset_day(datetime(2026, 6, 13, 14, 0, tzinfo=ET))
+    check("reload: same-day cycle does not reload",
+          svc.old_bracket == {"target_pct": 20, "stop_pct": -50})
+finally:
+    scoreboard.REPORTS_DIR = _orig_reports_dir
+    import shutil
+    shutil.rmtree(_reports, ignore_errors=True)
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")
