@@ -526,6 +526,12 @@ for DEEP reasoning because it is hard, open-ended, technical, or outside the
 bot's normal tools. Take your time and give the highest-quality answer you can:
 reason it through carefully and be genuinely useful, specific, and correct.
 
+You may get background blocks before the question: LIVE BOT STATE (the bot's
+live context), WHAT I'VE LEARNED (the playbook from grading its own calls), and
+RECENT CONVERSATION (the last few chat turns, oldest first). Use them to
+resolve references like "the second one" and to ground the answer. They are
+background, not the question.
+
 Rules:
 - Be thorough but tight. Telegram-readable: lead with the answer, then the why,
   in short paragraphs or clean bullets. No walls of text.
@@ -565,6 +571,36 @@ def deep_think(question: str, context: str = "") -> str:
     text = "".join(b.get("text", "") for b in body.get("content", [])
                    if b.get("type") == "text").strip()
     return text or "the deep brain came back empty, try rephrasing?"
+
+
+DEEP_CONTEXT_TURNS = 6    # history entries handed to the deep brain (3 exchanges)
+DEEP_CONTEXT_CHARS = 500  # per-turn cap so a pasted wall can't bloat the prompt
+
+
+def _deep_context(context_text: str, history: list, user_text: str = "") -> str:
+    """Everything the deep brain should know beyond the raw question: the same
+    LIVE BOT STATE block every normal reply gets, the learned playbook, and the
+    last few chat turns so an escalated follow-up ("what about the second
+    one?") still makes sense. Without this, deep_think reasons blind."""
+    parts = ["LIVE BOT STATE:\n" + context_text.strip()]
+    lessons = _lessons_block().strip()
+    if lessons:
+        parts.append(lessons)
+    lines = []
+    for turn in history[-DEEP_CONTEXT_TURNS:]:
+        body = turn.get("content")
+        if not isinstance(body, str) or not body.strip():
+            continue  # history is text-only today; never crash the escalation
+        body = " ".join(body.split())
+        if len(body) > DEEP_CONTEXT_CHARS:
+            body = body[:DEEP_CONTEXT_CHARS] + " [...]"
+        lines.append(("User: " if turn.get("role") == "user" else "Bot: ") + body)
+    if user_text.strip():
+        lines.append("User (the message being answered now): "
+                     + " ".join(user_text.split())[:DEEP_CONTEXT_CHARS])
+    if lines:
+        parts.append("RECENT CONVERSATION (oldest first):\n" + "\n".join(lines))
+    return "\n\n".join(parts)
 
 
 def _load_history() -> dict:
@@ -713,7 +749,8 @@ def _hi_conviction(read) -> bool:
                 and read.get("plan") and (read.get("fvg") or {}).get("confirming"))
 
 
-def _run_tool(name: str, args: dict, chat_id: str, attachments: list = None) -> str:
+def _run_tool(name: str, args: dict, chat_id: str, attachments: list = None,
+              deep_context: str = "") -> str:
     try:
         if name == "log_trade_result":
             entry = log_trade(chat_id, args["profit_dollars"],
@@ -723,8 +760,9 @@ def _run_tool(name: str, args: dict, chat_id: str, attachments: list = None) -> 
         if name == "get_score":
             return json.dumps(score(chat_id))
         if name == "ask_deep":
-            # never "I'm not trained": escalate to deep Fable 5 reasoning
-            return deep_think(args.get("question", ""))
+            # never "I'm not trained": escalate to deep reasoning, with the
+            # live state, playbook, and recent turns so it doesn't reason blind
+            return deep_think(args.get("question", ""), context=deep_context)
         if name == "request_new_ticker":
             return _request_ticker(args.get("ticker", ""), chat_id,
                                    args.get("asked_by", ""))
@@ -817,6 +855,7 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True,
 
     history = _load_history().get(chat_id, [])
     messages = history + [{"role": "user", "content": blocks}]
+    deep_ctx = _deep_context(context_text, history, user_text)
     reply = ""
     deep_answer = ""  # raw ask_deep result, kept so a dead relay can't eat it
     force_text = False
@@ -855,7 +894,7 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True,
                 if b.get("type") != "tool_use":
                     continue
                 out = _run_tool(b["name"], b.get("input", {}), chat_id,
-                                attachments)
+                                attachments, deep_ctx)
                 if b["name"] == "ask_deep" and out:
                     deep_answer = out
                 results.append({"type": "tool_result", "tool_use_id": b["id"],

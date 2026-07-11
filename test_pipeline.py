@@ -341,6 +341,85 @@ finally:
         assistant.HISTORY_FILE.unlink()
     assistant.HISTORY_FILE = config.DATA_DIR / "chat_history.json"
 
+# --- chat brain: ask_deep escalates WITH context, not blind ---
+# deep_think always accepted a context arg but _run_tool never passed it, so
+# the deep brain got only the raw question: no live bot state, no learned
+# playbook, no conversation. A follow-up like "what about the second one?"
+# was unanswerable. respond() now assembles _deep_context and threads it in.
+import json as _json
+import os as _os
+
+assistant.HISTORY_FILE = config.DATA_DIR / "chat_history_test.json"
+_orig_digest = assistant.LESSONS_DIGEST
+assistant.LESSONS_DIGEST = config.DATA_DIR / "lessons_digest_test.md"
+try:
+    # the plumbing: deep_think prepends the context block to the question
+    _had_key = bool(_os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    if not _had_key:
+        _os.environ["ANTHROPIC_API_KEY"] = "test-key"
+    assistant._post_anthropic, seen = _scripted([_text("deep out")])
+    out = assistant.deep_think("hard q?", context="BACKGROUND")
+    check("deep ctx: deep_think prepends context to the question",
+          out == "deep out" and
+          seen[0]["messages"][0]["content"] == "BACKGROUND\n\nQuestion: hard q?",
+          f"got {seen[0]['messages'][0]['content']!r}")
+    if not _had_key:
+        del _os.environ["ANTHROPIC_API_KEY"]
+
+    # end to end: respond() hands ask_deep the state, playbook, and turns
+    assistant.LESSONS_DIGEST.write_text(
+        "- never chase a late SPX call after 10:30 CT", encoding="utf-8")
+    assistant.HISTORY_FILE.write_text(_json.dumps({"u9": [
+        {"role": "user", "content": "any setups today"},
+        {"role": "assistant", "content": "two setups: SPX call and a QCOM put"},
+    ]}), encoding="utf-8")
+    captured = {}
+
+    def _fake_deep(q, context=""):
+        captured["q"], captured["context"] = q, context
+        return "DEEP OUT"
+
+    assistant.deep_think = _fake_deep
+    assistant._post_anthropic, seen = _scripted(
+        [_tooluse("ask_deep", {"question": "what about the second one?"}),
+         _text("relayed")])
+    r = assistant.respond(_msg, "book: 1 open SPX call")
+    ctx = captured.get("context", "")
+    check("deep ctx: question still passed through",
+          r == "relayed" and captured.get("q") == "what about the second one?")
+    check("deep ctx: live bot state included",
+          "LIVE BOT STATE:" in ctx and "book: 1 open SPX call" in ctx, f"got {ctx!r}")
+    check("deep ctx: learned playbook included",
+          "WHAT I'VE LEARNED" in ctx and "never chase a late SPX call" in ctx)
+    check("deep ctx: recent turns included",
+          "RECENT CONVERSATION" in ctx and "SPX call and a QCOM put" in ctx)
+    check("deep ctx: current message is the newest line",
+          "User (the message being answered now): why did SPX rip today?" in ctx)
+
+    # shaping: caps hold, oldest turns drop, non-text content never crashes
+    ctx = assistant._deep_context(
+        "state", [{"role": "user", "content": "x" * 3000}], "now?")
+    check("deep ctx: long turns truncated to the cap",
+          "x" * assistant.DEEP_CONTEXT_CHARS + " [...]" in ctx
+          and "x" * (assistant.DEEP_CONTEXT_CHARS + 1) not in ctx)
+    turns = [{"role": "user", "content": f"turn T{i} here"} for i in range(10)]
+    ctx = assistant._deep_context("state", turns, "")
+    check("deep ctx: only the newest turns ride along",
+          "turn T9 here" in ctx and "turn T4 here" in ctx
+          and "turn T3 here" not in ctx)
+    ctx = assistant._deep_context(
+        "state", [{"role": "user", "content": ["blocks"]}], "")
+    check("deep ctx: non-text history skipped without a conversation block",
+          "RECENT CONVERSATION" not in ctx and "LIVE BOT STATE:" in ctx)
+finally:
+    assistant._post_anthropic = _orig_post
+    assistant.deep_think = _orig_deep
+    for _f in (assistant.HISTORY_FILE, assistant.LESSONS_DIGEST):
+        if _f.exists():
+            _f.unlink()
+    assistant.HISTORY_FILE = config.DATA_DIR / "chat_history.json"
+    assistant.LESSONS_DIGEST = _orig_digest
+
 # --- market_tools: 15-min momentum is session-scoped, never the overnight gap ---
 import pandas as pd
 
