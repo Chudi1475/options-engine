@@ -412,6 +412,35 @@ def _atr(bars, n=14):
     return val if val > 0 and not pd.isna(val) else None
 
 
+def _prior_daily_close(closes_d, asof_ts=None):
+    """The last DAILY close from a session strictly BEFORE the one the current
+    price sits in. iloc[-2] assumed the daily frame's last row is always the
+    current session's partial bar; pre-open (and whenever yfinance hasn't
+    posted that partial row yet) it quietly reached back TWO sessions, so
+    day_move_pct became the overnight gap plus a whole extra day. Sessions are
+    compared on the daily frame's own clock (exchange days for stocks, UTC
+    days for 24h symbols): the intraday timestamp is converted INTO that
+    clock, never the daily rows out of it, so a UTC-stamped crypto row keeps
+    its own day. asof_ts=None (price came from the daily frame itself) treats
+    the last row as the current session. None when no earlier session exists."""
+    if closes_d is None or len(closes_d) == 0:
+        return None
+    idx = closes_d.index
+    try:
+        if asof_ts is None:
+            asof_date = idx[-1].date()
+        else:
+            tz = getattr(idx, "tz", None)
+            if tz is not None and getattr(asof_ts, "tzinfo", None) is not None:
+                asof_ts = asof_ts.astimezone(tz)
+            asof_date = asof_ts.date()
+        prior = closes_d[[d < asof_date for d in idx.date]]
+        return float(prior.iloc[-1]) if len(prior) else None
+    except (AttributeError, TypeError, ValueError):
+        # unrecognizable index -> the old assumption beats losing the field
+        return float(closes_d.iloc[-2]) if len(closes_d) >= 2 else None
+
+
 def _signal_symbol(disp, kind):
     """The symbol a trader actually places the order on: gold -> XAUUSD,
     EUR/USD -> EURUSD, BTC/USD -> BTCUSD, a stock -> its ticker."""
@@ -529,7 +558,8 @@ def _do_read(disp, yfs, dec, kind, source):
         # these bars instead of paying a third yfinance download
         _M5_CACHE[yfs] = (datetime.now(ET), m5)
     price = float(m5["Close"].dropna().iloc[-1]) if have_5m else float(closes_d.iloc[-1])
-    prior_close = float(closes_d.iloc[-2]) if len(closes_d) >= 2 else None
+    prior_close = _prior_daily_close(
+        closes_d, m5["Close"].dropna().index[-1] if have_5m else None)
 
     # how old is the last bar? Used to tell a LIVE read from a stale one (market
     # closed / weekend), so we never dress a last-session close up as a live

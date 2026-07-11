@@ -441,8 +441,8 @@ class _FakeYF:
         return self.d1 if interval == "1d" else self.m5
 
 
-def _daily(last=105.0, n=25):
-    idx = pd.date_range(end="2026-06-11", periods=n, freq="B")
+def _daily(last=105.0, n=25, end="2026-06-11"):
+    idx = pd.date_range(end=end, periods=n, freq="B")
     close = [100.0] * (n - 1) + [last]
     return pd.DataFrame({"Open": close, "High": [x + 1 for x in close],
                          "Low": [x - 1 for x in close], "Close": close,
@@ -492,6 +492,65 @@ try:
           and abs(r["recent_session_high"] - 110.2) < 1e-9
           and abs(r["recent_session_low"] - 104.8) < 1e-9,
           f"got {r.get('recent_session_high')}/{r.get('recent_session_low')}")
+
+    # --- prior_close / day_move_pct never span two sessions ---
+    # normal RTH read (daily frame carries today's partial row): prior close
+    # is yesterday's, and the day move is today's real move
+    check("prior_close: normal RTH read uses yesterday's close",
+          abs(r["prior_close"] - 100.0) < 1e-9
+          and abs(r["day_move_pct"] - 10.0) < 0.011,
+          f"got {r.get('prior_close')}/{r.get('day_move_pct')}")
+
+    # pre-open / early session: yfinance hasn't posted today's daily row, so
+    # iloc[-2] was TWO sessions back and the "day move" swallowed yesterday's
+    # whole range (here +5% instead of the real +0.96% gap)
+    mt.yf = _FakeYF(_daily(last=104.0, end="2026-06-10"),
+                    _m5_frame([104.0] * 6, [105.0, 105.0]))
+    r = mt._do_read("TSLA", "TSLA", 2, "stock", "test")
+    check("prior_close: pre-open read steps back ONE session, not two",
+          r.get("prior_close") is not None
+          and abs(r["prior_close"] - 104.0) < 1e-9,
+          f"got {r.get('prior_close')}")
+    check("prior_close: pre-open day move is the gap only",
+          r.get("day_move_pct") is not None
+          and abs(r["day_move_pct"] - 0.96) < 0.011,
+          f"got {r.get('day_move_pct')}")
+
+    # 24h symbol: crypto daily rows are stamped on the UTC clock, and by 3pm
+    # ET the current UTC day's PARTIAL row (~= live price) is already in the
+    # frame. Sessions must be matched on the daily frame's own clock or that
+    # partial row becomes the "prior close" and the day move reads ~0.
+    _cl = [100.0] * 24 + [105.0]
+    _d_utc = pd.DataFrame(
+        {"Open": _cl, "High": [x + 1 for x in _cl],
+         "Low": [x - 1 for x in _cl], "Close": _cl, "Volume": [0] * 25},
+        index=pd.date_range(end="2026-06-11", periods=25, freq="D", tz="UTC"))
+    _m5_utc = pd.DataFrame(
+        {"Open": [105.0] * 6, "High": [105.2] * 6, "Low": [104.8] * 6,
+         "Close": [105.0] * 6, "Volume": [0] * 6},
+        index=pd.date_range("2026-06-11 18:00", periods=6, freq="5min",
+                            tz="UTC"))
+    mt.yf = _FakeYF(_d_utc, _m5_utc)
+    r = mt._do_read("Bitcoin", "BTC-USD", 2, "crypto", "test")
+    check("prior_close: UTC-stamped daily never serves the partial today row",
+          r.get("prior_close") is not None
+          and abs(r["prior_close"] - 100.0) < 1e-9
+          and abs(r["day_move_pct"] - 5.0) < 0.011,
+          f"got {r.get('prior_close')}/{r.get('day_move_pct')}")
+
+    # market closed, no intraday at all: the last daily row IS the current
+    # session, so prior close steps back one full row from it
+    mt.yf = _FakeYF(_daily(last=110.0), pd.DataFrame())
+    r = mt._do_read("TSLA", "TSLA", 2, "stock", "test")
+    check("prior_close: daily-only fallback steps back one session",
+          r.get("prior_close") is not None
+          and abs(r["prior_close"] - 100.0) < 1e-9
+          and r.get("stale") is True,
+          f"got {r.get('prior_close')}/{r.get('stale')}")
+
+    # one daily row: no earlier session exists -> None, never a fake number
+    check("prior_close: single daily row -> None",
+          mt._prior_daily_close(_daily(n=1)["Close"], None) is None)
 finally:
     mt.yf = _orig_yf
     risk_gate.upcoming_events = _orig_ev
