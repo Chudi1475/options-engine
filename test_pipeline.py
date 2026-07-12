@@ -731,7 +731,7 @@ try:
     learn._append_lesson(_lentry("2026-06-01", ["real lesson A"]))
     learn._append_lesson(_lentry("2026-06-02", ["Same  old lesson."]))
     learn._append_lesson(_lentry("2026-06-03", ["same old lesson.", ""]))
-    learn._append_lesson(_lentry("2026-06-03", None))  # legacy null entry
+    learn._append_lesson(_lentry("2026-06-05", None))  # legacy null entry
     learn._append_lesson(_lentry("2026-06-04", ["real lesson B"]))
     learn._rebuild_digest()
     got = _digest_bullets()
@@ -745,9 +745,12 @@ try:
                   f"- ({_tag('2026-06-01')}) real lesson A"],
           f"got {got}")
 
-    # a slow stretch repeating one bullet cannot evict the real lessons
-    for _ in range(30):
-        learn._append_lesson(_lentry("2026-06-05", ["repeat me"]))
+    # a slow stretch of DIFFERENT nights repeating one bullet cannot evict
+    # the real lessons (the original bug: the same quiet-day lesson landed
+    # every night)
+    for i in range(30):
+        day = (date(2026, 6, 6) + timedelta(days=i)).isoformat()
+        learn._append_lesson(_lentry(day, ["repeat me"]))
     learn._rebuild_digest()
     got = _digest_bullets()
     check("learn: 30 identical nights collapse to one bullet",
@@ -758,7 +761,8 @@ try:
 
     # the window still caps at DIGEST_KEEP, newest distinct bullets win
     for i in range(25):
-        learn._append_lesson(_lentry("2026-06-08", [f"distinct lesson {i:02d}"]))
+        day = (date(2026, 7, 6) + timedelta(days=i)).isoformat()
+        learn._append_lesson(_lentry(day, [f"distinct lesson {i:02d}"]))
     learn._rebuild_digest()
     got = _digest_bullets()
     check("learn: window capped at DIGEST_KEEP distinct bullets",
@@ -961,6 +965,103 @@ finally:
             f.unlink()
     learn.LESSONS_LOG, learn.LESSONS_DIGEST = _orig_llog, _orig_ldig
     learn.et_now = _orig_et_now
+
+# --- learn log idempotency: re-running a session upserts, backfills stay old ---
+# run() appended a fresh row every call, so a --date backfill or a crash-refire
+# between send and dedup-mark double-counted a session's lessons, and
+# _rebuild_digest ordered bullets by file position, so a backfilled OLD night
+# landed at the end of the file and masqueraded as the newest guidance. Nightly
+# and coach rows now upsert by session (per-trade deep-review rows stay
+# additive), and the digest plus the reviewer's nightly reads order by the
+# actual session date.
+learn.LESSONS_LOG = config.DATA_DIR / "lessons_test.jsonl"
+learn.LESSONS_DIGEST = config.DATA_DIR / "lessons_digest_test.md"
+
+
+def _lrow(day, review, lessons):
+    e = _lentry(day, lessons)
+    e["review"] = review
+    return e
+
+
+try:
+    for f in (learn.LESSONS_LOG, learn.LESSONS_DIGEST):
+        if f.exists():
+            f.unlink()
+
+    # a re-run of the same session replaces its nightly row, never stacks it
+    learn._append_lesson(_lentry("2026-06-20", ["first pass"]))
+    learn._append_lesson(_lentry("2026-06-20", ["second pass"]))
+    rows = learn._all_lessons()
+    check("upsert: re-run keeps one nightly row per session",
+          len(rows) == 1 and rows[0]["lessons"] == ["second pass"],
+          f"got {rows}")
+    learn._rebuild_digest()
+    txt = learn.LESSONS_DIGEST.read_text(encoding="utf-8")
+    check("upsert: digest counts the re-run once",
+          "second pass" in txt and "first pass" not in txt, f"got {txt!r}")
+
+    # deep-review rows are per trade: two on one session both survive, and a
+    # nightly re-run for that session leaves them alone
+    learn._append_lesson(_lrow("2026-06-20", "deep review SPX 2026-06-20: a",
+                               ["deep lesson one"]))
+    learn._append_lesson(_lrow("2026-06-20", "deep review TSLA 2026-06-20: b",
+                               ["deep lesson two"]))
+    learn._append_lesson(_lentry("2026-06-20", ["third pass"]))
+    rows = learn._all_lessons()
+    check("upsert: deep-review rows stay additive across the upsert",
+          sum(r["review"].startswith("deep review ") for r in rows) == 2
+          and sum(not r["review"].startswith(("deep review ", "coach: "))
+                  for r in rows) == 1, f"got {rows}")
+
+    # the coach's row upserts independently of the nightly row
+    learn._append_lesson(_lrow("2026-06-20", "coach: read one", ["coach A"]))
+    learn._append_lesson(_lrow("2026-06-20", "coach: read two", ["coach B"]))
+    rows = learn._all_lessons()
+    coach_rows = [r for r in rows if r["review"].startswith("coach: ")]
+    check("upsert: one coach row per session, newest wins",
+          len(coach_rows) == 1 and coach_rows[0]["lessons"] == ["coach B"],
+          f"got {coach_rows}")
+    check("upsert: nightly row survives the coach upsert",
+          any(r["lessons"] == ["third pass"] for r in rows), f"got {rows}")
+
+    # a line the parser cannot read is preserved by the rewrite, not destroyed
+    with learn.LESSONS_LOG.open("a", encoding="utf-8") as f:
+        f.write("{corrupt json\n")
+    learn._append_lesson(_lentry("2026-06-20", ["fourth pass"]))
+    raw = learn.LESSONS_LOG.read_text(encoding="utf-8")
+    check("upsert: unparseable line survives the rewrite",
+          "{corrupt json" in raw, f"got {raw!r}")
+
+    # a backfilled old session appended LAST cannot masquerade as the newest
+    # guidance, in the digest or in the reviewer's nightly reads
+    learn._append_lesson(_lentry("2026-06-21", ["newest real lesson"]))
+    learn._append_lesson(_lentry("2026-06-02", ["ancient backfill lesson"]))
+    learn._rebuild_digest()
+    got = _digest_bullets()
+    check("digest: bullets order by session date, not append order",
+          "newest real lesson" in got[0] and "ancient backfill" in got[-1],
+          f"got {got}")
+    brief = learn._day_brief(_quiet_record("2026-06-22"))
+    reads = [ln for ln in brief.splitlines() if ln.startswith("- 2026-")]
+    check("brief: nightly reads order by session date, not append order",
+          reads and reads[0].startswith("- 2026-06-21"), f"got {reads}")
+
+    # a malformed legacy session (an int, junk text) sorts oldest and tags
+    # as-is instead of aborting the whole digest rebuild
+    bad = _lentry("2026-06-18", ["int session lesson"])
+    bad["session"] = 20260618
+    learn._append_lesson(bad)
+    learn._rebuild_digest()
+    got = _digest_bullets()
+    check("digest: malformed legacy session cannot abort the rebuild",
+          any("int session lesson" in ln for ln in got)
+          and "newest real lesson" in got[0], f"got {got}")
+finally:
+    for f in (learn.LESSONS_LOG, learn.LESSONS_DIGEST):
+        if f.exists():
+            f.unlink()
+    learn.LESSONS_LOG, learn.LESSONS_DIGEST = _orig_llog, _orig_ldig
 
 # --- telegram 409 conflict: a second bot instance must not be invisible ---
 # Two processes polling the same token make Telegram answer 409 Conflict.

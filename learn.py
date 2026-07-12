@@ -8,9 +8,11 @@ double-firing). It reads the day's tracked positions (positions.json) plus any
 legacy alerts, grades each one RIGHT/WRONG with the SAME logic the 4 PM recap
 uses, then asks the Claude brain to distill 1-3 concrete lessons: what the good
 calls had in common, what the mistakes had in common, and what to watch
-tomorrow. Lessons are appended to lessons.jsonl and distilled into
-lessons_digest.md, which the conversational brain reads on every reply, so
-accumulated learning actually changes how it reasons. The newest
+tomorrow. Lessons are written to lessons.jsonl (one nightly row per session; a
+re-run of an already-reviewed session replaces its earlier row instead of
+double-counting it) and distilled into lessons_digest.md, which the
+conversational brain reads on every reply, so accumulated learning actually
+changes how it reasons. The newest
 watch_tomorrow line is pinned at the top of that digest for exactly its
 target session, so the one time-sensitive output actually shapes the next
 day instead of evaporating overnight.
@@ -32,7 +34,7 @@ import sys
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import config
@@ -288,7 +290,8 @@ def _prior_learning_block(session: str) -> list:
     prior lessons instead of re-deriving them from scratch every night, and
     can flag when today confirms or violates one. The playbook bullets come
     from the digest (already deduped and capped by _rebuild_digest); the
-    nightly reads come from lessons.jsonl, newest first, one per session."""
+    nightly reads come from lessons.jsonl, newest session first, one per
+    session."""
     lines = []
     try:
         if LESSONS_DIGEST.exists():
@@ -302,7 +305,7 @@ def _prior_learning_block(session: str) -> list:
     except OSError:
         pass
     reads, seen_days = [], set()
-    for entry in reversed(_all_lessons()):
+    for entry in _by_session_newest_first(_all_lessons()):
         review = (entry.get("review") or "").strip()
         day = entry.get("session", "")
         # skip tonight's own session (a re-run would echo itself) and the
@@ -413,7 +416,54 @@ def synthesize(record) -> dict:
 
 # ---------------------------- persist + deliver ----------------------------
 
+def _lesson_kind(entry: dict) -> str:
+    """Which writer produced a lessons.jsonl row. run() writes one 'nightly'
+    row per session and coach.reflect one 'coach' row per session, so those
+    upsert on a re-run; 'deep' rows are one PER TRADE (several can share a
+    session date, each trade id reviewed at most once via _reviewed_ids), so
+    they stay append-only."""
+    review = str(entry.get("review") or "")
+    if review.startswith("deep review "):
+        return "deep"
+    if review.startswith("coach: "):
+        return "coach"
+    return "nightly"
+
+
 def _append_lesson(entry: dict):
+    """Persist one lessons.jsonl row. Nightly and coach rows UPSERT by
+    (session, kind): re-running an already-reviewed session (a --date
+    backfill, a crash-restart re-fire between send and dedup-mark) replaces
+    the previous row instead of stacking a duplicate the digest would count
+    twice. The first review of a session is still a pure append; a line the
+    parser cannot read is preserved verbatim, never destroyed."""
+    kind = _lesson_kind(entry)
+    session = entry.get("session")
+    if kind != "deep" and session and LESSONS_LOG.exists():
+        try:
+            lines = LESSONS_LOG.read_text(encoding="utf-8-sig").splitlines()
+        except OSError:
+            lines = None
+        if lines is not None:
+            kept, dropped = [], 0
+            for line in lines:
+                try:
+                    old = json.loads(line)
+                except json.JSONDecodeError:
+                    kept.append(line)
+                    continue
+                if old.get("session") == session and _lesson_kind(old) == kind:
+                    dropped += 1
+                    continue
+                kept.append(line)
+            if dropped:
+                try:
+                    tmp = LESSONS_LOG.with_suffix(".jsonl.tmp")
+                    tmp.write_text("\n".join(kept) + ("\n" if kept else ""),
+                                   encoding="utf-8")
+                    tmp.replace(LESSONS_LOG)
+                except OSError as e:  # rewrite failed: append still lands below
+                    print(f"learn: lesson upsert rewrite failed ({e}); appending")
     with LESSONS_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
@@ -428,6 +478,23 @@ def _all_lessons() -> list:
         except json.JSONDecodeError:
             continue
     return out
+
+
+def _by_session_newest_first(entries: list) -> list:
+    """Entries ordered by their actual session date, newest first (file
+    position breaks ties, later rows win), instead of raw append order: a
+    backfilled OLD session lands at the END of the file and must not
+    masquerade as the newest guidance in the digest or the reviewer's
+    nightly reads. Rows with an unparseable session sort oldest."""
+    def key(pair):
+        i, entry = pair
+        try:
+            d = datetime.strptime(str(entry.get("session") or ""),
+                                  "%Y-%m-%d").date()
+        except ValueError:
+            d = date.min
+        return (d, i)
+    return [e for _, e in sorted(enumerate(entries), key=key, reverse=True)]
 
 
 def _next_weekday(d):
@@ -462,25 +529,27 @@ def _latest_watch():
 
 def _rebuild_digest():
     """Rewrite the distilled playbook the brain reads: the most recent lesson
-    bullets, newest first, capped so the prompt never bloats. A lesson whose
-    text repeats across nights keeps only its newest occurrence, so a stretch
-    of look-alike days cannot fill the window and evict real lessons. The
-    newest watch_tomorrow is pinned above the bullets as a dated FOR TODAY
-    line that expires once its target session has passed."""
+    bullets, newest SESSION first (not file append order, so a backfilled old
+    night cannot sit on top as if it were last night's guidance), capped so
+    the prompt never bloats. A lesson whose text repeats across nights keeps
+    only its newest occurrence, so a stretch of look-alike days cannot fill
+    the window and evict real lessons. The newest watch_tomorrow is pinned
+    above the bullets as a dated FOR TODAY line that expires once its target
+    session has passed."""
     bullets = []
-    for entry in _all_lessons():
+    for entry in _by_session_newest_first(_all_lessons()):
         d = entry.get("session", "")
         tag = ""
         if d:
             try:
-                tag = datetime.strptime(d, "%Y-%m-%d").strftime("%#m/%#d"
+                tag = datetime.strptime(str(d), "%Y-%m-%d").strftime("%#m/%#d"
                     if sys.platform.startswith("win") else "%-m/%-d")
-            except ValueError:
-                tag = d
+            except ValueError:  # malformed legacy row: keep it, tag it as-is
+                tag = str(d)
         for lesson in entry.get("lessons") or []:
             bullets.append((tag, str(lesson)))
     seen, deduped = set(), []
-    for tag, lesson in reversed(bullets):  # newest first, newest copy wins
+    for tag, lesson in bullets:  # newest session first, its copy wins the dedup
         key = " ".join(lesson.lower().split())
         if not key or key in seen:
             continue
