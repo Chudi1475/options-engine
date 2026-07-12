@@ -1215,6 +1215,98 @@ finally:
         config.STATE_FILE.unlink()
     config.STATE_FILE = _orig_state_file2
 
+# --- est_entry backfill: throttled vol at entry no longer kills the stop ---
+# If the vol download was throttled at entry, est_entry was stored 0.0 and
+# est_pct stayed None for the position's whole life; the first stale/bid-less
+# quote stretch then had NO stop signal at all. monitor_one now rebuilds the
+# baseline (the model price at the recorded entry moment) the first cycle vol
+# is available, so the estimate stop-floor works again.
+import quotes
+
+
+class _StubFeed:
+    def __init__(self, px):
+        self.px = px
+
+    def latest_price(self, yfs):
+        return self.px
+
+
+class _StubBook:
+    def __init__(self):
+        self.saves = 0
+
+    def save(self):
+        self.saves += 1
+
+
+def _monitor_svc(spot, sigma):
+    svc = Service.__new__(Service)  # plumbing only: every I/O path is stubbed
+    svc.cfg = scannermod.StrategyConfig()
+    svc.feed = _StubFeed(spot)
+    svc.book = _StubBook()
+    svc.old_bracket = BRACKET
+    svc.get_bars = lambda yfs, now: None
+    svc.sigma = lambda t: sigma
+    svc.notified = []
+    svc.notify = lambda card: svc.notified.append(card) or []
+    return svc
+
+
+_orig_get_quote = quotes.get_option_quote
+quotes.get_option_quote = lambda *a, **k: None  # chain unavailable all cycle
+try:
+    _expiry16 = datetime.combine(TODAY, time(16, 0), tzinfo=ET)
+    _entry_dt = datetime(2026, 6, 11, 9, 50, tzinfo=ET)
+
+    # vol back + underlying collapsed: baseline is rebuilt AT THE ENTRY MOMENT
+    # and the restored stop-floor fires the exit that used to be impossible
+    p = mk_pos()  # est_entry defaults to 0.0 = throttled at entry
+    svc = _monitor_svc(spot=7200.0, sigma=0.25)
+    svc.monitor_one(p, at(11, 0))
+    want = quotes.estimate_premium(7297.0, 7300.0, "C", _expiry16,
+                                   _entry_dt, 0.25)
+    check("backfill: baseline rebuilt at the recorded entry moment",
+          want > 0 and abs(p.est_entry - want) < 0.005,
+          f"est_entry {p.est_entry}, want {want}")
+    check("backfill: restored stop-floor fires on the collapsed underlying",
+          p.state == "closed" and p.final_exit is not None
+          and p.final_exit["reason"] == "stop" and len(svc.notified) == 1,
+          f"state {p.state}, notified {len(svc.notified)}")
+    check("backfill: closed position persisted", svc.book.saves == 1)
+
+    # vol STILL throttled: no invented baseline, no false signal, cycle skipped
+    p = mk_pos()
+    svc = _monitor_svc(spot=7200.0, sigma=0.0)
+    svc.monitor_one(p, at(11, 0))
+    check("backfill: sigma 0 invents nothing and fires nothing",
+          p.est_entry == 0.0 and p.state == "open" and svc.notified == [])
+
+    # a healthy position's baseline is pinned at entry, never re-priced
+    p = mk_pos()
+    p.est_entry = 5.0
+    svc = _monitor_svc(spot=7297.0, sigma=0.25)
+    svc.monitor_one(p, at(10, 0))
+    check("backfill: existing baseline is left untouched",
+          p.est_entry == 5.0 and p.state == "open")
+
+    # malformed legacy records skip the repair instead of killing the cycle
+    p = mk_pos()
+    p.time_et = "not-a-time"
+    svc = _monitor_svc(spot=7200.0, sigma=0.25)
+    svc.monitor_one(p, at(11, 0))
+    check("backfill: malformed time_et skips repair, monitoring survives",
+          p.est_entry == 0.0 and p.state == "open")
+
+    p = mk_pos()
+    p.spot_at_signal = 0.0
+    svc = _monitor_svc(spot=7200.0, sigma=0.25)
+    svc.monitor_one(p, at(11, 0))
+    check("backfill: legacy record without spot_at_signal is skipped",
+          p.est_entry == 0.0 and p.state == "open")
+finally:
+    quotes.get_option_quote = _orig_get_quote
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")

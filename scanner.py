@@ -1225,6 +1225,29 @@ class Service:
         # "no estimate this cycle" so est can't become the mark or trip the stop.
         est = (quotes.estimate_premium(spot, pos.strike, pos.right,
                                        expiry_dt, now, sigma) if sigma > 0 else 0.0)
+        # A throttled vol download at ENTRY stored est_entry as 0.0, which
+        # would leave the model stop-floor dead for the position's whole life:
+        # the first stale/bid-less stretch then has NO stop signal at all and
+        # the position can bleed to the bell unwatched. The first cycle vol is
+        # back, rebuild the baseline the entry would have stored — the model
+        # price at the recorded entry moment — so est_pct compares
+        # model-to-model again. A malformed legacy record skips the repair
+        # rather than aborting the monitoring cycle.
+        if pos.est_entry <= 0 and sigma > 0 and pos.spot_at_signal > 0:
+            try:
+                entry_dt = datetime.combine(
+                    date.fromisoformat(pos.date),
+                    time.fromisoformat(pos.time_et), tzinfo=ET)
+                baseline = quotes.estimate_premium(
+                    pos.spot_at_signal, pos.strike, pos.right,
+                    expiry_dt, entry_dt, sigma)
+            except Exception:
+                baseline = 0.0
+            if baseline > 0:
+                pos.est_entry = baseline
+                print(f"{now:%H:%M:%S} {pos.ticker}: vol was throttled at "
+                      f"entry — model baseline backfilled at ${baseline:.2f}, "
+                      "estimate stop-floor active again")
         # the estimate-based stop floor compares model-to-model: the BS
         # estimate now vs the BS estimate AT ENTRY. (Estimate vs a real quote
         # mid would read -30% on day one just from the vol-model gap.)
