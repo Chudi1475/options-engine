@@ -7,6 +7,7 @@ a diagonal trendline, an orange channel around recent price action, red alert
 lines with red price tags pinned to the right axis, a dotted red current-price
 line with a price+time tag, a Target label at the objective, PLUS the FVG boxes
 (BISI/SIBI + grade), the CE line, the order block behind the confirming gap,
+the displacement candle outlined with its strength on the confirming badge,
 a one-line premium/discount · bias · killzone context chip under the header,
 and faint London/NY-AM killzone bands that are the bot's own edge.
 
@@ -186,6 +187,26 @@ def _context_chip(conf, bias):
         segs.append((f"formed in {kz}" if kz else "formed outside killzones",
                      _MUT))
     return segs
+
+
+def _disp_tag(conf):
+    """The displacement-strength clause for the confirming gap's badge, e.g.
+    '1.8x ATR impulse' — fvg 'disp' (middle-candle body / ATR) is the literal
+    justification for the grade, computed on every gap but never shown until
+    now. Says 'impulse' so it can't be misread as the GAP size, which is also
+    quoted in ATRs elsewhere. Returns '' for an inverted gap (the trade there
+    runs against the original impulse, so celebrating its strength would
+    mislead, same reasoning as the OB skip) and for a missing or junk disp
+    (a fact the read can't vouch for is omitted, never guessed)."""
+    if not isinstance(conf, dict) or conf.get("inverted"):
+        return ""
+    try:
+        d = float(conf.get("disp"))
+    except (TypeError, ValueError):
+        return ""
+    if not d > 0:
+        return ""
+    return f"{d:g}x ATR impulse"
 
 
 def _order_block(o, c, i_mid, kind, max_back=12):
@@ -414,6 +435,10 @@ def render_fvg(r: dict, bars=None):
             ax.plot([i - 0.5, right], [f["ce"], f["ce"]], color=base, linewidth=0.9,
                     linestyle="--", alpha=0.8 if is_conf else 0.4, zorder=3)
             tag = f["label"] + (" IFVG" if f.get("inverted") else "") + f" · {f['grade']}"
+            if is_conf:
+                dt = _disp_tag(f)
+                if dt:
+                    tag += " · " + dt
             ax.text(i - 0.3, f["top"], tag, color=base, fontsize=7.6, fontweight="bold",
                     va="bottom", ha="left", zorder=7,
                     bbox=dict(boxstyle="round,pad=0.22", facecolor=_BG,
@@ -448,6 +473,20 @@ def render_fvg(r: dict, bars=None):
             body = max(abs(cc - oo), span * 1e-4)
             ax.add_patch(Rectangle((xi - 0.31, min(oo, cc)), 0.62, body,
                                    facecolor=col, edgecolor=col, linewidth=0.4, zorder=5))
+
+        # outline the displacement candle that created the confirming gap, so
+        # the badge's impulse clause points at a visible candle. Same silence
+        # rule as the clause: no usable disp (or an inverted gap) draws
+        # nothing, and the gap candle must actually be in the charted window.
+        try:
+            if conf and _disp_tag(conf) and 0 <= conf["i"] < n:
+                di = conf["i"]
+                col = _GREEN if conf.get("polarity") == "bull" else _RED
+                ax.add_patch(Rectangle((di - 0.45, low[di]), 0.9,
+                                       h[di] - low[di], facecolor="none",
+                                       edgecolor=col, linewidth=1.3, zorder=6))
+        except Exception:
+            pass
 
         # orange channel around the recent run
         try:

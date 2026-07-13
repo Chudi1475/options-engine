@@ -463,6 +463,74 @@ check("no-gap read renders with no chip",
       png is not None and chip_calls == [(None, "bullish", [])],
       f"png={png is not None} calls={chip_calls}")
 
+# 21) displacement-strength helper: the badge clause for the confirming gap
+conf70 = stored_from(make_bars(90, gap_at=70), 70)    # stored disp 1.8
+check("disp tag reads the stored strength",
+      charts._disp_tag(conf70) == "1.8x ATR impulse",
+      f"tag={charts._disp_tag(conf70)!r}")
+check("whole-number strength drops the trailing zero",
+      charts._disp_tag(dict(conf70, disp=2.0)) == "2x ATR impulse")
+check("inverted gap gets no impulse clause",
+      charts._disp_tag(dict(conf70, inverted=True)) == "")
+nd = {k: v for k, v in conf70.items() if k != "disp"}
+check("missing disp says nothing rather than guessing",
+      charts._disp_tag(nd) == "")
+check("junk disp is safe", charts._disp_tag(dict(conf70, disp="big")) == "")
+check("zero disp says nothing", charts._disp_tag(dict(conf70, disp=0.0)) == "")
+check("NaN disp says nothing",
+      charts._disp_tag(dict(conf70, disp=float("nan"))) == "")
+check("no gap, no clause", charts._disp_tag(None) == "")
+
+# 22) wiring: the badge clause AND the candle outline both read the stored
+# gap (badge site + outline site = two calls); an off-window gap candle is
+# never marked; an inverted gap renders with the mark silent
+disp_calls = []
+real_disp = charts._disp_tag
+
+
+def disp_recorder(conf):
+    out = real_disp(conf)
+    disp_calls.append((conf.get("time") if isinstance(conf, dict) else None,
+                       out))
+    return out
+
+
+bars = make_bars(90, gap_at=70)
+st = stored_from(bars, 70)
+charts._disp_tag = disp_recorder
+try:
+    png, why = render(make_r(st), bars, boom)
+finally:
+    charts._disp_tag = real_disp
+check("impulse mark drawn on a stored-gap read", png is not None, str(why))
+check("badge and outline both read the stored strength",
+      disp_calls == [(st["time"], "1.8x ATR impulse")] * 2,
+      f"calls={disp_calls}")
+
+bars = make_bars(200, gap_at=20)                      # candle left the window
+disp_calls.clear()
+charts._disp_tag = disp_recorder
+try:
+    png, why = render(make_r(stored_from(bars, 20)), bars, recorder)
+finally:
+    charts._disp_tag = real_disp
+check("off-window gap candle is never marked",
+      png is not None and disp_calls == [],
+      f"png={png is not None} calls={disp_calls}")
+
+bars = make_bars(90, gap_at=70)
+inv = stored_from(bars, 70)
+inv["inverted"] = True
+disp_calls.clear()
+charts._disp_tag = disp_recorder
+try:
+    png, why = render(make_r(inv), bars, boom)
+finally:
+    charts._disp_tag = real_disp
+check("inverted gap renders with the mark silent",
+      png is not None and disp_calls and all(t == "" for _, t in disp_calls),
+      f"png={png is not None} calls={disp_calls}")
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")
