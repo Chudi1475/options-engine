@@ -2262,6 +2262,141 @@ finally:
     learn.et_now = _orig_et_now_ng
     learn._market_context = _orig_mktctx_ng
 
+# --- catch-up recap settles stragglers too (recap.py) ---
+# The recap fired by the night catch-up after a late reboot used to tell the
+# owner an expired 0DTE was STILL OPEN and being watched. recap.main now
+# settles overdue positions in memory first (save=False, same settle the next
+# session's needs_monitoring persists) and position_story grades the settled
+# truth: a settle whose close the bot never saw says so, and a never-marked
+# settle reads NOT GRADED. Same-day settles wait for SETTLE_AFTER (16:12,
+# scanner's SESSION_END) so a live-day 16:05 recap can never front-run the
+# monitoring loop's own bell settle during a feed outage.
+print()
+print("--- catch-up recap of expired stragglers ---")
+import contextlib
+import io
+
+import pandas as pd
+
+import recap as rcmod
+
+_orig_posfile_rc = config.POSITIONS_FILE
+_orig_et_now_rc = rcmod.et_now
+_orig_fetch_rc = rcmod.fetch_5m
+_orig_alerts_rc = rcmod.ALERTS_FILE
+_orig_argv_rc = sys.argv[:]
+_rc_path = config.DATA_DIR / "positions_recap_straggler_test.json"
+config.POSITIONS_FILE = _rc_path
+try:
+    if _rc_path.exists():
+        _rc_path.unlink()
+
+    def _rc_pos(pid, expiry=TODAY, last_pct=None):
+        q = mk_pos(expiry=expiry)
+        q.id = q.ticker = pid
+        if last_pct is not None:
+            q.last_mark = mark(last_pct)
+            q.last_mark_pct = last_pct
+            q.last_mark_source = "quote mid"
+            q.last_mark_time = "15:55:00"
+        return q
+
+    _rc_book = PositionBook(_rc_path)
+    _rc_book.add(_rc_pos("rc_win", last_pct=12.0))
+    _rc_book.add(_rc_pos("rc_blind"))                        # never marked
+    _rc_book.add(_rc_pos("rc_weekly", expiry=TODAY + timedelta(days=4),
+                         last_pct=5.0))
+
+    # position_story on the settled shapes (no network needed)
+    _rc_view = PositionBook(_rc_path)
+    _rc_view.settle_overdue(TODAY, datetime(2026, 6, 11, 21, 30, tzinfo=ET),
+                            save=False)
+    _rc_by = {q.ticker: q for q in _rc_view.for_date(TODAY)}
+    _v, _s = rcmod.position_story(_rc_by["rc_win"])
+    check("RC offline settle grades RIGHT with the last-price caveat",
+          _v.startswith("RIGHT") and "never saw the close" in _s
+          and "last price" in _s, f"got {_v!r} {_s!r}")
+    check("RC offline settle never claims it ran into the closing bell",
+          "closing bell" not in _s, f"got {_s!r}")
+    _v, _s = rcmod.position_story(_rc_by["rc_blind"])
+    check("RC never-marked settle is NOT GRADED, not STILL OPEN",
+          _v == "NOT GRADED" and "without a grade" in _s
+          and "watching" not in _s, f"got {_v!r} {_s!r}")
+
+    # a genuine bell-time expiry (bot alive, step() settled) keeps its story
+    _rc_bell = _rc_pos("rc_bell", last_pct=8.0)
+    _rc_bell.state = "closed"
+    _rc_bell.final_pnl_pct = 8.0
+    _rc_bell.final_exit = {"time": "16:00:00", "pct": 8.0, "mark": mark(8.0),
+                           "reason": "expiry close"}
+    _v, _s = rcmod.position_story(_rc_bell)
+    check("RC live bell expiry story unchanged",
+          "closing bell" in _s and "offline" not in _s, f"got {_s!r}")
+
+    # end-to-end: the catch-up recap message itself (dry run, offline)
+    def _rc_fetch(sym):
+        idx = pd.date_range("2026-06-11 09:30", periods=79, freq="5min",
+                            tz=ET)
+        base = [7300 + i * 0.5 for i in range(len(idx))]
+        return pd.DataFrame(
+            {"Open": base, "High": [b + 2 for b in base],
+             "Low": [b - 2 for b in base], "Close": [b + 1 for b in base]},
+            index=idx)
+
+    rcmod.fetch_5m = _rc_fetch
+    rcmod.et_now = lambda: datetime(2026, 6, 11, 21, 30, tzinfo=ET)
+    rcmod.ALERTS_FILE = config.DATA_DIR / "no_such_alerts_test.jsonl"
+    sys.argv = [sys.argv[0], "--dry-run"]
+    _rc_raw_before = _rc_path.read_text(encoding="utf-8-sig")
+    _rc_buf = io.StringIO()
+    with contextlib.redirect_stdout(_rc_buf):
+        _rc_ret = rcmod.main()
+    _rc_msg = _rc_buf.getvalue()
+    _rc_raw_after = _rc_path.read_text(encoding="utf-8-sig")
+    check("RC dry catch-up recap returns clean and stays write-free",
+          _rc_ret == [] and _rc_raw_before == _rc_raw_after,
+          f"got {_rc_ret!r}")
+    check("RC catch-up recap grades the settled straggler as a win",
+          "rc_win" in _rc_msg and "WE WERE RIGHT" in _rc_msg,
+          f"got {_rc_msg!r}")
+    check("RC exactly one STILL OPEN left: the real weekly",
+          _rc_msg.count("STILL OPEN") == 1
+          and "I'm still watching it" not in
+          _rc_msg.split("rc_weekly")[0], f"got {_rc_msg!r}")
+    check("RC ungraded head reads NOT GRADED, not WE WERE NOT GRADED",
+          "NOT GRADED" in _rc_msg and "WE WERE NOT GRADED" not in _rc_msg,
+          f"got {_rc_msg!r}")
+
+    # during the live session window the monitoring loop owns settles: a
+    # 16:05 recap during a bell-time feed outage must not text a grade the
+    # loop could still contradict by persisting a fresher mark at 16:07
+    rcmod.et_now = lambda: datetime(2026, 6, 11, 16, 5, tzinfo=ET)
+    _rc_buf2 = io.StringIO()
+    with contextlib.redirect_stdout(_rc_buf2):
+        rcmod.main()
+    _rc_msg2 = _rc_buf2.getvalue()
+    check("RC before 16:12 the recap leaves settles to the monitoring loop",
+          _rc_msg2.count("STILL OPEN") == 3 and "NOT GRADED" not in _rc_msg2,
+          f"got {_rc_msg2!r}")
+
+    # a next-morning catch-up (prior session) settles regardless of the clock
+    rcmod.et_now = lambda: datetime(2026, 6, 12, 9, 0, tzinfo=ET)
+    _rc_buf3 = io.StringIO()
+    with contextlib.redirect_stdout(_rc_buf3):
+        rcmod.main()
+    _rc_msg3 = _rc_buf3.getvalue()
+    check("RC next-morning catch-up settles the prior session too",
+          "WE WERE RIGHT" in _rc_msg3 and _rc_msg3.count("STILL OPEN") == 1,
+          f"got {_rc_msg3!r}")
+finally:
+    if _rc_path.exists():
+        _rc_path.unlink()
+    config.POSITIONS_FILE = _orig_posfile_rc
+    rcmod.et_now = _orig_et_now_rc
+    rcmod.fetch_5m = _orig_fetch_rc
+    rcmod.ALERTS_FILE = _orig_alerts_rc
+    sys.argv = _orig_argv_rc
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")

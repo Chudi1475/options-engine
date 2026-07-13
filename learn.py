@@ -207,16 +207,10 @@ def _grade_positions(session_date):
     book.settle_overdue(session_date, et_now(), save=False)
     trades = []
     for p in book.for_date(session_date):
+        # position_story grades the closed-but-ungraded settle honestly
+        # (NOT GRADED) since the recap learned to settle stragglers too
         verdict, story = recap.position_story(p)
         final = getattr(p, "final_pnl_pct", None)
-        if getattr(p, "state", "") == "closed" and final is None:
-            # settled 'not graded' (expired with no price ever seen):
-            # position_story's open-or-ungraded test cannot tell this from a
-            # live position, and 'STILL OPEN, I'm watching it' would be a lie
-            verdict = "NOT GRADED"
-            story = ("Expired while the bot was offline and no price was "
-                     "ever seen, so it settled without a grade instead of "
-                     "an invented result.")
         trades.append({
             "ticker": p.ticker,
             "direction": p.direction,

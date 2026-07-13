@@ -21,7 +21,7 @@ import sys
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -37,6 +37,16 @@ from strategy import StrategyConfig
 ET = ZoneInfo("America/New_York")
 CT = ZoneInfo("America/Chicago")  # display timezone ONLY — logic stays ET
 ALERTS_FILE = config.ALERTS_JSONL
+
+# = scanner.SESSION_END. Until then the daytime monitoring loop owns settles
+# (each cycle monitors BEFORE it recaps, and no monitor runs after the loop
+# exits), so a same-day in-memory settle before this moment could text a
+# grade the loop then contradicts by persisting a fresher mark minutes later.
+SETTLE_AFTER = time(16, 12)
+
+
+def et_now():
+    return datetime.now(ET)
 
 
 def fetch_5m(yf_symbol):
@@ -94,7 +104,15 @@ def position_story(p):
     if p.entry_source == "estimate" or "estimat" in (p.last_mark_source or ""):
         est_note = " (some prices were estimates from the stock move; your broker shows real fills)"
 
-    if p.state != "closed" or p.final_pnl_pct is None:
+    if p.state == "closed" and p.final_pnl_pct is None:
+        # settled with no price ever seen (bot down at the close, or the
+        # feed was): an honest blank, never an invented result, and never
+        # the STILL-OPEN watching line
+        return ("NOT GRADED",
+                "It expired without the bot ever seeing a price for it, so "
+                "it settled without a grade instead of an invented result. "
+                "Your broker shows the real outcome." + est_note)
+    if p.state != "closed":
         cur = p.last_mark_pct if p.last_mark_pct is not None else 0.0
         return (f"STILL OPEN ({cur:+.0f}% so far)",
                 "This one doesn't expire today. I'm still watching it and "
@@ -133,10 +151,20 @@ def position_story(p):
     elif "expir" in reason:
         h_note = (f" (half was banked at {p.half_exit['pct']:+.0f}% earlier)"
                   if p.half_exit else "")
-        story = (f"It ran into the closing bell and was closed at "
-                 f"{total:+.0f}%{h_note}. That's why the bot warns "
-                 f"{config.EXPIRY_WARN_MINUTES} minutes before expiry: "
-                 "same-day (0DTE) options don't get a tomorrow.")
+        if "offline" in reason:
+            # the settle reason says 'bot offline at close', but the same
+            # shape happens when the bot was up and the FEED died at the
+            # bell, so the words only claim what is always true: the close
+            # was never seen and the grade uses the last price that was
+            story = (f"The bot never saw the close for this one, so this "
+                     f"grade uses the last price it did see: "
+                     f"{total:+.0f}%{h_note}. Your broker shows the exact "
+                     "closing number.")
+        else:
+            story = (f"It ran into the closing bell and was closed at "
+                     f"{total:+.0f}%{h_note}. That's why the bot warns "
+                     f"{config.EXPIRY_WARN_MINUTES} minutes before expiry: "
+                     "same-day (0DTE) options don't get a tomorrow.")
     else:
         story = f"Closed at {total:+.0f}% ({reason})."
     tag = kelechi_tag(reason, banked_half=bool(p.half_exit)) if total > 0 else ""
@@ -248,6 +276,16 @@ def main(require_date=None):
     lines.append("")
 
     book = PositionBook()
+    # Settle overdue stragglers IN MEMORY first (save=False): the catch-up
+    # recap after a late reboot must not tell the owner an expired 0DTE is
+    # still being watched. positions.json keeps its single daytime writer;
+    # the next session's needs_monitoring persists this exact settle, and a
+    # --dry-run stays write-free. Same-day settles wait for SETTLE_AFTER so
+    # the 16:05 recap during a bell-time feed outage can never text a grade
+    # the still-running monitoring loop contradicts minutes later.
+    now = et_now()
+    if session < now.date() or now.time() >= SETTLE_AFTER:
+        book.settle_overdue(session, now, save=False)
     pos_today = book.for_date(session)
     graded = set()
     if pos_today:
@@ -259,7 +297,8 @@ def main(require_date=None):
             tag = "[PAPER] " if p.paper else ""
             head = (f"{tag}{p.ticker} {p.strike:g} {p.direction.upper()} "
                     f"(texted {t}): ")
-            head += verdict if verdict.startswith("STILL") else f"WE WERE {verdict}"
+            head += verdict if verdict.startswith(("STILL", "NOT GRADED")) \
+                else f"WE WERE {verdict}"
             lines.append(head)
             lines.append(story)
             graded.add((p.ticker, p.direction))
