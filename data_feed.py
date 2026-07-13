@@ -89,11 +89,23 @@ class AlpacaREST:
         df = _completed(df, now)
         return df if not df.empty else None
 
-    def latest_price(self, symbol: str):
+    def latest_trade(self, symbol: str):
+        """(price, ET timestamp) of the newest IEX trade. IEX only prints
+        roughly 8:00-17:00 ET, so a caller quoting this as a LIVE price must
+        check the timestamp first: overnight and on weekends the 'latest'
+        trade can be hours or days old. Timestamp None = could not parse."""
         r = requests.get(f"{ALPACA_DATA}/v2/stocks/{symbol}/trades/latest",
                          params={"feed": "iex"}, headers=self.headers, timeout=10)
         r.raise_for_status()
-        return float(r.json()["trade"]["p"])
+        tr = r.json()["trade"]
+        try:
+            ts = pd.Timestamp(tr["t"]).tz_convert(ET)
+        except (KeyError, TypeError, ValueError):
+            ts = None
+        return float(tr["p"]), ts
+
+    def latest_price(self, symbol: str):
+        return self.latest_trade(symbol)[0]
 
 
 class DataFeed:

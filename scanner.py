@@ -644,7 +644,10 @@ class Service:
                 img, _ = charts.render_fvg(r)
                 if img:
                     d = (r.get("plan") or {}).get("direction", "")
-                    cap = f"{tk} {d} · FVG confirmed. ~15m delayed, your call."
+                    fresh = ("real-time (IEX)"
+                             if str(r.get("source") or "").startswith("alpaca")
+                             else "~15m delayed")
+                    cap = f"{tk} {d} · FVG confirmed. {fresh}, your call."
                     telegram.send_photo(chat_id, img, caption=cap[:1024])
             except Exception as e:
                 print(f"fvg chart send skipped for {tk}: {e}")

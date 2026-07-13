@@ -499,10 +499,25 @@ def plan_levels(price, bias, atr, hi, lo, dec, kind):
     }
 
 
+# Alpaca's stock endpoint only knows plain US equity/ETF tickers: no ^GSPC
+# indexes, =F futures, =X forex or -USD coins, and Yahoo spells share classes
+# BRK-B where Alpaca wants BRK.B, so dotted/hyphened symbols stay on yfinance.
+_ALPACA_SYM = re.compile(r"^[A-Z]{1,6}$")
+
+
+def _alpaca_eligible(yfs, kind):
+    """True when a read may patch in the live scanner's real-time Alpaca feed:
+    keys configured and the symbol is a plain equity/ETF ticker."""
+    return (_feed.alpaca is not None and kind == "stock"
+            and bool(_ALPACA_SYM.match(yfs or "")))
+
+
 def _do_read(disp, yfs, dec, kind, source):
     """Shared read engine for any symbol: price, day move, 15-min momentum,
     recent high/low, 20-day trend, a momentum/trend BIAS, an ATR-sized trade
-    PLAN, plus high-impact news. Real numbers only (yfinance, ~15-min delayed)."""
+    PLAN, plus high-impact news. Real numbers only (yfinance, ~15-min delayed;
+    when Alpaca keys are set, plain stocks upgrade in place to the same
+    real-time IEX feed the live scanner trades from)."""
     tried = [yfs]
     try:
         d1 = _flatten(yf.download(yfs, period="1mo", interval="1d",
@@ -553,11 +568,47 @@ def _do_read(disp, yfs, dec, kind, source):
             m5.index = m5.index.tz_convert(ET)
         except (TypeError, ValueError):
             pass
+    # Real-time upgrade: when Alpaca keys are set, patch in the same real-time
+    # IEX feed the live scanner trades from, so a chat read and the scanner
+    # stop disagreeing on what a stock costs. Bars: only timestamps Alpaca
+    # actually printed replace their yfinance copies (a thin symbol's missing
+    # IEX windows keep the consolidated-tape bar, and yesterday's plus
+    # pre/post-market rows always stay yfinance's, so extended-hours reads
+    # lose nothing). Price: IEX only prints roughly 8:00-17:00 ET, so the
+    # 'latest' trade overnight or on a weekend can be DAYS old while yfinance
+    # still holds fresher pre/post bars - the trade is quoted (and the read
+    # labeled real-time) ONLY when it is newer than the end of the freshest
+    # bar held; otherwise the bar close wins and the delayed label stands.
+    # Each Alpaca failure is swallowed on its own, leaving the plain yfinance
+    # read untouched.
+    rt_price = rt_ts = None
+    if _alpaca_eligible(yfs, kind):
+        try:
+            ab = _feed.alpaca.today_bars_5m(yfs, datetime.now(ET))
+            if ab is not None and not ab.empty:
+                if have_5m:
+                    dup = m5.index.isin(ab.index)
+                    m5 = pd.concat([m5[~dup], ab]).sort_index()
+                else:
+                    m5, have_5m = ab, True
+        except Exception:
+            pass
+        try:
+            px, ts = _feed.alpaca.latest_trade(yfs)
+            if (px > 0 and ts is not None and have_5m
+                    and ts >= m5.index[-1] + timedelta(minutes=5)):
+                rt_price, rt_ts = float(px), ts
+        except Exception:
+            pass
+        if rt_price is not None:
+            source = "alpaca real-time (IEX); history via yfinance"
     if have_5m:
         # short-lived cache so the chart renderer right after a read reuses
         # these bars instead of paying a third yfinance download
         _M5_CACHE[yfs] = (datetime.now(ET), m5)
     price = float(m5["Close"].dropna().iloc[-1]) if have_5m else float(closes_d.iloc[-1])
+    if rt_price is not None:
+        price = rt_price
     prior_close = _prior_daily_close(
         closes_d, m5["Close"].dropna().index[-1] if have_5m else None)
 
@@ -578,6 +629,13 @@ def _do_read(disp, yfs, dec, kind, source):
             stale = (datetime.now(ET) - last_ts) > timedelta(minutes=90)
         except (AttributeError, ValueError, TypeError):
             stale = False  # can't tell -> don't falsely flag a live read
+    if rt_ts is not None:
+        # the quoted price is the live IEX trade, so "price as of X" must
+        # stamp the TRADE's time, not the older bar's
+        try:
+            asof = rt_ts.astimezone(CT).strftime("%a %I:%M %p CT").replace(" 0", " ")
+        except (AttributeError, ValueError, TypeError):
+            pass
 
     # crypto precision depends on the live price (SHIB needs 8 dp, BTC needs 2)
     dec = _adaptive_dec(price, kind, dec)

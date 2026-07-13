@@ -128,7 +128,12 @@ def signal_card(r: dict) -> str:
     if kind == "stock":
         lines.append("(levels are on the stock; trade it as the calls/puts)")
     if r.get("asof"):
-        lines.append(f"price as of {r['asof']}, ~15m delayed, confirm live before you click.")
+        # freshness must follow the read's actual source: an Alpaca-served
+        # read is real-time, and calling it delayed would be its own lie
+        fresh = ("real-time (IEX)"
+                 if str(r.get("source") or "").startswith("alpaca")
+                 else "~15m delayed")
+        lines.append(f"price as of {r['asof']}, {fresh}, confirm live before you click.")
     why = _why_line(r)
     if why:
         lines.append(why)

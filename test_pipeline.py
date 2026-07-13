@@ -475,6 +475,11 @@ import risk_gate
 _orig_yf = mt.yf
 _orig_ev = risk_gate.upcoming_events
 _orig_rec = forward_ledger.record_candidate
+# .env may carry real Alpaca keys; reads would then patch in a LIVE price and
+# these offline tests would depend on the actual market. Force pure yfinance
+# stubs here; the dedicated alpaca section below installs its own fake.
+_orig_alpaca = mt._feed.alpaca
+mt._feed.alpaca = None
 
 
 class _FakeYF:
@@ -597,6 +602,212 @@ try:
     check("prior_close: single daily row -> None",
           mt._prior_daily_close(_daily(n=1)["Close"], None) is None)
 finally:
+    mt._feed.alpaca = _orig_alpaca
+    mt.yf = _orig_yf
+    risk_gate.upcoming_events = _orig_ev
+    forward_ledger.record_candidate = _orig_rec
+
+# --- market_tools: reads inherit the scanner's real-time Alpaca feed ---
+# _do_read used to hard-code delayed yfinance even with Alpaca keys set, so a
+# chat read and the live scanner quoted two different prices for one stock.
+
+
+class _FakeAlpaca:
+    """Stands in for AlpacaREST: counts calls, serves canned bars/trade."""
+    def __init__(self, bars=None, price=None, price_ts=None, boom=False):
+        self.bars, self.price, self.price_ts = bars, price, price_ts
+        self.boom = boom
+        self.calls = []
+
+    def today_bars_5m(self, symbol, now):
+        self.calls.append(("bars", symbol))
+        if self.boom:
+            raise RuntimeError("alpaca down")
+        return self.bars
+
+    def latest_trade(self, symbol):
+        self.calls.append(("trade", symbol))
+        if self.boom:
+            raise RuntimeError("alpaca down")
+        if self.price is None:
+            raise RuntimeError("no trade")
+        return self.price, self.price_ts
+
+
+def _alpaca_frame(closes, start="2026-06-11 09:30"):
+    idx = pd.date_range(start, periods=len(closes), freq="5min", tz=ET)
+    return pd.DataFrame({"Open": closes, "High": [x + 0.2 for x in closes],
+                         "Low": [x - 0.2 for x in closes], "Close": closes,
+                         "Volume": [0] * len(closes)}, index=idx)
+
+
+_orig_alpaca = mt._feed.alpaca
+try:
+    risk_gate.upcoming_events = lambda *a, **k: []
+    forward_ledger.record_candidate = lambda *a, **k: None
+
+    # keys set: today's delayed yf bars (3 bars, stuck at 107) are replaced by
+    # alpaca's fresher six (up to 110), the price is the live IEX trade (its
+    # timestamp beats the last bar's end), and the source label says so.
+    # Yesterday's yf bars survive the patch.
+    mt.yf = _FakeYF(_daily(last=110.0),
+                    _m5_frame([100.0] * 6, [105.0, 106.0, 107.0]))
+    fake = _FakeAlpaca(bars=_alpaca_frame([105.0, 106.0, 107.0,
+                                           108.0, 109.0, 110.0]),
+                       price=111.5,
+                       price_ts=pd.Timestamp("2026-06-11 10:02", tz=ET))
+    mt._feed.alpaca = fake
+    r = mt._do_read("TSLA", "TSLA", 2, "stock", "test")
+    check("alpaca read: price is the live IEX trade",
+          r.get("price") == 111.5, f"got {r.get('price')}")
+    check("alpaca read: source label flips to real-time",
+          str(r.get("source", "")).startswith("alpaca"), f"got {r.get('source')}")
+    check("alpaca read: asof stamps the trade's own time",
+          r.get("asof") == "Thu 9:02 AM CT", f"got {r.get('asof')}")
+    check("alpaca read: session high from the fresher bars",
+          r.get("recent_session_high") is not None
+          and abs(r["recent_session_high"] - 110.2) < 1e-9,
+          f"got {r.get('recent_session_high')}")
+    check("alpaca read: momentum from the fresher bars (110 vs 107 = +2.8%)",
+          r.get("momentum_15min_pct") is not None
+          and abs(r["momentum_15min_pct"] - 2.8) < 0.011,
+          f"got {r.get('momentum_15min_pct')}")
+    check("alpaca read: day move uses the live price",
+          r.get("day_move_pct") is not None
+          and abs(r["day_move_pct"] - 11.5) < 0.011,
+          f"got {r.get('day_move_pct')}")
+    cached = mt.cached_m5("TSLA")
+    check("alpaca read: chart cache holds the merged frame, no dup bars",
+          cached is not None and len(cached) == 12
+          and not cached.index.duplicated().any(),
+          f"got {None if cached is None else len(cached)} rows")
+
+    # alpaca can't serve crypto, indexes, futures or FX: never even called
+    fake2 = _FakeAlpaca(bars=_alpaca_frame([1.0]), price=1.0)
+    mt._feed.alpaca = fake2
+    mt.yf = _FakeYF(_d_utc, _m5_utc)
+    r = mt._do_read("Bitcoin", "BTC-USD", 2, "crypto", "test")
+    check("alpaca read: crypto stays on yfinance, alpaca untouched",
+          fake2.calls == [] and r.get("source") == "test",
+          f"calls {fake2.calls}, source {r.get('source')}")
+    mt.yf = _FakeYF(_daily(last=110.0), _m5_frame([100.0] * 6, [105.0] * 4))
+    r = mt._do_read("SPX", "^GSPC", 2, "stock", "test")
+    check("alpaca read: index symbols stay on yfinance, alpaca untouched",
+          fake2.calls == [] and r.get("source") == "test",
+          f"calls {fake2.calls}, source {r.get('source')}")
+
+    # a full alpaca outage leaves the plain yfinance read byte-identical
+    boom = _FakeAlpaca(boom=True)
+    mt._feed.alpaca = boom
+    mt.yf = _FakeYF(_daily(last=110.0),
+                    _m5_frame([100.0] * 6,
+                              [105.0, 106.0, 107.0, 108.0, 109.0, 110.0]))
+    r = mt._do_read("TSLA", "TSLA", 2, "stock", "test")
+    check("alpaca read: outage keeps the yfinance read intact",
+          r.get("price") == 110.0 and r.get("source") == "test"
+          and abs(r["momentum_15min_pct"] - 2.8) < 0.011,
+          f"got {r.get('price')}/{r.get('source')}")
+    check("alpaca read: outage tried both endpoints before falling back",
+          ("bars", "TSLA") in boom.calls and ("trade", "TSLA") in boom.calls,
+          f"calls {boom.calls}")
+
+    # bars endpoint dry but the trade tape alive AND fresh: price upgrades
+    part = _FakeAlpaca(bars=None, price=108.25,
+                       price_ts=pd.Timestamp("2026-06-11 10:05", tz=ET))
+    mt._feed.alpaca = part
+    r = mt._do_read("TSLA", "TSLA", 2, "stock", "test")
+    check("alpaca read: fresh trade alone still upgrades the price",
+          r.get("price") == 108.25
+          and str(r.get("source", "")).startswith("alpaca"),
+          f"got {r.get('price')}/{r.get('source')}")
+
+    # IEX quiet (overnight/weekend): the 'latest' trade is OLDER than the
+    # freshest bar held, so quoting it as live would be a lie. The bar close
+    # wins and the delayed label stands.
+    old = _FakeAlpaca(bars=None, price=93.0,
+                      price_ts=pd.Timestamp("2026-06-11 09:00", tz=ET))
+    mt._feed.alpaca = old
+    r = mt._do_read("TSLA", "TSLA", 2, "stock", "test")
+    check("alpaca read: a stale IEX trade never masquerades as live",
+          r.get("price") == 110.0 and r.get("source") == "test",
+          f"got {r.get('price')}/{r.get('source')}")
+
+    # a trade with no parseable timestamp can't prove freshness: rejected
+    nots = _FakeAlpaca(bars=None, price=93.0, price_ts=None)
+    mt._feed.alpaca = nots
+    r = mt._do_read("TSLA", "TSLA", 2, "stock", "test")
+    check("alpaca read: timestampless trade rejected",
+          r.get("price") == 110.0 and r.get("source") == "test",
+          f"got {r.get('price')}/{r.get('source')}")
+
+    # thin symbol: IEX printed nothing 9:35-9:40, so only the bars alpaca
+    # actually printed replace their yfinance copies; the consolidated-tape
+    # bars in the gap survive (a whole-span replace would delete them and
+    # silently stretch the '15-min' momentum window)
+    mt.yf = _FakeYF(_daily(last=110.0),
+                    _m5_frame([100.0] * 6,
+                              [105.0, 106.0, 107.0, 108.0, 109.0, 110.0]))
+    thin_idx = pd.DatetimeIndex([pd.Timestamp("2026-06-11 09:30", tz=ET),
+                                 pd.Timestamp("2026-06-11 09:45", tz=ET)])
+    thin_bars = pd.DataFrame(
+        {"Open": [105.5, 108.5], "High": [105.7, 108.7],
+         "Low": [105.3, 108.3], "Close": [105.5, 108.5], "Volume": [0, 0]},
+        index=thin_idx)
+    mt._feed.alpaca = _FakeAlpaca(bars=thin_bars, price=None)
+    r = mt._do_read("TSLA", "TSLA", 2, "stock", "test")
+    cached = mt.cached_m5("TSLA")
+    check("alpaca read: gap in IEX bars keeps the yfinance bars underneath",
+          cached is not None and len(cached) == 12
+          and cached.loc[pd.Timestamp("2026-06-11 09:45", tz=ET), "Close"] == 108.5
+          and cached.loc[pd.Timestamp("2026-06-11 09:40", tz=ET), "Close"] == 107.0,
+          f"got {None if cached is None else len(cached)} rows")
+
+    # data_feed.latest_trade: price + ET timestamp parsed, absent ts -> None
+    import data_feed as dfmod
+
+    class _Resp:
+        def __init__(self, js):
+            self._js = js
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._js
+
+    _orig_req_get = dfmod.requests.get
+    try:
+        dfmod.requests.get = lambda *a, **k: _Resp(
+            {"trade": {"p": 123.45, "t": "2026-06-11T14:02:00.5Z"}})
+        rest = dfmod.AlpacaREST("k", "s")
+        px, ts = rest.latest_trade("TSLA")
+        check("alpaca trade: price and ET timestamp parsed",
+              px == 123.45 and ts is not None and ts.hour == 10
+              and ts.minute == 2, f"got {px}/{ts}")
+        check("alpaca trade: latest_price still returns the bare float",
+              rest.latest_price("TSLA") == 123.45)
+        dfmod.requests.get = lambda *a, **k: _Resp({"trade": {"p": 9.5}})
+        px, ts = rest.latest_trade("TSLA")
+        check("alpaca trade: missing timestamp -> None, price intact",
+              px == 9.5 and ts is None, f"got {px}/{ts}")
+    finally:
+        dfmod.requests.get = _orig_req_get
+
+    # the signal card's freshness line follows the read's actual source
+    _plan = {"direction": "BUY", "entry": 100.0, "stop": 99.0, "target1": 101.0,
+             "target": 102.0, "risk": 1.0, "reward": 2.0, "rr": 2.0,
+             "weak": False, "structure": True}
+    _base = {"instrument": "TSLA", "ticker": "TSLA", "kind": "stock",
+             "decimals": 2, "plan": _plan, "asof": "Thu 9:55 AM CT",
+             "source": "alpaca real-time (IEX); history via yfinance"}
+    card = cards.signal_card(_base)
+    check("signal card: real-time read never claims a 15m delay",
+          "real-time (IEX)" in card and "~15m delayed" not in card, card)
+    card = cards.signal_card({**_base, "source": "yfinance, ~15-min delayed"})
+    check("signal card: yfinance read keeps the delay warning",
+          "~15m delayed" in card, card)
+finally:
+    mt._feed.alpaca = _orig_alpaca
     mt.yf = _orig_yf
     risk_gate.upcoming_events = _orig_ev
     forward_ledger.record_candidate = _orig_rec

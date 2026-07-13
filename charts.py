@@ -627,8 +627,13 @@ def render_fvg(r: dict, bars=None):
         step = max(1, n // 5)
         ax.set_xticks(x[::step])
         ax.set_xticklabels([df.index[i].strftime("%H:%M") for i in x[::step]])
+        # freshness claim must match the text card sent with this chart: an
+        # Alpaca-served read is real-time, everything else keeps the warning
+        fresh = ("real-time (IEX)"
+                 if str((r or {}).get("source") or "").startswith("alpaca")
+                 else "~15m delayed")
         fig.text(0.985, 0.012,
-                 f"{now_et:%a %b %d %I:%M %p CT}  ·  ~15m delayed, your call",
+                 f"{now_et:%a %b %d %I:%M %p CT}  ·  {fresh}, your call",
                  color=_MUT, fontsize=7, ha="right", va="bottom")
         # the chip claims one more header line, so give it the room
         fig.subplots_adjust(top=0.850 if chip else 0.885, bottom=0.055,
