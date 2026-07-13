@@ -7,6 +7,7 @@ a diagonal trendline, an orange channel around recent price action, red alert
 lines with red price tags pinned to the right axis, a dotted red current-price
 line with a price+time tag, a Target label at the objective, PLUS the FVG boxes
 (BISI/SIBI + grade), the CE line, the order block behind the confirming gap,
+a one-line premium/discount · bias · killzone context chip under the header,
 and faint London/NY-AM killzone bands that are the bot's own edge.
 
 render_signal(): simple dark price-line fallback with entry/SL/TP.
@@ -140,6 +141,51 @@ def _killzone_runs(index):
         if start is not None:
             runs.append((start, len(mins) - 1, label))
     return runs
+
+
+def _killzone_name(time_str):
+    """Killzone containing the tz-aware timestamp `time_str` ('LONDON KZ' /
+    'NY AM KZ'), '' when it sits outside both, or None when the stamp is naive
+    or unparseable (a naive stamp could mean any zone: say nothing rather than
+    guess). Same ET windows and end-exclusive clock as _killzone_runs."""
+    try:
+        import pandas as pd
+        ts = pd.Timestamp(time_str)
+        if ts.tzinfo is None:
+            return None
+        et = ts.tz_convert(ET)
+        mins = et.hour * 60 + et.minute
+    except Exception:
+        return None
+    for label, lo, hi in _KILLZONES:
+        if lo <= mins < hi:
+            return label
+    return ""
+
+
+def _context_chip(conf, bias):
+    """The one-line PD-array read under the header: premium/discount, bias,
+    and whether the confirming gap formed in a killzone — the three facts an
+    ICT trader checks before anything else, stated in words instead of left
+    to eye-scanning the bands and the equilibrium line. Returns [(text,
+    color), ...] segments (zone word green in discount / red in premium,
+    the rest muted), or [] when there is no confirming gap to read; a fact
+    the read cannot vouch for is omitted, never guessed."""
+    if not isinstance(conf, dict):
+        return []
+    segs = []
+    zone = conf.get("pd_zone")
+    if zone in ("premium", "discount", "equilibrium"):
+        col = _GREEN if zone == "discount" else _RED if zone == "premium" else _MUT
+        segs.append(("price at EQUILIBRIUM" if zone == "equilibrium"
+                     else f"price in {zone.upper()}", col))
+    if bias:
+        segs.append((f"bias {str(bias).upper()}", _MUT))
+    kz = _killzone_name(conf.get("time"))
+    if kz is not None:
+        segs.append((f"formed in {kz}" if kz else "formed outside killzones",
+                     _MUT))
+    return segs
 
 
 def _order_block(o, c, i_mid, kind, max_back=12):
@@ -504,6 +550,31 @@ def render_fvg(r: dict, bars=None):
                      + (f" · {tk['rr']:g}R" if tk and tk.get('rr') else ""),
                      color=_MUT, fontsize=9.5, ha="left", va="top")
 
+        # PD-array context chip: built from the READ's own gap (stored) when
+        # it has one, so the words match the text card even when the gap
+        # candle has left the charted window; recomputed-gap fallback covers
+        # chart-only callers.
+        chip = _context_chip(stored or conf, bias)
+        if chip:
+            chip_y = line2_y - 0.056
+            drawn = []
+            try:
+                rend = fig.canvas.get_renderer()
+                cx = 0.055
+                for k, (seg, colr) in enumerate(chip):
+                    t = fig.text(cx, chip_y, ("" if k == 0 else " · ") + seg,
+                                 color=colr, fontsize=9.5, ha="left", va="top")
+                    drawn.append(t)
+                    cx += t.get_window_extent(rend).width / fig.bbox.width
+            except Exception:  # metrics hiccup: same words, one muted line
+                for t in drawn:
+                    try:
+                        t.remove()
+                    except Exception:
+                        pass
+                fig.text(0.055, chip_y, " · ".join(s for s, _ in chip),
+                         color=_MUT, fontsize=9.5, ha="left", va="top")
+
         ax.set_xlim(-1.5, right + 0.5)
         # the stored target can sit beyond this window's own range (it is the
         # READ's dealing-range extreme); keep it in frame or the Target label
@@ -520,7 +591,9 @@ def render_fvg(r: dict, bars=None):
         fig.text(0.985, 0.012,
                  f"{now_et:%a %b %d %I:%M %p CT}  ·  ~15m delayed, your call",
                  color=_MUT, fontsize=7, ha="right", va="bottom")
-        fig.subplots_adjust(top=0.885, bottom=0.055, left=0.03, right=0.87)
+        # the chip claims one more header line, so give it the room
+        fig.subplots_adjust(top=0.850 if chip else 0.885, bottom=0.055,
+                            left=0.03, right=0.87)
 
         # draw the queued right-axis price tags, de-collided. The alert
         # line stays at the true price; only the box slides, offset in

@@ -363,6 +363,106 @@ check("killzone bands drawn from the charted window", png is not None, str(why))
 check("render shades both zones the window shows",
       kz_calls == [["LONDON KZ", "NY AM KZ"]], f"calls={kz_calls}")
 
+# 18) killzone-name helper: the chip's clock, same ET windows as the bands
+check("NY AM stamp names its killzone",
+      charts._killzone_name("2026-07-10 09:35:00-04:00") == "NY AM KZ")
+check("London stamp names its killzone",
+      charts._killzone_name("2026-07-10 03:00:00-04:00") == "LONDON KZ")
+check("lunch stamp is outside every killzone",
+      charts._killzone_name("2026-07-10 12:30:00-04:00") == "")
+check("membership judged in ET whatever zone the stamp carries",
+      charts._killzone_name("2026-07-10 08:35:00-05:00") == "NY AM KZ")
+check("window end is exclusive, like the bands",
+      charts._killzone_name("2026-07-10 11:00:00-04:00") == "")
+check("naive stamp says nothing rather than guessing",
+      charts._killzone_name("2026-07-10 09:35:00") is None)
+check("garbage stamp is safe", charts._killzone_name("not-a-time") is None)
+check("missing stamp is safe", charts._killzone_name(None) is None)
+
+# 19) context-chip helper: three facts, zone word colored, the rest muted
+bars = make_bars(90, gap_at=70)                       # 09:50 ET -> NY AM KZ
+conf70 = stored_from(bars, 70)                        # pd_zone 'discount'
+segs = charts._context_chip(conf70, "bullish")
+check("chip states zone, bias and killzone",
+      [t for t, _ in segs] == ["price in DISCOUNT", "bias BULLISH",
+                               "formed in NY AM KZ"], f"segs={segs}")
+check("discount is green, the rest muted",
+      [c for _, c in segs] == [charts._GREEN, charts._MUT, charts._MUT],
+      f"segs={segs}")
+check("premium is red",
+      charts._context_chip(dict(conf70, pd_zone="premium"), "bearish")[0]
+      == ("price in PREMIUM", charts._RED))
+check("equilibrium reads as its own word, muted",
+      charts._context_chip(dict(conf70, pd_zone="equilibrium"), None)[0]
+      == ("price at EQUILIBRIUM", charts._MUT))
+lunch = dict(conf70, time="2026-07-10 12:30:00-04:00")
+check("a lunch gap is called out as outside the killzones",
+      charts._context_chip(lunch, "bullish")[-1][0]
+      == "formed outside killzones")
+naive_t = dict(conf70, time="2026-07-10 09:50:00")
+check("a naive gap stamp drops the killzone clause, keeps the rest",
+      [t for t, _ in charts._context_chip(naive_t, "bullish")]
+      == ["price in DISCOUNT", "bias BULLISH"])
+check("no bias drops the bias clause",
+      [t for t, _ in charts._context_chip(conf70, None)]
+      == ["price in DISCOUNT", "formed in NY AM KZ"])
+nz = {k: v for k, v in conf70.items() if k != "pd_zone"}
+check("missing pd_zone drops the zone clause",
+      [t for t, _ in charts._context_chip(nz, "bullish")]
+      == ["bias BULLISH", "formed in NY AM KZ"])
+check("no confirming gap, no chip",
+      charts._context_chip(None, "bullish") == [])
+
+# 20) wiring: the chip is built from the READ's stored gap and drawn even
+# when the gap candle left the charted window; a no-gap read gets no chip
+chip_calls = []
+real_chip = charts._context_chip
+
+
+def chip_recorder(conf, bias):
+    out = real_chip(conf, bias)
+    chip_calls.append((conf.get("time") if isinstance(conf, dict) else None,
+                       bias, [t for t, _ in out]))
+    return out
+
+
+bars = make_bars(90, gap_at=70)
+st = stored_from(bars, 70)
+charts._context_chip = chip_recorder
+try:
+    png, why = render(make_r(st), bars, boom)
+finally:
+    charts._context_chip = real_chip
+check("chip drawn on a stored-gap read", png is not None, str(why))
+check("chip built from the read's own gap and bias",
+      chip_calls == [(st["time"], "bullish",
+                      ["price in DISCOUNT", "bias BULLISH",
+                       "formed in NY AM KZ"])], f"calls={chip_calls}")
+
+bars = make_bars(200, gap_at=20)                      # candle left the window
+st = stored_from(bars, 20)
+chip_calls.clear()
+charts._context_chip = chip_recorder
+try:
+    png, why = render(make_r(st), bars, boom)
+finally:
+    charts._context_chip = real_chip
+check("chip survives the gap candle leaving the window",
+      png is not None and chip_calls
+      and chip_calls[0][0] == st["time"] and chip_calls[0][2] != [],
+      f"png={png is not None} calls={chip_calls}")
+
+bars = make_bars(90, gap_at=70)
+chip_calls.clear()
+charts._context_chip = chip_recorder
+try:
+    png, why = render(make_r(stored=None), bars, boom)
+finally:
+    charts._context_chip = real_chip
+check("no-gap read renders with no chip",
+      png is not None and chip_calls == [(None, "bullish", [])],
+      f"png={png is not None} calls={chip_calls}")
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")
