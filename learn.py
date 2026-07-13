@@ -59,8 +59,11 @@ DIGEST_KEEP = 20   # most-recent lesson bullets kept in the digest (recency wins
 CAUSE_SYSTEM = """You are the trading bot doing a DEEP review of ONE past trade
 to fully understand why it won or lost. Consider the setup itself AND outside
 forces: breaking news, war or geopolitics, scandals, Fed or macro events (FOMC,
-CPI, NFP), volatility regime, time decay, and execution. Only reason from what
-you are shown; never invent facts. No dashes as punctuation. Reply ONLY JSON:
+CPI, NFP), volatility regime, time decay, and execution. A trade tagged
+[PAPER] was practice mode: tracked and graded, but no money moved. Learn from
+it, but a lesson from a [PAPER] trade must say it came from practice, never
+posing as a live result. Only reason from what you are shown; never invent
+facts. No dashes as punctuation. Reply ONLY JSON:
 {"why": "2-3 sentences, the honest root cause of the outcome",
  "cause": "setup|news|geopolitics|macro_event|volatility|time_decay|execution|unknown",
  "cause_detail": "one line naming the specific driver if any",
@@ -125,7 +128,8 @@ def review_history(max_new: int = 25) -> int:
     for p in todo[:max_new]:
         verdict, story = recap.position_story(p)
         news = _breaking_news_for(p.date)
-        brief = (f"Trade: {p.ticker} {p.strike:g} {p.direction.upper()} on {p.date}, "
+        tag = "[PAPER] " if getattr(p, "paper", False) else ""
+        brief = (f"{tag}Trade: {p.ticker} {p.strike:g} {p.direction.upper()} on {p.date}, "
                  f"alerted {p.time_et} ET. Entry momentum {getattr(p, 'mom_pct', None)}, "
                  f"quoted win rate {getattr(p, 'win_rate_quoted', None)}, risk mode "
                  f"{getattr(p, 'risk_mode', None)}. Outcome: {verdict}, final "
@@ -167,6 +171,7 @@ def review_history(max_new: int = 25) -> int:
                       "lesson": ""}
         entry = {"id": p.id, "date": p.date, "ticker": p.ticker,
                  "direction": p.direction, "strike": p.strike,
+                 "paper": bool(getattr(p, "paper", False)),
                  "final_pnl_pct": p.final_pnl_pct, "verdict": verdict,
                  "why": parsed.get("why", ""), "cause": parsed.get("cause", "unknown"),
                  "cause_detail": parsed.get("cause_detail", ""),
@@ -220,6 +225,10 @@ def _grade_positions(session_date):
             "story": story,
             "won": (final is not None and final > 0),
             "closed": (getattr(p, "state", "") == "closed" and final is not None),
+            # practice signals must never masquerade as live results anywhere
+            # downstream: the brief, the fallback lessons, the owner digest
+            # and the coach dossier all key off this flag
+            "paper": bool(getattr(p, "paper", False)),
             "features": {
                 "mom_pct": getattr(p, "mom_pct", None),
                 "win_rate_quoted": getattr(p, "win_rate_quoted", None),
@@ -282,6 +291,11 @@ behind the wins and the losses, not platitudes. A lesson must be specific and
 actionable ("when a call spikes past +30% in the first 20 minutes, bank half
 immediately, do not wait for +25% to become give-back") not generic ("manage
 risk"). If you genuinely see nothing new worth writing, say so.
+
+A call tagged [PAPER] was practice mode: the bot tracked and graded it, but
+no money moved. Learn from it, and weigh it lighter than a live call. A
+lesson drawn mostly from [PAPER] calls must say so in its own words, and a
+practice outcome is never stated as a live result.
 
 Never invent numbers. Only reason from the calls you are shown. Never use
 dashes of any kind as punctuation (no em dash, no " - ", no "--"); use commas,
@@ -359,11 +373,16 @@ def _day_brief(record) -> str:
         return "\n".join(lines)
     lines.append(f"Calls today: {len(record['trades'])} "
                  f"({record['wins']} right, {record['losses']} wrong).")
+    if any(t.get("paper") for t in record["trades"]):
+        lines.append("Calls tagged [PAPER] were practice mode: tracked and "
+                     "graded, but no money moved. Weigh them lighter than "
+                     "live calls, and say so in any lesson drawn from them.")
     for t in record["trades"]:
         f = t["features"]
         o = t["outcome"]
+        tag = "[PAPER] " if t.get("paper") else ""
         lines.append(
-            f"- {t['ticker']} {t['strike']:g} {t['direction'].upper()} texted {t['texted']}: "
+            f"- {tag}{t['ticker']} {t['strike']:g} {t['direction'].upper()} texted {t['texted']}: "
             f"{t['verdict']}. entry momentum {f.get('mom_pct')}, quoted win rate "
             f"{f.get('win_rate_quoted')}, risk mode {f.get('risk_mode')}, "
             f"entry priced from {f.get('entry_source')}. "
@@ -388,8 +407,17 @@ def _deterministic_review(record) -> dict:
     else:
         review = (f"{len(trades)} call(s): {record['wins']} right, "
                   f"{record['losses']} wrong.")
+        paper_n = sum(1 for t in trades if t.get("paper"))
+        if paper_n:
+            review += (f" {paper_n} of them [PAPER] practice signals, "
+                       "no money moved.")
         for t in trades:
             o = t["outcome"]
+            if t.get("paper"):
+                # the model can hedge a practice-mode lesson in its own words;
+                # this fallback cannot, so a paper outcome writes nothing into
+                # the permanent playbook rather than posing as a live result
+                continue
             if (not t["won"] and o.get("exit_reason") == "stop"
                     and (o.get("mfe_pct") or 0) >= 10):
                 lessons.append(
@@ -818,7 +846,8 @@ def _owner_message(record, lesson, prop=None) -> str:
         lines.append("TODAY'S CALLS:")
         for t in record["trades"]:
             hd = _t(t["texted"])
-            lines.append(f"{t['ticker']} {t['strike']:g} {t['direction'].upper()} "
+            tag = "[PAPER] " if t.get("paper") else ""
+            lines.append(f"{tag}{t['ticker']} {t['strike']:g} {t['direction'].upper()} "
                          f"({hd}): {t['verdict']}")
         lines.append("")
     else:

@@ -1141,6 +1141,169 @@ finally:
             f.unlink()
     learn.LESSONS_LOG, learn.LESSONS_DIGEST = _orig_llog, _orig_ldig
 
+# --- learn: paper practice calls cannot masquerade as live results ---
+# PAPER_MODE positions flowed into the nightly review identically to real
+# calls: the brief presented them to the reviewer as live trades, the
+# deterministic fallback could write a practice outcome into the permanent
+# playbook, the owner's nightly digest listed them untagged (recap, cards and
+# scoreboard already tag [PAPER]) and the coach dossier carried no flag at
+# all. Every surface now sees the tag.
+import coach
+
+learn.LESSONS_LOG = config.DATA_DIR / "lessons_test.jsonl"
+learn.LESSONS_DIGEST = config.DATA_DIR / "lessons_digest_test.md"
+_orig_posfile_pp = config.POSITIONS_FILE
+_orig_et_now_pp = learn.et_now
+_orig_mktctx_pp = learn._market_context
+_pp_path = config.DATA_DIR / "positions_paper_test.json"
+config.POSITIONS_FILE = _pp_path
+
+
+def _pp_trade(ticker, paper, won=True, exit_reason="trail", mfe=55.0,
+              banked_half=True):
+    final = 40.0 if won else -70.0
+    return {"ticker": ticker, "direction": "call", "strike": 7300.0,
+            "texted": "09:50:00", "verdict": "RIGHT" if won else "WRONG",
+            "story": "ran", "won": won, "closed": True, "paper": paper,
+            "features": {"mom_pct": 0.2, "win_rate_quoted": 72.0,
+                         "risk_mode": "green", "entry_source": "quote"},
+            "outcome": {"final_pnl_pct": final, "mfe_pct": mfe,
+                        "mae_pct": -5.0, "exit_reason": exit_reason,
+                        "banked_half": banked_half}}
+
+
+def _pp_rec(*trades):
+    return {"session": "2026-06-11", "day_name": "Thu 6/11", "market": "",
+            "trades": list(trades),
+            "wins": sum(1 for t in trades if t["won"]),
+            "losses": sum(1 for t in trades if t["closed"] and not t["won"])}
+
+
+try:
+    for f in (learn.LESSONS_LOG, learn.LESSONS_DIGEST):
+        if f.exists():
+            f.unlink()
+    if _pp_path.exists():
+        _pp_path.unlink()
+
+    _pp_mixed = _pp_rec(_pp_trade("SPX", paper=True), _pp_trade("TSLA", paper=False))
+    brief = learn._day_brief(_pp_mixed)
+    check("paper: brief tags the practice call",
+          "- [PAPER] SPX 7300 CALL" in brief, f"got {brief[-300:]!r}")
+    check("paper: brief leaves the live call untagged",
+          "\n- TSLA 7300 CALL" in brief)
+    check("paper: brief tells the reviewer how to weigh practice calls",
+          "no money moved" in brief)
+    brief = learn._day_brief(_pp_rec(_pp_trade("TSLA", paper=False)))
+    check("paper: all-live brief carries no [PAPER] anywhere",
+          "[PAPER]" not in brief and "no money moved" not in brief)
+    check("paper: reviewer prompt explains the tag",
+          "[PAPER]" in learn.REVIEWER_SYSTEM)
+
+    # the deterministic fallback cannot hedge its wording, so a practice
+    # outcome writes no playbook lesson at all
+    det = learn._deterministic_review(_pp_rec(_pp_trade("SPX", paper=True)))
+    check("paper: fallback writes no lesson from a practice win",
+          det["lessons"] == [], f"got {det['lessons']}")
+    check("paper: fallback review says practice signals, no money moved",
+          "practice signals" in det["review"], f"got {det['review']!r}")
+    det = learn._deterministic_review(_pp_rec(
+        _pp_trade("SPX", paper=True, won=False, exit_reason="stop",
+                  banked_half=False)))
+    check("paper: fallback writes no lesson from a practice stop-out",
+          det["lessons"] == [], f"got {det['lessons']}")
+    det = learn._deterministic_review(_pp_mixed)
+    check("paper: live call still teaches its lesson in a mixed day",
+          len(det["lessons"]) == 1 and "TSLA" in det["lessons"][0],
+          f"got {det['lessons']}")
+    det = learn._deterministic_review(_pp_rec(_pp_trade("TSLA", paper=False)))
+    check("paper: all-live fallback review mentions no practice",
+          "practice" not in det["review"], f"got {det['review']!r}")
+
+    msg = learn._owner_message(_pp_mixed, {"review": "", "lessons": [],
+                                           "watch_tomorrow": "",
+                                           "proposed_change": None})
+    check("paper: owner digest tags the practice call like the recap does",
+          "[PAPER] SPX 7300 CALL" in msg and "\nTSLA 7300 CALL" in msg,
+          f"got {msg!r}")
+
+    # the flag rides from positions.json through _grade_positions into the
+    # coach dossier, so both nightly reviewers see it
+    _pp_book = PositionBook(_pp_path)
+    for pid, is_paper in (("pp_paper", True), ("pp_real", False)):
+        q = mk_pos()
+        q.id = q.ticker = pid
+        q.paper = is_paper
+        q.state = "closed"
+        q.final_pnl_pct = 12.0
+        q.final_exit = {"time": "11:00:00", "pct": 12.0, "mark": mark(12.0),
+                        "reason": "trail"}
+        _pp_book.add(q)
+    learn.et_now = lambda: datetime(2026, 6, 11, 21, 30, tzinfo=ET)
+    learn._market_context = lambda d: ""
+    _pp_tr = {t["ticker"]: t for t in learn._grade_positions(TODAY)}
+    check("paper: graded trades carry the flag from positions.json",
+          _pp_tr.get("pp_paper", {}).get("paper") is True
+          and _pp_tr.get("pp_real", {}).get("paper") is False, f"got {_pp_tr}")
+    _pp_doss = {t["ticker"]: t for t in coach.gather_dossier(TODAY)["trades"]}
+    check("paper: coach dossier carries the flag",
+          _pp_doss.get("pp_paper", {}).get("paper") is True
+          and _pp_doss.get("pp_real", {}).get("paper") is False,
+          f"got {_pp_doss}")
+    check("paper: coach prompt explains the flag",
+          '"paper": true' in coach.COACH_SYSTEM)
+
+    # the per-trade deep review is the third writer into the digest; its
+    # brief and archival record must carry the tag too
+    import assistant as _pp_assistant
+    _orig_reviews_pp = learn.REVIEWS_FILE
+    _orig_en_pp = _pp_assistant.enabled
+    _orig_cd_pp = _pp_assistant.cooldown_left_s
+    _orig_comp_pp = _pp_assistant.complete
+    learn.REVIEWS_FILE = config.DATA_DIR / "trade_reviews_paper_test.jsonl"
+    try:
+        if learn.REVIEWS_FILE.exists():
+            learn.REVIEWS_FILE.unlink()
+        _pp_briefs = []
+        _pp_assistant.enabled = lambda: True
+        _pp_assistant.cooldown_left_s = lambda: 0
+        _pp_assistant.complete = lambda s, u, **k: _pp_briefs.append(u) or (
+            '{"why": "clean push", "cause": "setup", '
+            '"cause_detail": "", "lesson": ""}')
+        _pp_n = learn.review_history()
+        check("paper: deep review covers both trades", _pp_n == 2,
+              f"got {_pp_n}")
+        check("paper: deep-review brief tags the practice trade",
+              any(b.startswith("[PAPER] Trade:") for b in _pp_briefs)
+              and any(b.startswith("Trade:") for b in _pp_briefs),
+              f"got {[b[:30] for b in _pp_briefs]}")
+        check("paper: cause prompt explains the tag",
+              "[PAPER]" in learn.CAUSE_SYSTEM)
+        _pp_rows = {_json.loads(ln)["id"]: _json.loads(ln)
+                    for ln in learn.REVIEWS_FILE.read_text(
+                        encoding="utf-8-sig").splitlines() if ln.strip()}
+        check("paper: trade_reviews.jsonl records the flag",
+              _pp_rows.get("pp_paper", {}).get("paper") is True
+              and _pp_rows.get("pp_real", {}).get("paper") is False,
+              f"got {_pp_rows}")
+    finally:
+        if learn.REVIEWS_FILE.exists():
+            learn.REVIEWS_FILE.unlink()
+        learn.REVIEWS_FILE = _orig_reviews_pp
+        _pp_assistant.enabled = _orig_en_pp
+        _pp_assistant.cooldown_left_s = _orig_cd_pp
+        _pp_assistant.complete = _orig_comp_pp
+finally:
+    for f in (learn.LESSONS_LOG, learn.LESSONS_DIGEST):
+        if f.exists():
+            f.unlink()
+    if _pp_path.exists():
+        _pp_path.unlink()
+    learn.LESSONS_LOG, learn.LESSONS_DIGEST = _orig_llog, _orig_ldig
+    config.POSITIONS_FILE = _orig_posfile_pp
+    learn.et_now = _orig_et_now_pp
+    learn._market_context = _orig_mktctx_pp
+
 # --- learn digest: watch_tomorrow reaches the brain for exactly one session ---
 # Each nightly review writes watch_tomorrow, the one line meant to shape the
 # NEXT session, but _rebuild_digest only pulled the lessons array, so it was

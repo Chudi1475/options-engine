@@ -57,7 +57,9 @@ Your job, for EVERY imperfection in the day:
 Hard honesty rules: never invent prices or events not in the dossier. Never
 propose touching the frozen verified sniper constants without a new backtest
 round; route those as backtest_request instead. A day with zero real
-imperfections is a valid answer.
+imperfections is a valid answer. A trade marked "paper": true was practice
+mode (tracked, no money moved): learn from it, but weigh it lighter than a
+live trade and never present a practice outcome as a live-money result.
 
 Reply with STRICT JSON only:
 {"imperfections": [{"what": str, "perfect_scenario": str, "why_fell_short":
@@ -103,6 +105,7 @@ def gather_dossier(session_date) -> dict:
         dossier["trades"] = [
             {"ticker": t["ticker"], "direction": t["direction"],
              "verdict": t["verdict"], "story": t["story"],
+             "paper": bool(t.get("paper")),
              "features": t.get("features"), "outcome": t.get("outcome")}
             for t in record.get("trades", [])]
         dossier["news"] = learn._breaking_news_for(day)
