@@ -362,6 +362,7 @@ TOOLS = [
     {
         "name": "get_score",
         "description": ("The user's running personal record: wins, losses, "
+                        "scratches ($0 breakevens, kept out of the win rate), "
                         "total P&L from everything they've logged."),
         "input_schema": {"type": "object", "properties": {}},
     },
@@ -697,15 +698,21 @@ def log_trade(chat_id: str, profit_dollars: float, ticker: str = "",
 
 
 def score(chat_id: str) -> dict:
-    """Running W:L record + total P&L from everything this user logged."""
+    """Running W:L record + total P&L from everything this user logged.
+    A $0 trade is a scratch, not a loss: it counts in entries and total but
+    sits in its own bucket, and win_rate is wins over decided (W+L) trades
+    only, so breakevens can't drag an honest record down."""
     entries = _load_trades().get(chat_id, [])
     wins = [e for e in entries if e["profit_dollars"] > 0]
-    losses = [e for e in entries if e["profit_dollars"] <= 0]
+    losses = [e for e in entries if e["profit_dollars"] < 0]
+    scratches = [e for e in entries if e["profit_dollars"] == 0]
+    decided = len(wins) + len(losses)
     return {
         "entries": len(entries),
         "wins": len(wins),
         "losses": len(losses),
-        "win_rate_pct": round(len(wins) / len(entries) * 100) if entries else 0,
+        "scratches": len(scratches),
+        "win_rate_pct": round(len(wins) / decided * 100) if decided else 0,
         "total_dollars": round(sum(e["profit_dollars"] for e in entries), 2),
         "last": entries[-1] if entries else None,
     }
@@ -714,11 +721,13 @@ def score(chat_id: str) -> dict:
 def score_line(chat_id: str) -> str:
     s = score(chat_id)
     if not s["entries"]:
-        return ("No trades logged yet — just tell me how one went "
+        return ("No trades logged yet. Just tell me how one went "
                 "(\"made $500 on SPX\") or send a P&L screenshot and "
                 "I'll keep score.")
-    return (f"📊 YOUR RECORD: {s['wins']}W - {s['losses']}L "
-            f"({s['win_rate_pct']}%) — total {s['total_dollars']:+,.0f} "
+    n = s["scratches"]
+    scratch = f" - {n} scratch{'es' if n != 1 else ''}" if n else ""
+    return (f"📊 YOUR RECORD: {s['wins']}W - {s['losses']}L{scratch} "
+            f"({s['win_rate_pct']}%), total {s['total_dollars']:+,.0f} "
             f"dollars across {s['entries']} logged trades.")
 
 

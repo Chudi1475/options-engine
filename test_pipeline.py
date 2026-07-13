@@ -261,6 +261,25 @@ tool_out = assistant._run_tool("log_trade_result",
                                {"profit_dollars": 200, "ticker": "spx"}, "u1")
 check("ledger: tool path logs + uppercases ticker",
       '"SPX"' in tool_out and assistant.score("u1")["entries"] == 3)
+# a $0 breakeven is a scratch, not a loss: score() used to bucket
+# profit_dollars <= 0 as a loss, dragging win_rate down on flat trades.
+assistant.log_trade("u1", 0, "SPX", "scratched at entry")
+s = assistant.score("u1")
+check("ledger: $0 trade is a scratch, not a loss",
+      s["wins"] == 2 and s["losses"] == 1 and s["scratches"] == 1
+      and s["entries"] == 4)
+check("ledger: win rate over decided trades only (2 of 3, not 2 of 4)",
+      s["win_rate_pct"] == 67)
+check("ledger: score line shows the scratch",
+      "2W - 1L - 1 scratch (67%)" in assistant.score_line("u1"))
+s = assistant.score("u2")  # +50 only: no scratch clause in the line
+check("ledger: no scratches -> no scratch clause",
+      s["scratches"] == 0 and "scratch" not in assistant.score_line("u2"))
+assistant.log_trade("u3", 0)  # all-scratch ledger must not divide by zero
+s = assistant.score("u3")
+check("ledger: all-scratch record renders at 0% without a loss",
+      s["wins"] == 0 and s["losses"] == 0 and s["scratches"] == 1
+      and s["win_rate_pct"] == 0 and "0W - 0L" in assistant.score_line("u3"))
 assistant.TRADES_FILE.unlink()
 
 # --- chat brain: a computed deep answer must survive to the user ---
