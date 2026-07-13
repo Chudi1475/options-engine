@@ -1606,6 +1606,102 @@ finally:
         config.STATE_FILE.unlink()
     config.STATE_FILE = _orig_state_file3
 
+# --- nightly review: the deep brain writes it, with a real fallback chain ---
+# synthesize ran the highest-leverage reasoning task in the system (the
+# nightly review whose lessons steer every future reply) on the everyday
+# model with no extended thinking. It now tries assistant.complete_deep
+# (deep model, adaptive thinking) first, falls back to the everyday
+# complete(), then to the deterministic review, so a deep-brain outage can
+# never cost the night.
+
+_VALID_DEEP = ('{"review": "deep read", "lessons": ["deep lesson"], '
+               '"watch_tomorrow": "watch", "proposed_change": null}')
+_VALID_EVERYDAY = ('{"review": "everyday read", "lessons": [], '
+                   '"watch_tomorrow": "", "proposed_change": null}')
+
+_orig_api_key = os.environ.get("ANTHROPIC_API_KEY")
+_orig_post = assistant._post_anthropic
+_orig_cdeep, _orig_comp = assistant.complete_deep, assistant.complete
+_orig_llog5, _orig_ldig5 = learn.LESSONS_LOG, learn.LESSONS_DIGEST
+learn.LESSONS_LOG = config.DATA_DIR / "lessons_test.jsonl"
+learn.LESSONS_DIGEST = config.DATA_DIR / "lessons_digest_test.md"
+try:
+    # the payload complete_deep sends: deep model, adaptive thinking, the
+    # caller's system prompt, and only the text blocks come back
+    os.environ["ANTHROPIC_API_KEY"] = "test-key"
+    seen = {}
+
+    def _fake_post(payload, timeout):
+        seen["payload"], seen["timeout"] = payload, timeout
+        return {"content": [{"type": "thinking", "thinking": "hmm"},
+                            {"type": "text", "text": "part one "},
+                            {"type": "text", "text": "and two"}]}, None
+
+    assistant._post_anthropic = _fake_post
+    out = assistant.complete_deep("SYS PROMPT", "USER BRIEF")
+    _p = seen["payload"]
+    check("deep review: complete_deep runs the deep model with thinking on",
+          _p["model"] == assistant.deep_model()
+          and _p["thinking"] == {"type": "adaptive"}
+          and _p["system"] == "SYS PROMPT"
+          and _p["messages"] == [{"role": "user", "content": "USER BRIEF"}],
+          f"got {_p}")
+    check("deep review: complete_deep returns text blocks only",
+          out == "part one and two", f"got {out!r}")
+
+    assistant._post_anthropic = lambda payload, timeout: (None, "boom")
+    check("deep review: API failure returns None so callers can fall back",
+          assistant.complete_deep("s", "u") is None)
+
+    assistant._post_anthropic = lambda payload, timeout: (
+        {"content": [{"type": "thinking", "thinking": "x"}]}, None)
+    check("deep review: an empty completion returns None, not ''",
+          assistant.complete_deep("s", "u") is None)
+
+    del os.environ["ANTHROPIC_API_KEY"]
+    assistant._post_anthropic = _orig_post
+    check("deep review: no API key means None with no network attempt",
+          assistant.complete_deep("s", "u") is None)
+
+    # synthesize prefers the deep answer; the everyday model is never called
+    calls = []
+    assistant.complete_deep = lambda s, u, **k: calls.append("deep") or _VALID_DEEP
+    assistant.complete = lambda s, u, **k: calls.append("everyday") or _VALID_EVERYDAY
+    got = learn.synthesize(_quiet_record("2026-06-11"))
+    check("deep review: synthesize uses the deep answer when it lands",
+          got["review"] == "deep read" and got["lessons"] == ["deep lesson"]
+          and calls == ["deep"], f"got {got.get('review')!r}, calls {calls}")
+
+    # a dead deep brain hands the night to the everyday model
+    calls = []
+    assistant.complete_deep = lambda s, u, **k: calls.append("deep") or None
+    got = learn.synthesize(_quiet_record("2026-06-11"))
+    check("deep review: dead deep brain falls back to the everyday model",
+          got["review"] == "everyday read" and calls == ["deep", "everyday"],
+          f"got {got.get('review')!r}, calls {calls}")
+
+    # both brains get the same reviewer prompt and the same day brief
+    seen_args = []
+    assistant.complete_deep = lambda s, u, **k: seen_args.append((s, u)) or None
+    assistant.complete = lambda s, u, **k: seen_args.append((s, u)) or None
+    got = learn.synthesize(_quiet_record("2026-06-11"))
+    check("deep review: both brains get the same prompt and brief",
+          len(seen_args) == 2 and seen_args[0] == seen_args[1]
+          and seen_args[0][0] == learn.REVIEWER_SYSTEM)
+    check("deep review: no brain at all still writes the deterministic review",
+          "stayed out" in got["review"], f"got {got.get('review')!r}")
+finally:
+    if _orig_api_key is None:
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+    else:
+        os.environ["ANTHROPIC_API_KEY"] = _orig_api_key
+    assistant._post_anthropic = _orig_post
+    assistant.complete_deep, assistant.complete = _orig_cdeep, _orig_comp
+    for f in (learn.LESSONS_LOG, learn.LESSONS_DIGEST):
+        if f.exists():
+            f.unlink()
+    learn.LESSONS_LOG, learn.LESSONS_DIGEST = _orig_llog5, _orig_ldig5
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")

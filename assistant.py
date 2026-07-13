@@ -520,6 +520,30 @@ def deep_model() -> str:
     return os.environ.get("BOT_DEEP_MODEL", "claude-opus-4-8").strip()
 
 
+def complete_deep(system: str, user: str, max_tokens: int = 8000):
+    """complete() on the DEEP model with extended thinking: one-shot, no tools,
+    no chat history. Returns the text or None on any failure so callers can
+    fall back to complete(). Used by the nightly learn job: the review it
+    writes steers every future reply and runs exactly once per day, so it is
+    the one completion worth the strongest brain. max_tokens covers thinking
+    plus text combined (thinking is always on here), so it stays roomy."""
+    if not enabled():
+        return None
+    body, err = _post_anthropic(
+        {"model": deep_model(), "max_tokens": max_tokens,
+         "thinking": {"type": "adaptive"},
+         "output_config": {"effort":
+             os.environ.get("BOT_DEEP_EFFORT", "xhigh").strip()},
+         "system": system,
+         "messages": [{"role": "user", "content": user}]},
+        timeout=300)
+    if body is None:
+        return None
+    text = "".join(b.get("text", "") for b in body.get("content", [])
+                   if b.get("type") == "text").strip()
+    return text or None
+
+
 DEEP_SYSTEM = """You are the senior analyst behind a trading and markets Telegram
 bot used by three traders (Chudi, Kelechi, Ryan). A question was escalated to you
 for DEEP reasoning because it is hard, open-ended, technical, or outside the

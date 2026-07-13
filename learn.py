@@ -391,10 +391,16 @@ def _deterministic_review(record) -> dict:
 
 
 def synthesize(record) -> dict:
-    """Ask the brain to distill lessons; fall back to a deterministic review."""
+    """Ask the brain to distill lessons; fall back to a deterministic review.
+    The review runs once per day and silently steers every future reply, so it
+    goes to the deep brain (extended thinking) first; the everyday model
+    answers when the deep call fails or comes back empty, and the
+    deterministic review covers a night with no brain at all."""
     try:
         import assistant
-        raw = assistant.complete(REVIEWER_SYSTEM, _day_brief(record), max_tokens=700)
+        brief = _day_brief(record)
+        raw = (assistant.complete_deep(REVIEWER_SYSTEM, brief)
+               or assistant.complete(REVIEWER_SYSTEM, brief, max_tokens=700))
         if raw:
             txt = raw.strip()
             if txt.startswith("```"):  # strip a ```json fence if the model added one
