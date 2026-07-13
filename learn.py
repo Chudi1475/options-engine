@@ -194,13 +194,29 @@ def et_now() -> datetime:
 def _grade_positions(session_date):
     """Grade every tracked position for the session using recap's exact
     RIGHT/WRONG logic. Works straight off positions.json, so it needs no
-    network (0DTE positions are all closed by the time this runs)."""
+    network. A position still 'open' after its expiry close (the bot was down
+    at the 16:00 settle) is first settled IN MEMORY with the same honest
+    semantics the next session's monitoring would apply, so the review grades
+    the settled truth instead of calling an expired 0DTE STILL OPEN and
+    telling the owner it is still being watched. positions.json is never
+    written from here: a --dry-run must stay write-free, and the daytime
+    monitoring path stays the one writer (it re-derives the identical settle
+    at the next open)."""
     import recap
     book = PositionBook()
+    book.settle_overdue(session_date, et_now(), save=False)
     trades = []
     for p in book.for_date(session_date):
         verdict, story = recap.position_story(p)
         final = getattr(p, "final_pnl_pct", None)
+        if getattr(p, "state", "") == "closed" and final is None:
+            # settled 'not graded' (expired with no price ever seen):
+            # position_story's open-or-ungraded test cannot tell this from a
+            # live position, and 'STILL OPEN, I'm watching it' would be a lie
+            verdict = "NOT GRADED"
+            story = ("Expired while the bot was offline and no price was "
+                     "ever seen, so it settled without a grade instead of "
+                     "an invented result.")
         trades.append({
             "ticker": p.ticker,
             "direction": p.direction,

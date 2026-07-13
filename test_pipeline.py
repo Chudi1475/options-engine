@@ -2144,6 +2144,124 @@ finally:
     config.STATE_FILE = _orig_state_file4
     learn.LESSONS_LOG, learn.LESSONS_DIGEST = _orig_llog7, _orig_ldig7
 
+# --- night grading settles stragglers the bot was down for (learn.py) ---
+# A 0DTE still 'open' at review time (bot down at the 16:00 settle) used to be
+# graded STILL OPEN with a "doesn't expire today, I'm still watching it" story.
+# _grade_positions now settles it in memory first (same honest semantics as
+# needs_monitoring's force-expire) and never writes positions.json.
+print()
+print("--- night grading of expired stragglers ---")
+_orig_posfile_ng = config.POSITIONS_FILE
+_orig_et_now_ng = learn.et_now
+_orig_mktctx_ng = learn._market_context
+_ng_path = config.DATA_DIR / "positions_straggler_test.json"
+config.POSITIONS_FILE = _ng_path
+try:
+    if _ng_path.exists():
+        _ng_path.unlink()
+
+    def _ng_pos(pid, expiry=TODAY, last_pct=None, state="open"):
+        q = mk_pos(expiry=expiry)
+        q.id = q.ticker = pid   # trades carry no id; the ticker tells them apart
+        q.state = state
+        if last_pct is not None:
+            q.last_mark = mark(last_pct)
+            q.last_mark_pct = last_pct
+            q.last_mark_source = "quote mid"
+            q.last_mark_time = "15:55:00"
+        return q
+
+    def _ng_at(day, hh, mm):
+        return datetime(day.year, day.month, day.day, hh, mm, tzinfo=ET)
+
+    _ng_book = PositionBook(_ng_path)
+    _ng_book.add(_ng_pos("ng_win", last_pct=12.0))
+    _ng_book.add(_ng_pos("ng_blind"))                          # never marked
+    _ng_book.add(_ng_pos("ng_weekly", expiry=TODAY + timedelta(days=4),
+                         last_pct=5.0))
+    _ng_bad = _ng_pos("ng_bad", last_pct=3.0)
+    _ng_bad.expiry = "not-a-date"
+    _ng_book.add(_ng_bad)
+
+    learn.et_now = lambda: _ng_at(TODAY, 21, 30)
+    _ng_raw_before = _ng_path.read_text(encoding="utf-8-sig")
+    _ng_tr = {t["ticker"]: t for t in learn._grade_positions(TODAY)}
+    _ng_raw_after = _ng_path.read_text(encoding="utf-8-sig")
+    check("NG all four positions graded", len(_ng_tr) == 4,
+          f"got {sorted(_ng_tr)}")
+    _w = _ng_tr.get("ng_win", {})
+    check("NG marked straggler settles for grading: closed and won",
+          _w.get("closed") is True and _w.get("won") is True, f"got {_w}")
+    check("NG settled straggler graded RIGHT, not STILL OPEN",
+          "RIGHT" in str(_w.get("verdict")), f"got {_w.get('verdict')}")
+    check("NG settle reason says the bot was offline",
+          "offline" in str(_w.get("outcome", {}).get("exit_reason")),
+          f"got {_w.get('outcome')}")
+    check("NG grading never writes positions.json",
+          _ng_raw_before == _ng_raw_after)
+    _b = _ng_tr.get("ng_blind", {})
+    check("NG never-marked straggler is NOT GRADED, not a win or a loss",
+          _b.get("verdict") == "NOT GRADED" and not _b.get("won")
+          and not _b.get("closed"), f"got {_b}")
+    check("NG ungraded story says no result was invented",
+          "without a grade" in str(_b.get("story")), f"got {_b.get('story')}")
+    check("NG weekly that truly is open stays STILL OPEN",
+          str(_ng_tr.get("ng_weekly", {}).get("verdict", ""))
+          .startswith("STILL OPEN"), f"got {_ng_tr.get('ng_weekly')}")
+    check("NG malformed expiry doesn't abort the sweep",
+          str(_ng_tr.get("ng_bad", {}).get("verdict", ""))
+          .startswith("STILL OPEN"), f"got {_ng_tr.get('ng_bad')}")
+
+    learn.et_now = lambda: _ng_at(TODAY, 15, 59)
+    _ng_tr2 = {t["ticker"]: t for t in learn._grade_positions(TODAY)}
+    check("NG before the close nothing settles",
+          str(_ng_tr2["ng_win"].get("verdict", "")).startswith("STILL OPEN"),
+          f"got {_ng_tr2['ng_win'].get('verdict')}")
+    learn.et_now = lambda: _ng_at(TODAY, 16, 0)
+    _ng_tr3 = {t["ticker"]: t for t in learn._grade_positions(TODAY)}
+    check("NG the 16:00 bell is the boundary",
+          _ng_tr3["ng_win"].get("closed") is True)
+    learn.et_now = lambda: _ng_at(TODAY + timedelta(days=1), 9, 0)
+    _ng_tr4 = {t["ticker"]: t for t in learn._grade_positions(TODAY)}
+    check("NG catch-up review on a later day settles too",
+          _ng_tr4["ng_win"].get("closed") is True)
+
+    learn._market_context = lambda d: ""
+    learn.et_now = lambda: _ng_at(TODAY, 21, 30)
+    _ng_rec = learn.grade_day(TODAY)
+    check("NG grade_day counts the settled straggler as a win",
+          _ng_rec["wins"] == 1 and _ng_rec["losses"] == 0,
+          f"got wins={_ng_rec['wins']} losses={_ng_rec['losses']}")
+
+    _ng_half = _ng_pos("ng_half", last_pct=10.0, state="half_sold")
+    _ng_half.half_exit = {"time": "10:05:00", "pct": 26.0, "mark": mark(26.0)}
+    _ng_book2 = PositionBook(_ng_path)
+    _ng_book2.add(_ng_half)
+    _ng_settled = _ng_book2.settle_overdue(TODAY, _ng_at(TODAY, 21, 30),
+                                           save=False)
+    check("NG settle_overdue settles exactly the overdue open stragglers",
+          {q.ticker for q in _ng_settled} == {"ng_win", "ng_blind", "ng_half"},
+          f"got {[q.ticker for q in _ng_settled]}")
+    check("NG half-banked straggler settles to the weighted final (0.5*26 + 0.5*10)",
+          _ng_half.final_pnl_pct is not None
+          and abs(_ng_half.final_pnl_pct - 18.0) < 0.01,
+          f"got {_ng_half.final_pnl_pct}")
+    _ng_book3 = PositionBook(_ng_path)
+    check("NG save=False left the disk copy open",
+          all(q.state == "open" for q in _ng_book3.positions
+              if q.ticker == "ng_win"))
+    _ng_book3.settle_overdue(TODAY, _ng_at(TODAY, 21, 30))  # default save=True
+    _ng_book4 = PositionBook(_ng_path)
+    check("NG default save=True persists the settle",
+          any(q.ticker == "ng_win" and q.state == "closed"
+              for q in _ng_book4.positions))
+finally:
+    if _ng_path.exists():
+        _ng_path.unlink()
+    config.POSITIONS_FILE = _orig_posfile_ng
+    learn.et_now = _orig_et_now_ng
+    learn._market_context = _orig_mktctx_ng
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")

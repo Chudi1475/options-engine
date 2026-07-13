@@ -256,12 +256,14 @@ class PositionBook:
                 print(f"skipping unmonitorable position {getattr(p, 'id', '?')}: {e}")
         return out
 
-    def _force_expire(self, p: Position):
+    def _force_expire(self, p: Position, save: bool = True):
         """Settle a position whose expiry passed while the bot was offline,
         using the last price it ever saw (labeled as such). If it was NEVER
         marked, do NOT invent a 0% result — that fabricates a breakeven/loss on
         the scoreboard (honesty rule). Settle it 'not graded' and leave
-        final_pnl_pct None so closed()/live_stats exclude it."""
+        final_pnl_pct None so closed()/live_stats exclude it. save=False
+        settles in memory only (the nightly review grades a settled view
+        without touching positions.json)."""
         ts = "16:00:00"
         if p.state != "closed":
             if p.last_mark_pct is None:  # no price ever seen -> ungraded
@@ -279,7 +281,36 @@ class PositionBook:
             last_pct = p.last_mark_pct if p.last_mark_pct is not None else 0.0
             p.old_rules.update(status="closed", exit_pct=last_pct,
                                exit_reason="old time stop (last known)", exit_time=ts)
-        self.save()
+        if save:
+            self.save()
+
+    def settle_overdue(self, day, now: datetime, save: bool = True) -> list:
+        """Force-settle positions from `day` that are still open even though
+        their expiry-day 16:00 ET close has passed (the bot was down at the
+        bell), so an after-hours grader (the nightly review) sees the same
+        settled truth the next session's needs_monitoring would produce.
+        needs_monitoring only settles strictly-past days because on expiry
+        day itself step() settles at the close with a real mark; a review
+        running at 21:00 on that same day needs the >= 16:00 case too. `now`
+        must be ET. save=False settles in memory only, so a --dry-run stays
+        write-free and the daytime monitoring path remains the one writer.
+        Same per-record guard as needs_monitoring: one malformed record
+        (unparseable expiry) must never abort the sweep. Returns the settled
+        positions."""
+        settled = []
+        for p in self.for_date(day):
+            try:
+                if p.state == "closed":
+                    continue
+                exp = p.expires_on()
+                if exp < now.date() or (exp == now.date()
+                                        and now.time() >= CLOSE_T):
+                    self._force_expire(p, save=save)
+                    settled.append(p)
+            except Exception as e:
+                print(f"skipping unsettleable position "
+                      f"{getattr(p, 'id', '?')}: {e}")
+        return settled
 
     def open_same_direction(self, direction: str) -> bool:
         return any(p.state != "closed" and p.direction == direction
