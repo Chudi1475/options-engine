@@ -670,7 +670,7 @@ class Service:
 
     ADMIN_CMDS = {"/adduser", "/removeuser", "/users", "/risk", "/setaccount",
                   "/test", "/health", "/requests", "/approve", "/reject",
-                  "/done", "/reqfrom", "/backlog"}
+                  "/done", "/reqfrom", "/backlog", "/proposals"}
 
     def run_command(self, cmd: str, args: str, chat_id: str = ""):
         if cmd in self.ADMIN_CMDS and not telegram.is_owner(chat_id):
@@ -751,6 +751,9 @@ class Service:
         if cmd == "/reqfrom":
             import intake
             return intake.reqfrom_command(args)
+        if cmd == "/proposals":
+            import learn
+            return learn.proposals_command(args)
         if cmd in ("/help", "/start"):
             return cards.help_card()
         # bare-symbol shortcut: /spx /qcom /gold /usdjpy /eurusd ... just work.

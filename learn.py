@@ -20,7 +20,11 @@ day instead of evaporating overnight.
 Guardrail: this NEVER auto-changes a trade rule, threshold, or the allow-list.
 If a lesson implies a rule change, it is PROPOSED to the owner in the nightly
 digest for a human to approve. The bot keeps its picky filter and 70% win-rate
-floor until Chudi says otherwise.
+floor until Chudi says otherwise. Proposals are tracked in state.json with a
+status (pending, approved, rejected): a repeat of a pending idea is counted,
+not re-pitched every night, /proposals lists and decides everything on the
+table, and a rule change the model phrases as a plain lesson is routed into
+that same channel instead of the digest the brain silently absorbs.
 
 Usage:
     python learn.py                    # run tonight's review + send owner digest
@@ -29,6 +33,7 @@ Usage:
 """
 
 import json
+import re
 import sys
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -414,10 +419,208 @@ def synthesize(record) -> dict:
                 data["lessons"] = [str(x).strip() for x in lessons if str(x).strip()][:3]
                 data.setdefault("watch_tomorrow", "")
                 data.setdefault("proposed_change", None)
-                return data
+                return _sanitize(data)
     except Exception as e:
         print(f"learn: brain synthesis failed ({e}); using deterministic review")
-    return _deterministic_review(record)
+    return _sanitize(_deterministic_review(record))
+
+
+# ------------------------ rule-change proposal registry ------------------------
+
+PROPOSALS_KEY = "rule_proposals"  # state.json: every rule change ever pitched
+
+# A lesson that PROPOSES CHANGING a configured rule must reach the owner as a
+# proposal, never the digest the brain silently absorbs. Detection is
+# deliberately conservative (precision over recall): a missed one still lands
+# under the digest header that says lessons never override the hard rules,
+# but a false flag would hide a real lesson from the playbook. The reviewer
+# prompt's own blessed example ("when a call spikes past +30%... bank half
+# immediately, do not wait for +25%...") is behavioral guidance and must NOT
+# match, so bare percents and words like "stop" or "half" alone never trigger:
+# it takes a change-verb aimed at a rule noun, an explicit numeric swap, or an
+# allow-list edit naming a ticker. Progressive "-ing" forms are excluded on
+# purpose ("staying picky is increasing the win rate" describes an outcome).
+_RULE_NOUNS = (r"(?:stops?|windows?|thresholds?|floors?|gates?|watchlists?|"
+               r"allow[- ]?lists?|give[- ]?backs?|half[- ]?targets?|"
+               r"take[- ]?half|sell[- ]?half|bank[- ]?half|"
+               r"min(?:imum)?[- ]gap|entry (?:start|end))\b")
+_CHANGE_PATTERNS = [
+    # a change-verb aimed at a rule noun (up to 3 words between, so "lower
+    # the win rate floor" and "raise the intraday stop" both count)
+    re.compile(r"\b(?:chang|rais|lower|widen|narrow|tighten|loosen|extend|"
+               r"mov|adjust|increas|decreas|bump|reduc|relax|shift)"
+               r"(?:e|es|ed|s)?\s+(?:[-\w$%+.]+\s+){0,3}?" + _RULE_NOUNS,
+               re.I),
+    # an explicit numeric threshold swap: "at +30% instead of +25%"
+    # ("instead of waiting" has no digit, so it stays a lesson)
+    re.compile(r"\b(?:instead of|rather than)\s+[+-]?\d", re.I),
+    # allow-list edits name a ticker: "Allow QQQ", "add IWM to the watchlist"
+    re.compile(r"\b(?:[Aa]llow(?:ed|ing|s)?|[Aa]dd(?:ed|ing|s)?|"
+               r"[Rr]emove[ds]?|[Dd]rop(?:ped|ping|s)?)\s+"
+               r"(?:[Tt]he\s+)?[A-Z]{2,6}\b"),
+]
+
+
+def _is_rule_change(text) -> bool:
+    """True when a lesson bullet is really a rule or threshold change in
+    disguise. Those go to the owner for approval, never into the digest."""
+    t = str(text or "")
+    return any(p.search(t) for p in _CHANGE_PATTERNS)
+
+
+def _sanitize(lesson: dict) -> dict:
+    """Move rule-change-phrased bullets out of lessons and into
+    proposed_change, so the guardrail (a human approves every rule change)
+    holds even when the model phrases one as a plain lesson."""
+    bullets = lesson.get("lessons") or []
+    moved = [x for x in bullets if _is_rule_change(x)]
+    if moved:
+        lesson["lessons"] = [x for x in bullets if not _is_rule_change(x)]
+        pc = str(lesson.get("proposed_change") or "").strip()
+        lesson["proposed_change"] = " | ".join(([pc] if pc else []) + moved)
+    return lesson
+
+
+def _proposal_key(text) -> str:
+    """Wording-tolerant identity: lowercased, whitespace collapsed, trailing
+    punctuation dropped, so tonight's copy of last night's idea matches."""
+    return " ".join(str(text or "").lower().split()).strip(".!? ")
+
+
+def proposals_list() -> list:
+    rows = config.state_get(PROPOSALS_KEY, [])
+    return rows if isinstance(rows, list) else []
+
+
+def track_proposal(text, session, source="nightly") -> dict:
+    """Upsert one proposed rule change in state.json. The same idea proposed
+    again gets its sighting counted (once per session), never a fresh nightly
+    re-pitch; the returned row carries 'repeat' and 'status' so the owner
+    message and /proposals can render it honestly. Never applies anything."""
+    key = _proposal_key(text)
+    if not key:
+        return {}
+    rows = proposals_list()
+    for row in rows:
+        if row.get("key") == key:
+            if row.get("last") != str(session):
+                row["times"] = int(row.get("times", 1)) + 1
+                row["last"] = str(session)
+                config.state_set(PROPOSALS_KEY, rows)
+            out = dict(row)
+            out["repeat"] = True
+            return out
+    row = {"key": key, "text": str(text).strip(), "first": str(session),
+           "last": str(session), "times": 1, "status": "pending",
+           "source": str(source)}
+    rows.append(row)
+    config.state_set(PROPOSALS_KEY, rows)
+    out = dict(row)
+    out["repeat"] = False
+    return out
+
+
+def _pending_sorted(rows) -> list:
+    """Pending proposals in first-seen order. New ones append at the end, so
+    the numbers /proposals shows stay stable while the owner replies."""
+    return sorted([r for r in rows if r.get("status", "pending") == "pending"],
+                  key=lambda r: (str(r.get("first") or ""),
+                                 str(r.get("key") or "")))
+
+
+def proposals_text() -> str:
+    """/proposals: every rule change the reviews have pitched, with status,
+    plus coach ideas recurring across days, in one place."""
+    rows = proposals_list()
+    pending = _pending_sorted(rows)
+    lines = []
+    if pending:
+        lines.append(f"💡 PENDING RULE PROPOSALS ({len(pending)}):")
+        for i, r in enumerate(pending, 1):
+            times = int(r.get("times", 1))
+            nights = "night" if times == 1 else "nights"
+            lines.append(f"{i}. {r.get('text')}")
+            lines.append(f"   first {r.get('first')}, came up {times} {nights}, "
+                         f"from the {r.get('source', 'nightly')} review")
+        lines.append("")
+        lines.append("/proposals ok <n> · /proposals no <n>  "
+                     "(a note can follow the n)")
+        lines.append("Approving records the decision only. A trade threshold "
+                     "still needs a verified backtest round before anything "
+                     "ships.")
+    else:
+        lines.append("No pending rule proposals. 🎯")
+    decided = [r for r in rows if r.get("status") in ("approved", "rejected")]
+    if decided:
+        decided.sort(key=lambda r: str(r.get("decided") or ""), reverse=True)
+        lines.append("")
+        lines.append("DECIDED:")
+        for r in decided[:5]:
+            lines.append(f"- {r.get('status')} {r.get('decided', '?')}: "
+                         f"{str(r.get('text'))[:100]}")
+    # the coach tracks its own proposals per day (coach_proposals.jsonl);
+    # surface the recurring ones so this really is the whole table
+    try:
+        import coach
+        by_key = {}
+        for p in coach._jl_read(coach.PROPOSALS):
+            if p.get("key"):
+                by_key.setdefault(p["key"], []).append(p)
+        recurring = sorted(((len(v), v[-1]) for v in by_key.values()
+                            if len(v) >= 2), key=lambda x: -x[0])
+        if recurring:
+            lines.append("")
+            lines.append("🧑‍🏫 COACH IDEAS RECURRING ACROSS DAYS:")
+            for n, p in recurring[:5]:
+                tag = (" (escalated, worth a backtest round)"
+                       if n >= coach.ESCALATE_AT else "")
+                lines.append(f"- {n} days: {str(p.get('proposal'))[:100]}{tag}")
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
+def _decide_proposal(n_str, status, note="") -> str:
+    try:
+        n = int(n_str)
+    except (TypeError, ValueError):
+        return ("Usage: /proposals ok <n>  or  /proposals no <n>  "
+                "(numbers from /proposals)")
+    rows = proposals_list()
+    pending = _pending_sorted(rows)
+    if not 1 <= n <= len(pending):
+        return f"No pending proposal #{n}. /proposals shows what's on the table."
+    row = pending[n - 1]  # same dict object as in rows, so the edit persists
+    row["status"] = status
+    row["decided"] = str(et_now().date())
+    if note:
+        row["note"] = str(note)[:300]
+    config.state_set(PROPOSALS_KEY, rows)
+    txt = str(row.get("text"))[:120]
+    if status == "approved":
+        return (f"Approved: {txt}\nNothing changes by itself. A trade "
+                "threshold still needs a verified backtest round, and code "
+                "ships through a reviewed change. It stays on the decided "
+                "list so it never gets re-pitched.")
+    return (f"Rejected: {txt}\nI'll stop bringing it up. It stays in the "
+            "record so a future review can't pitch it fresh.")
+
+
+def proposals_command(args="") -> str:
+    """Owner command: list tracked rule-change proposals or decide one.
+    /proposals · /proposals ok <n> [note] · /proposals no <n> [note]"""
+    parts = str(args or "").split(None, 2)
+    if parts:
+        word = parts[0].lower()
+        n = parts[1] if len(parts) > 1 else None
+        note = parts[2] if len(parts) > 2 else ""
+        if word in ("ok", "yes", "approve"):
+            return _decide_proposal(n, "approved", note)
+        if word in ("no", "reject"):
+            return _decide_proposal(n, "rejected", note)
+        return ("Usage: /proposals  ·  /proposals ok <n> [note]  ·  "
+                "/proposals no <n> [note]")
+    return proposals_text()
 
 
 # ---------------------------- persist + deliver ----------------------------
@@ -443,6 +646,21 @@ def _append_lesson(entry: dict):
     the previous row instead of stacking a duplicate the digest would count
     twice. The first review of a session is still a pure append; a line the
     parser cannot read is preserved verbatim, never destroyed."""
+    moved = [x for x in entry.get("lessons") or [] if _is_rule_change(x)]
+    if moved:
+        # a rule change phrased as a lesson (coach and deep-review rows land
+        # here unsanitized) goes to the proposal registry for a human to
+        # decide, never into the digest the brain absorbs
+        entry = dict(entry)
+        entry["lessons"] = [x for x in entry["lessons"]
+                            if not _is_rule_change(x)]
+        for x in moved:
+            try:
+                track_proposal(x, entry.get("session") or str(et_now().date()),
+                               source=_lesson_kind(entry))
+            except Exception as e:
+                print("learn: proposal tracking failed "
+                      f"({e}); kept out of the digest anyway: {str(x)[:80]}")
     kind = _lesson_kind(entry)
     session = entry.get("session")
     if kind != "deep" and session and LESSONS_LOG.exists():
@@ -582,7 +800,7 @@ def _rebuild_digest():
     LESSONS_DIGEST.write_text(header + "\n" + pin + body + "\n", encoding="utf-8")
 
 
-def _owner_message(record, lesson) -> str:
+def _owner_message(record, lesson, prop=None) -> str:
     lines = [f"🌙 NIGHTLY REVIEW: {record['day_name']}", ""]
     if record["market"]:
         lines += ["THE MARKET: " + record["market"], ""]
@@ -603,10 +821,19 @@ def _owner_message(record, lesson) -> str:
         lines.append("")
     if lesson.get("watch_tomorrow"):
         lines += ["WATCH TOMORROW: " + lesson["watch_tomorrow"], ""]
-    if lesson.get("proposed_change"):
-        lines += ["💡 PROPOSED RULE CHANGE (needs your ok): "
-                  + lesson["proposed_change"],
-                  "I will not change any trade rule on my own. Reply if you want it in."]
+    pc = lesson.get("proposed_change")
+    if pc:
+        status = (prop or {}).get("status", "pending")
+        if status == "pending" and (prop or {}).get("repeat"):
+            times = int(prop.get("times", 1))
+            lines += ["💡 Rule change still waiting on your call "
+                      f"(came up {times} nights now): {prop.get('text', pc)}",
+                      "/proposals to approve or reject it."]
+        elif status == "pending":
+            lines += ["💡 PROPOSED RULE CHANGE (needs your ok): " + pc,
+                      "I will not change any trade rule on my own. "
+                      "/proposals to approve or reject."]
+        # approved or rejected: the owner already decided, no nightly nagging
     return "\n".join(lines).strip()
 
 
@@ -665,6 +892,12 @@ def run(require_date=None, dry=False):
 
     record = grade_day(session)
     lesson = synthesize(record)
+    prop = None
+    if lesson.get("proposed_change"):
+        if dry:  # preview the full pitch; never write the registry on a dry run
+            prop = {"status": "pending", "repeat": False}
+        else:
+            prop = track_proposal(lesson["proposed_change"], record["session"])
     entry = {
         "session": record["session"],
         "graded_at": et_now().strftime("%Y-%m-%d %H:%M:%S %Z"),
@@ -677,7 +910,7 @@ def run(require_date=None, dry=False):
         "watch_tomorrow": lesson.get("watch_tomorrow", ""),
         "proposed_change": lesson.get("proposed_change"),
     }
-    msg = _owner_message(record, lesson)
+    msg = _owner_message(record, lesson, prop)
     if reviewed:
         msg += (f"\n\n🔎 DEEP REVIEW: went back over {reviewed} past trade(s), "
                 "attributed the real cause (setup vs news vs macro), and folded "

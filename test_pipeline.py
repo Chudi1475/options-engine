@@ -1770,6 +1770,150 @@ finally:
             f.unlink()
     learn.LESSONS_LOG, learn.LESSONS_DIGEST = _orig_llog5, _orig_ldig5
 
+# --- rule-change proposals: tracked, deduped, decidable, digest-safe ---
+# proposed_change had no dedup or status tracking, so the same idea got
+# re-pitched night after night with no record of any decision, and a rule
+# change the model phrased as a plain lesson walked straight into the digest
+# the brain reads. Proposals now live in state.json with a status, repeats
+# are counted instead of re-pitched, /proposals lists and decides them, and
+# rule-change-phrased lessons are routed into the same channel.
+
+_orig_state_file4 = config.STATE_FILE
+_orig_llog7, _orig_ldig7 = learn.LESSONS_LOG, learn.LESSONS_DIGEST
+learn.LESSONS_LOG = config.DATA_DIR / "lessons_test.jsonl"
+learn.LESSONS_DIGEST = config.DATA_DIR / "lessons_digest_test.md"
+try:
+    config.STATE_FILE = config.DATA_DIR / "state_proposals_test.json"
+    for f in (config.STATE_FILE, learn.LESSONS_LOG, learn.LESSONS_DIGEST):
+        if f.exists():
+            f.unlink()
+
+    check("proposals: threshold changes detected",
+          learn._is_rule_change("Lower the win rate floor to 65% on trend days")
+          and learn._is_rule_change("Take half at +30% instead of +25%")
+          and learn._is_rule_change("Widen the entry window to 10:45")
+          and learn._is_rule_change("Add QQQ to the watchlist")
+          and learn._is_rule_change("Move the stop to -60% on green days"))
+    check("proposals: behavioral lessons stay lessons",
+          not learn._is_rule_change(
+              "when a call spikes past +30% in the first 20 minutes, bank "
+              "half immediately, do not wait for +25% to become give-back")
+          and not learn._is_rule_change(
+              "TSLA peaked +34% then stopped out. When a call spikes double "
+              "digits early, bank half into the spike instead of waiting.")
+          and not learn._is_rule_change(
+              "SPX ran the playbook clean: banked half into strength then "
+              "trailed the runner. Keep repeating this shape.")
+          and not learn._is_rule_change(
+              "Being picky is increasing my win rate."))
+
+    _l = learn._sanitize({"review": "r",
+                          "lessons": ["real behavioral lesson",
+                                      "Lower the win rate floor to 65%"],
+                          "watch_tomorrow": "", "proposed_change": None})
+    check("proposals: sanitize routes the rule change out of lessons",
+          _l["lessons"] == ["real behavioral lesson"]
+          and _l["proposed_change"] == "Lower the win rate floor to 65%")
+
+    # synthesize applies the sanitizer to whatever the brain returns
+    _oc1, _oc2 = assistant.complete_deep, assistant.complete
+    try:
+        assistant.complete_deep = lambda s, u, **k: (
+            '{"review": "r", "lessons": ["Tighten the gate to 75%"], '
+            '"watch_tomorrow": "", "proposed_change": null}')
+        assistant.complete = lambda s, u, **k: None
+        _got = learn.synthesize(_quiet_record("2026-06-12"))
+        check("proposals: synthesize sanitizes a rule change out of lessons",
+              _got["lessons"] == []
+              and _got["proposed_change"] == "Tighten the gate to 75%",
+              f"got {_got}")
+    finally:
+        assistant.complete_deep, assistant.complete = _oc1, _oc2
+
+    # tracking: reworded repeats count one row, once per session
+    p1 = learn.track_proposal("Lower the stop to -60%", "2026-06-10")
+    p2 = learn.track_proposal("  lower the stop to -60% ", "2026-06-11")
+    p3 = learn.track_proposal("lower the stop to -60%.", "2026-06-11")
+    check("proposals: same idea reworded counts one row",
+          p1["repeat"] is False and p2["repeat"] is True
+          and p2["times"] == 2 and p3["times"] == 2
+          and len(learn.proposals_list()) == 1,
+          f"got {learn.proposals_list()}")
+
+    learn.track_proposal("Widen the entry window to 10:45", "2026-06-11")
+    txt = learn.proposals_command("")
+    check("proposals: view lists pending with stable numbers",
+          "1. Lower the stop to -60%" in txt
+          and "2. Widen the entry window to 10:45" in txt
+          and "came up 2 nights" in txt, f"got {txt!r}")
+
+    reply = learn.proposals_command("ok 1 run it next round")
+    check("proposals: approve records the decision, changes nothing",
+          "Approved" in reply and "backtest" in reply, f"got {reply!r}")
+    _rows = learn.proposals_list()
+    check("proposals: status persisted with the note",
+          _rows[0]["status"] == "approved"
+          and _rows[0]["note"] == "run it next round", f"got {_rows}")
+    txt = learn.proposals_command("")
+    check("proposals: a decided one leaves the pending list",
+          "1. Widen the entry window to 10:45" in txt
+          and "Lower the stop" not in txt.split("DECIDED:")[0]
+          and "approved" in txt, f"got {txt!r}")
+
+    reply = learn.proposals_command("no 1")
+    check("proposals: reject stops the nagging",
+          "Rejected" in reply
+          and learn.proposals_list()[1]["status"] == "rejected")
+    check("proposals: bad index is a gentle note",
+          "No pending proposal" in learn.proposals_command("ok 9"))
+    check("proposals: junk args get usage",
+          "Usage" in learn.proposals_command("frobnicate")
+          and "Usage" in learn.proposals_command("ok"))
+    check("proposals: empty pending list says so",
+          "No pending rule proposals" in learn.proposals_command(""))
+
+    # owner message: full pitch once, a one-line reminder while pending,
+    # silence once decided
+    _rec = _quiet_record("2026-06-12")
+    _les = {"review": "r", "lessons": [], "watch_tomorrow": "",
+            "proposed_change": "Allow IWM for reads"}
+    _new = learn._owner_message(_rec, _les,
+                                {"status": "pending", "repeat": False})
+    _rep = learn._owner_message(_rec, _les,
+                                {"status": "pending", "repeat": True,
+                                 "times": 3, "text": "Allow IWM for reads"})
+    _rej = learn._owner_message(_rec, _les,
+                                {"status": "rejected", "repeat": True})
+    check("proposals: fresh proposal gets the full pitch",
+          "PROPOSED RULE CHANGE" in _new and "/proposals" in _new)
+    check("proposals: pending repeat is one reminder, not a re-pitch",
+          "PROPOSED RULE CHANGE" not in _rep and "came up 3 nights" in _rep,
+          f"got {_rep!r}")
+    check("proposals: a rejected idea never nags again", "💡" not in _rej)
+
+    # coach and deep-review rows are caught at the _append_lesson choke point
+    learn._append_lesson({"session": "2026-06-12", "graded_at": "x",
+                          "wins": 0, "losses": 0, "trades": [],
+                          "review": "coach: solid day",
+                          "lessons": ["real coach lesson",
+                                      "Raise the minimum gap to 1.2 ATR"],
+                          "watch_tomorrow": "", "proposed_change": None})
+    learn._rebuild_digest()
+    _dig = learn.LESSONS_DIGEST.read_text(encoding="utf-8")
+    check("proposals: rule change in a coach lesson never reaches the digest",
+          "real coach lesson" in _dig and "minimum gap" not in _dig,
+          f"got {_dig!r}")
+    check("proposals: routed coach lesson lands in the registry, sourced",
+          any(r.get("source") == "coach" and "minimum gap" in r.get("key", "")
+              for r in learn.proposals_list()),
+          f"got {learn.proposals_list()}")
+finally:
+    for f in (config.STATE_FILE, learn.LESSONS_LOG, learn.LESSONS_DIGEST):
+        if f.exists():
+            f.unlink()
+    config.STATE_FILE = _orig_state_file4
+    learn.LESSONS_LOG, learn.LESSONS_DIGEST = _orig_llog7, _orig_ldig7
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")
