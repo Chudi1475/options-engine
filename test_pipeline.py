@@ -1408,6 +1408,204 @@ try:
 finally:
     quotes.get_option_quote = _orig_get_quote
 
+# --- once-per-day attempt cap: a crash between a job's send and its dedup
+# mark can no longer re-broadcast the report indefinitely ---
+# Every once-per-day job (morning card, recap, request digest, nightly
+# review, weekly) sends first and writes its dedup key after, so a restart
+# landing in between re-broadcast the whole report on every start (railway
+# restartPolicy is ALWAYS, so a crash loop could spam it for hours), and
+# weekly retried delivery errors unbounded all weekend. Each job now records
+# its attempt BEFORE sending: the first re-broadcast after a crash is allowed
+# (duplicate beats missing), the next is not, and delivery-error retries ride
+# the same counter.
+import intake
+import recap as recapmod
+import telegram
+
+_orig_recap_main = recapmod.main
+_orig_learn_run2 = learn.run
+_orig_weekly_rep = scannermod.scoreboard.weekly_report
+_orig_news_lines = scannermod.news.morning_lines
+_orig_digest = intake.digest
+_orig_owner_id = telegram.primary_owner_id
+_orig_send_to = telegram.send_to
+_orig_state_file3 = config.STATE_FILE
+try:
+    config.STATE_FILE = config.DATA_DIR / "state_attempts_test.json"
+    if config.STATE_FILE.exists():
+        config.STATE_FILE.unlink()
+
+    def _job_svc():
+        svc = Service.__new__(Service)  # plumbing only: no live I/O paths
+        svc.dry = False
+        return svc
+
+    # morning card: crash between notify and the morning_sent write
+    scannermod.news.morning_lines = lambda watchlist: []
+    m_now = datetime(2026, 6, 11, 9, 0, tzinfo=ET)  # Thu, before entry window
+    m_day = str(m_now.date())
+    config.state_set("risk_auto", {"date": m_day, "mode": "green",
+                                   "reason": "test", "gap": True})
+    msvc = _job_svc()
+    msvc.cfg = scannermod.StrategyConfig()
+    msvc.mode, msvc.mode_reason = "green", ""
+    msvc.morning_sent_for = None
+    msvc.premarket_sent_for = None
+    m_sent = []
+    msvc.notify = lambda text: m_sent.append(text) or []
+    msvc.morning_report(m_now)
+    check("attempts: morning card sends once and marks sent",
+          len(m_sent) == 1 and config.state_get("morning_sent") == m_day
+          and config.state_get("morning_tries") == {m_day: 1})
+    config.state_set("morning_sent", None)  # crashed before the mark
+    msvc.morning_sent_for = None            # ...and restarted
+    msvc.morning_report(m_now)
+    check("attempts: one crash re-broadcast is allowed (duplicate beats missing)",
+          len(m_sent) == 2 and config.state_get("morning_sent") == m_day)
+    config.state_set("morning_sent", None)
+    msvc.morning_sent_for = None
+    msvc.morning_report(m_now)
+    check("attempts: a morning restart loop cannot broadcast a third time",
+          len(m_sent) == 2 and config.state_get("morning_sent") == m_day)
+
+    # recap: same crash shape, plus STALE refunds and bounded delivery errors
+    r_now = datetime(2026, 6, 11, 16, 10, tzinfo=ET)
+    r_calls = []
+    recapmod.main = lambda require_date=None: r_calls.append(require_date) or []
+    rsvc = _job_svc()
+    rsvc.maybe_recap(r_now)
+    check("attempts: recap sends once and marks sent",
+          r_calls == [m_day] and config.state_get("recap_sent") == m_day)
+    config.state_set("recap_sent", None)
+    rsvc.maybe_recap(r_now)
+    config.state_set("recap_sent", None)
+    rsvc.maybe_recap(r_now)
+    check("attempts: recap restart loop capped at two broadcasts",
+          len(r_calls) == 2 and config.state_get("recap_sent") == m_day)
+
+    config.state_set("recap_sent", None)
+    config.state_set("recap_tries", {})
+    recapmod.main = lambda require_date=None: "STALE"
+    for _ in range(5):
+        rsvc.maybe_recap(r_now)
+    check("attempts: STALE passes refund the attempt, never burn the cap",
+          config.state_get("recap_sent") is None
+          and config.state_get("recap_tries") == {m_day: 0})
+    recapmod.main = lambda require_date=None: r_calls.append(require_date) or []
+    rsvc.maybe_recap(r_now)
+    check("attempts: recap still sends once the data catches up",
+          len(r_calls) == 3 and config.state_get("recap_sent") == m_day)
+
+    config.state_set("recap_sent", None)
+    config.state_set("recap_tries", {})
+    recapmod.main = lambda require_date=None: ["403: blocked"]
+    rsvc.maybe_recap(r_now)
+    check("attempts: first recap delivery error stays retryable",
+          config.state_get("recap_sent") is None
+          and config.state_get("recap_tries") == {m_day: 1})
+    rsvc.maybe_recap(r_now)
+    check("attempts: second recap delivery error marks done",
+          config.state_get("recap_sent") == m_day)
+
+    # nightly review: a crash re-fire re-runs the review once, not forever
+    l_now = datetime(2026, 6, 11, 23, 50, tzinfo=ET)
+    l_runs = []
+    learn.run = lambda require_date=None, dry=False: l_runs.append(require_date) or []
+    lsvc = _job_svc()
+    lsvc.book = PositionBook.__new__(PositionBook)
+    lsvc.book.positions = []
+    config.state_set("learn_sent", None)
+    config.state_set("learn_tries", {})
+    lsvc.maybe_learn(l_now)
+    config.state_set("learn_sent", None)
+    lsvc.maybe_learn(l_now)
+    config.state_set("learn_sent", None)
+    lsvc.maybe_learn(l_now)
+    check("attempts: a crash loop cannot re-run the nightly review a third time",
+          len(l_runs) == 2 and config.state_get("learn_sent") == m_day)
+
+    # weekly: crash cap, plus its FIRST bounded delivery-error retry (it used
+    # to re-run and re-send every daemon tick all weekend)
+    scannermod.scoreboard.weekly_report = lambda *a, **k: "WEEKLY REPORT"
+    w_now = datetime(2026, 6, 12, 16, 10, tzinfo=ET)  # Friday after the close
+    w_key = w_now.strftime("%G-W%V")
+    wsvc = _job_svc()
+    wsvc.book = None
+    wsvc.backtest_old = None
+    wsvc.backtest_new = None
+    w_sent = []
+    wsvc.notify = lambda text: w_sent.append(text) or []
+    wsvc.maybe_weekly(w_now)
+    check("attempts: weekly sends once and marks the ISO week",
+          len(w_sent) == 1 and config.state_get("weekly_sent") == w_key)
+    config.state_set("weekly_sent", None)
+    wsvc.maybe_weekly(w_now)
+    config.state_set("weekly_sent", None)
+    wsvc.maybe_weekly(w_now)
+    check("attempts: weekly restart loop capped at two broadcasts",
+          len(w_sent) == 2 and config.state_get("weekly_sent") == w_key)
+
+    config.state_set("weekly_sent", None)
+    config.state_set("weekly_tries", {})
+    wsvc.notify = lambda text: w_sent.append(text) or ["network down"]
+    wsvc.maybe_weekly(w_now)
+    check("attempts: first weekly delivery error stays retryable",
+          config.state_get("weekly_sent") is None)
+    wsvc.maybe_weekly(w_now)
+    check("attempts: weekly delivery errors bounded, job marked done",
+          config.state_get("weekly_sent") == w_key)
+
+    # request digest (owner-only): same cap, same bounded error retries
+    intake.digest = lambda: "OPEN REQUESTS"
+    telegram.primary_owner_id = lambda: 111
+    d_sent = []
+    telegram.send_to = lambda chat, msg: d_sent.append(msg) or ""
+    dsvc = _job_svc()
+    dsvc.maybe_request_digest(r_now)
+    check("attempts: request digest sends once and marks sent",
+          len(d_sent) == 1 and config.state_get("request_digest_sent") == m_day)
+    config.state_set("request_digest_sent", None)
+    dsvc.maybe_request_digest(r_now)
+    config.state_set("request_digest_sent", None)
+    dsvc.maybe_request_digest(r_now)
+    check("attempts: digest restart loop capped at two sends",
+          len(d_sent) == 2 and config.state_get("request_digest_sent") == m_day)
+
+    config.state_set("request_digest_sent", None)
+    config.state_set("request_digest_tries", {})
+    telegram.send_to = lambda chat, msg: "403: blocked"
+    dsvc.maybe_request_digest(r_now)
+    check("attempts: first digest send error stays retryable",
+          config.state_get("request_digest_sent") is None)
+    dsvc.maybe_request_digest(r_now)
+    check("attempts: digest send errors bounded, job marked done",
+          config.state_get("request_digest_sent") == m_day)
+
+    # dry mode never counts an attempt or writes any dedup key
+    config.state_set("weekly_sent", None)
+    config.state_set("weekly_tries", {})
+    drysvc = _job_svc()
+    drysvc.dry = True
+    drysvc.book = None
+    drysvc.backtest_old = None
+    drysvc.backtest_new = None
+    drysvc.notify = lambda text: []
+    drysvc.maybe_weekly(w_now)
+    check("attempts: dry mode never counts or marks",
+          config.state_get("weekly_sent") is None
+          and config.state_get("weekly_tries") == {})
+finally:
+    recapmod.main = _orig_recap_main
+    learn.run = _orig_learn_run2
+    scannermod.scoreboard.weekly_report = _orig_weekly_rep
+    scannermod.news.morning_lines = _orig_news_lines
+    intake.digest = _orig_digest
+    telegram.primary_owner_id = _orig_owner_id
+    telegram.send_to = _orig_send_to
+    if config.STATE_FILE.exists():
+        config.STATE_FILE.unlink()
+    config.STATE_FILE = _orig_state_file3
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")

@@ -235,6 +235,25 @@ class Service:
             target=self.flush_pending, daemon=True, name="flush-pending")
         self._flush_thread.start()
 
+    # Once-per-day jobs (morning card, recap, request digest, nightly review,
+    # weekly) send FIRST and write their dedup key AFTER, so a crash or
+    # redeploy landing in between re-broadcasts the whole report on the next
+    # start — and railway restarts with restartPolicy ALWAYS, so a crash loop
+    # could re-text it indefinitely. Each job now records its attempt BEFORE
+    # sending; a key that has burned MAX_JOB_ATTEMPTS attempts (sends OR hard
+    # failures, not just delivery errors) is marked done without sending
+    # again. Duplicate still beats missing: the first re-broadcast after a
+    # crash is allowed, the next is not.
+    MAX_JOB_ATTEMPTS = 2
+
+    def _job_attempt(self, job: str, key: str) -> int:
+        """Record one attempt for (job, key) and return the new total.
+        Stores only the current key, so old days/weeks self-prune."""
+        rec = config.state_get(f"{job}_tries", {})
+        n = (rec.get(key, 0) if isinstance(rec, dict) else 0) + 1
+        config.state_set(f"{job}_tries", {key: n})
+        return n
+
     def reload_tunables(self):
         """Pick up the overnight backtest without a redeploy. The daemon
         lives for weeks, but backtest.py rewrites the report jsons overnight,
@@ -495,6 +514,16 @@ class Service:
                 self.notify("UPDATE — " + cards.morning_card(mode, reason, today))
             return
         self.morning_sent_for = today
+        # count the broadcast BEFORE it happens: a crash between the notify
+        # below and the morning_sent write used to re-text the card on every
+        # restart. Past the cap, adopt the mark without sending again.
+        if not self.dry:
+            n = self._job_attempt("morning", str(today))
+            if n > self.MAX_JOB_ATTEMPTS:
+                config.state_set("morning_sent", str(today))
+                print(f"morning card already attempted {n - 1} times today "
+                      "(restart between send and mark?); marking done")
+                return
         card = cards.morning_card(mode, reason, today)
         try:  # earnings radar + hot headlines (news must never block the report)
             extra = news.morning_lines(self.cfg.watchlist)
@@ -1509,12 +1538,22 @@ class Service:
         today = str(now.date())
         if config.state_get("recap_sent") == today:
             return
+        # recorded BEFORE the send: a crash between recap.main's broadcast and
+        # the recap_sent write used to re-text the whole recap on every restart
+        n = self._job_attempt("recap", today)
+        if n > self.MAX_JOB_ATTEMPTS:
+            config.state_set("recap_sent", today)
+            print(f"{now:%H:%M:%S} recap already attempted {n - 1} times today "
+                  "(restart between send and mark?); marking done")
+            return
         try:
             import recap
             errs = recap.main(require_date=today)
             if errs == "STALE":
-                # yfinance hasn't published today's session yet — don't send a
-                # wrong-day recap and don't mark sent; just retry next pass.
+                # yfinance hasn't published today's session yet — nothing was
+                # sent, so refund the attempt (data lag must not burn the cap)
+                # and retry next pass rather than text a wrong-day recap.
+                config.state_set("recap_tries", {today: n - 1})
                 print(f"{now:%H:%M:%S} recap data not caught up to {today} yet; will retry")
                 return
             if not errs:
@@ -1523,17 +1562,14 @@ class Service:
             # delivery errors: retry a BOUNDED number of times, then mark sent so
             # one permanently-unreachable member can't re-broadcast the full
             # recap to everyone else every cycle for the next 7 minutes.
-            tries = config.state_get("recap_tries", {})
-            n = (tries.get(today, 0) if isinstance(tries, dict) else 0) + 1
-            if n >= 2:
+            if n >= self.MAX_JOB_ATTEMPTS:
                 config.state_set("recap_sent", today)
                 print(f"{now:%H:%M:%S} recap had delivery errors after {n} tries; "
                       f"marking done to avoid duplicates: {errs}")
             else:
-                config.state_set("recap_tries", {today: n})
                 print(f"{now:%H:%M:%S} recap send had errors, will retry once: {errs}")
         except Exception as e:
-            print(f"{now:%H:%M:%S} recap failed (will retry): {e}")
+            print(f"{now:%H:%M:%S} recap failed (attempt {n} recorded, will retry): {e}")
 
     def maybe_request_digest(self, now: datetime):
         """After the close, send Chudi one rollup of every request that came in
@@ -1544,18 +1580,30 @@ class Service:
         today = str(now.date())
         if config.state_get("request_digest_sent") == today:
             return
+        # recorded BEFORE the send — see MAX_JOB_ATTEMPTS. Owner-only, so the
+        # blast radius is small, but the retry-forever loop was unbounded.
+        n = self._job_attempt("request_digest", today)
+        if n > self.MAX_JOB_ATTEMPTS:
+            config.state_set("request_digest_sent", today)
+            print(f"{now:%H:%M:%S} request digest already attempted {n - 1} "
+                  "times today; marking done")
+            return
         try:
             import intake
             msg = intake.digest()
             owner = telegram.primary_owner_id()
             if msg and owner:
                 err = telegram.send_to(owner, msg)
-                if err:
+                if err and n < self.MAX_JOB_ATTEMPTS:
                     print(f"{now:%H:%M:%S} request digest send error: {err}")
                     return  # don't mark sent — retry next pass
+                if err:
+                    print(f"{now:%H:%M:%S} request digest send error after "
+                          f"{n} tries; marking done: {err}")
             config.state_set("request_digest_sent", today)
         except Exception as e:
-            print(f"{now:%H:%M:%S} request digest failed (will retry): {e}")
+            print(f"{now:%H:%M:%S} request digest failed (attempt {n} "
+                  f"recorded, will retry): {e}")
 
     def maybe_learn(self, now: datetime):
         """Nightly self-review at a RANDOM late-evening time (21:00-23:45 ET),
@@ -1582,10 +1630,23 @@ class Service:
             print(f"{now:%H:%M:%S} learn: {key} review was missed and left no "
                   "positions or recap; skipping catch-up")
             return
+        # recorded BEFORE the review runs: learn.run writes lessons and texts
+        # the owner, so a crash between that send and the learn_sent write
+        # used to re-run the review (a fresh API call) and re-text the digest
+        # on every restart.
+        n = self._job_attempt("learn", key)
+        if n > self.MAX_JOB_ATTEMPTS:
+            config.state_set("learn_sent", key)
+            print(f"{now:%H:%M:%S} learn: {key} already attempted {n - 1} "
+                  "times (restart between send and mark?); marking done")
+            return
         try:
             import learn
             errs = learn.run(require_date=key)
             if errs == "STALE":
+                # nothing was sent — refund the attempt so data lag can't
+                # burn through the cap
+                config.state_set("learn_tries", {key: n - 1})
                 print(f"{now:%H:%M:%S} learn: data not caught up to {key}; will retry")
                 return
             if not errs:
@@ -1593,17 +1654,14 @@ class Service:
                 return
             # delivery errors: bounded retries, then mark done so a permanently
             # unreachable owner can't re-run the review every 45s all night.
-            tries = config.state_get("learn_tries", {})
-            n = (tries.get(key, 0) if isinstance(tries, dict) else 0) + 1
-            if n >= 2:
+            if n >= self.MAX_JOB_ATTEMPTS:
                 config.state_set("learn_sent", key)
                 print(f"{now:%H:%M:%S} learn had delivery errors after {n} tries; "
                       f"marking done: {errs}")
             else:
-                config.state_set("learn_tries", {key: n})
                 print(f"{now:%H:%M:%S} learn send had errors, will retry once: {errs}")
         except Exception as e:
-            print(f"{now:%H:%M:%S} learn failed (will retry): {e}")
+            print(f"{now:%H:%M:%S} learn failed (attempt {n} recorded, will retry): {e}")
 
     def maybe_weekly(self, now: datetime):
         # Friday after the close — with weekend catch-up if the bot was
@@ -1614,10 +1672,27 @@ class Service:
         key = now.strftime("%G-W%V")
         if config.state_get("weekly_sent") == key:
             return
+        n = 0
+        if not self.dry:  # recorded BEFORE the send — see MAX_JOB_ATTEMPTS.
+            n = self._job_attempt("weekly", key)
+            if n > self.MAX_JOB_ATTEMPTS:
+                config.state_set("weekly_sent", key)
+                print(f"weekly report already attempted {n - 1} times this "
+                      "week (restart between send and mark?); marking done")
+                return
         errors = self.notify(scoreboard.weekly_report(
             self.book, self.backtest_old, self.backtest_new, now.date()))
-        if not errors and not self.dry:  # only mark sent when it really went out
-            config.state_set("weekly_sent", key)            # (and never in dry)
+        if self.dry:  # dry never marks sent (and never counted an attempt)
+            return
+        if not errors:  # only mark sent when it really went out
+            config.state_set("weekly_sent", key)
+        elif n >= self.MAX_JOB_ATTEMPTS:
+            # persistent delivery errors used to re-run AND re-send this every
+            # daemon tick all weekend. notify() already queued the failed text
+            # for bounded per-message retries, so stop re-running the job.
+            config.state_set("weekly_sent", key)
+            print(f"weekly report had delivery errors after {n} tries; "
+                  f"marking done (text queued for retry): {errors}")
 
     # ---------- main loops ----------
 
