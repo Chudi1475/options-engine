@@ -1220,9 +1220,12 @@ check("weekly: no finished shadow means no verdict at all",
 # 21:00-23:45 window (a Friday-night redeploy rolling into the weekend, a
 # crash loop) lost that session's review forever while recap and weekly both
 # catch up. It now targets the most recent completed weekday session, catches
-# up at most that one session, and only when positions or that day's recap
-# prove the bot actually ran, so an outage day is never graded as a clean
-# stay-out. 2026-06-11 is a Thursday, 6/12 Friday, 6/13-14 the weekend.
+# up at most that one session, and grades any session (tonight's included)
+# only when positions or that day's MORNING CARD prove the bot actually ran,
+# so an outage day is never graded as a clean stay-out. The recap does not
+# count as evidence: its catch-up fires on the same night tick right before
+# maybe_learn, so a bot dead all day and restarted at 21:00 would look alive
+# by its own recap. 2026-06-11 is a Thursday, 6/12 Friday, 6/13-14 weekend.
 
 check("catchup: weekday past the window reviews today",
       scannermod.learn_session_due(datetime(2026, 6, 11, 23, 50, tzinfo=ET))
@@ -1255,7 +1258,24 @@ try:
     svc.dry = False
     svc.book = lbook
 
-    # the normal same-night path is unchanged: fires once, dedups after
+    # dead all day, restarted at night: nothing proves the bot ran the
+    # session, so tonight's review is skipped and marked, never graded
+    svc.maybe_learn(datetime(2026, 6, 11, 23, 50, tzinfo=ET))
+    check("outage guard: same night with no evidence is skipped, not graded",
+          lruns == [] and config.state_get("learn_sent") == "2026-06-11")
+
+    # the recap its own catch-up just sent is NOT evidence the bot was alive
+    # during the session (it fires on the same night tick right before learn)
+    config.state_set("learn_sent", None)
+    config.state_set("recap_sent", "2026-06-11")
+    svc.maybe_learn(datetime(2026, 6, 11, 23, 50, tzinfo=ET))
+    check("outage guard: tonight's catch-up recap alone is not proof of life",
+          lruns == [] and config.state_get("learn_sent") == "2026-06-11")
+
+    # the normal same-night path: the morning card went out at 9:15, so the
+    # quiet day was a choice; fires once, dedups after
+    config.state_set("learn_sent", None)
+    config.state_set("morning_sent", "2026-06-11")
     svc.maybe_learn(datetime(2026, 6, 11, 23, 50, tzinfo=ET))
     check("catchup: same night still runs tonight's review",
           lruns == ["2026-06-11"]
@@ -1277,19 +1297,22 @@ try:
     svc.maybe_learn(datetime(2026, 6, 15, 20, 0, tzinfo=ET))
     check("catchup: pre-window Monday tick never fires early", len(lruns) == 2)
 
-    # outage day with no positions and no recap: marked handled, never graded
+    # outage day with no positions and no morning card: marked handled, never
+    # graded. A Friday recap sent by the evening catch-up after a dead day
+    # does not count as proof the bot ran the session.
     lbook.positions = []
     config.state_set("learn_sent", "2026-06-11")
+    config.state_set("recap_sent", "2026-06-12")
     svc.maybe_learn(datetime(2026, 6, 13, 9, 0, tzinfo=ET))
     check("catchup: a day with no evidence the bot ran is skipped, not graded",
           len(lruns) == 2 and config.state_get("learn_sent") == "2026-06-12")
 
-    # but a recorded Friday recap proves the bot was alive at the close, so a
+    # but Friday's morning card proves the bot was up that trading day, so a
     # quiet (zero-position) Friday still gets its review
     config.state_set("learn_sent", "2026-06-11")
-    config.state_set("recap_sent", "2026-06-12")
+    config.state_set("morning_sent", "2026-06-12")
     svc.maybe_learn(datetime(2026, 6, 13, 9, 0, tzinfo=ET))
-    check("catchup: a quiet day with a recorded recap still gets its review",
+    check("catchup: a quiet day whose morning card went out gets its review",
           lruns == ["2026-06-11", "2026-06-12", "2026-06-12"])
 
     # delivery errors on a catch-up: bounded retries keyed by the session

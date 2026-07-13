@@ -1613,22 +1613,28 @@ class Service:
         once per session; never in dry mode. A review missed while the bot was
         down across the whole window (redeploy, crash loop, a Friday outage
         rolling into the weekend) is caught up on a later tick, recap/weekly
-        style, but only the single most recent session, and only when there is
-        evidence the bot actually ran that day (tracked positions, or that
-        day's recap went out), so an outage day is never graded as if the bot
-        had deliberately stayed out."""
+        style, but only the single most recent session. Tonight's session and
+        a caught-up one alike are graded only when there is evidence the bot
+        actually ran that trading day: tracked positions, or that day's
+        morning card (only ever sent from the daytime loops). The recap
+        deliberately does NOT count as evidence: its own catch-up fires on
+        the same night tick right before this one, so a bot that was dead
+        all day and restarted at 21:00 would look alive by the recap it just
+        sent, and its outage would be graded as a deliberate stay-out."""
         if self.dry:
             return
         key = str(learn_session_due(now))
         if config.state_get("learn_sent") == key:
             return
-        if key != str(now.date()) and not self.book.for_date(key) \
-                and config.state_get("recap_sent") != key:
-            # catch-up with no sign the bot was up that day: grading it would
-            # invent a "stayed out, being picky" story about an outage.
+        if not self.book.for_date(key) \
+                and config.state_get("morning_sent") != key:
+            # no sign the bot was up during that session: grading it would
+            # invent a "stayed out, being picky" story about an outage, and
+            # that fabricated lesson would steer every future reply.
             config.state_set("learn_sent", key)
-            print(f"{now:%H:%M:%S} learn: {key} review was missed and left no "
-                  "positions or recap; skipping catch-up")
+            print(f"{now:%H:%M:%S} learn: {key} left no positions and no "
+                  "morning card, so the bot was likely down that session; "
+                  "skipping the review rather than grading an outage as a choice")
             return
         # recorded BEFORE the review runs: learn.run writes lessons and texts
         # the owner, so a crash between that send and the learn_sent write
@@ -1642,13 +1648,11 @@ class Service:
             return
         try:
             import learn
+            # learn.run returns [] or a list of delivery errors, never "STALE":
+            # it grades off positions.json, so there is no data-lag state to
+            # wait out (a STALE branch copied from recap sat dead here for
+            # months and implied a retry path that could not happen).
             errs = learn.run(require_date=key)
-            if errs == "STALE":
-                # nothing was sent — refund the attempt so data lag can't
-                # burn through the cap
-                config.state_set("learn_tries", {key: n - 1})
-                print(f"{now:%H:%M:%S} learn: data not caught up to {key}; will retry")
-                return
             if not errs:
                 config.state_set("learn_sent", key)
                 return
