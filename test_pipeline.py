@@ -297,6 +297,13 @@ def _text(t):
              "content": [{"type": "text", "text": t}]}, None)
 
 
+def _refusal(t=""):
+    """Fable 5 safety decline: HTTP 200, stop_reason 'refusal', content empty
+    or holding a clipped fragment the classifier cut off."""
+    content = [{"type": "text", "text": t}] if t else []
+    return ({"stop_reason": "refusal", "content": content}, None)
+
+
 try:
     assistant.deep_think = lambda q, context="": "THE DEEP ANSWER"
 
@@ -334,6 +341,30 @@ try:
     r = assistant.respond(_msg, "ctx")
     check("brain: blank with no deep answer still deflects honestly",
           "came back empty" in r, f"got {r!r}")
+    check("brain: deflection carries no em dash", "—" not in r, f"got {r!r}")
+
+    # --- Fable 5 refusal handling: stop_reason 'refusal' is a safety ---
+    # decline delivered as HTTP 200 with empty (or clipped) content. It used
+    # to fall through to the "came back empty" deflection, which reads as
+    # exactly the dodge the system prompt forbids.
+    assistant._post_anthropic, seen = _scripted([_refusal()])
+    r = assistant.respond(_msg, "ctx")
+    check("brain: refusal gets an honest safety note, not a deflection",
+          "safety line" in r and "came back empty" not in r, f"got {r!r}")
+
+    # a refusal on the relay pass still cannot eat a computed deep answer
+    assistant._post_anthropic, seen = _scripted(
+        [_tooluse("ask_deep", {"question": "why"}), _refusal()])
+    r = assistant.respond(_msg, "ctx")
+    check("brain: deep answer survives a refused relay",
+          r == "THE DEEP ANSWER", f"got {r!r}")
+
+    # clipped refusal text is a cut-off thought: discard, never relay
+    assistant._post_anthropic, seen = _scripted(
+        [_refusal("well, the first step would be")])
+    r = assistant.respond(_msg, "ctx")
+    check("brain: partial refusal text is never relayed",
+          "first step" not in r and "safety line" in r, f"got {r!r}")
 finally:
     assistant._post_anthropic = _orig_post
     assistant.deep_think = _orig_deep
@@ -363,6 +394,20 @@ try:
           out == "deep out" and
           seen[0]["messages"][0]["content"] == "BACKGROUND\n\nQuestion: hard q?",
           f"got {seen[0]['messages'][0]['content']!r}")
+
+    # Fable 5 refusal on the one-shot paths: deep_think says which it was,
+    # and complete/complete_deep return None so the nightly review falls back
+    # down its chain instead of saving a clipped fragment as a lesson.
+    assistant._post_anthropic, seen = _scripted([_refusal()])
+    out = assistant.deep_think("hard q?")
+    check("deep refusal: honest safety note, not 'came back empty'",
+          "declined" in out and "empty" not in out, f"got {out!r}")
+    assistant._post_anthropic, seen = _scripted([_refusal("clipped frag")])
+    check("refusal: complete_deep returns None so callers fall back",
+          assistant.complete_deep("sys", "user") is None)
+    assistant._post_anthropic, seen = _scripted([_refusal("clipped frag")])
+    check("refusal: complete returns None so callers fall back",
+          assistant.complete("sys", "user") is None)
     if not _had_key:
         del _os.environ["ANTHROPIC_API_KEY"]
 

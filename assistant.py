@@ -488,6 +488,8 @@ def complete(system: str, user: str, max_tokens: int = 700):
         timeout=120)
     if body is None:
         return None
+    if body.get("stop_reason") == "refusal":
+        return None  # safety decline; a clipped fragment must never pass as the answer
     text = "".join(b.get("text", "") for b in body.get("content", [])
                    if b.get("type") == "text").strip()
     return text or None
@@ -539,6 +541,8 @@ def complete_deep(system: str, user: str, max_tokens: int = 8000):
         timeout=300)
     if body is None:
         return None
+    if body.get("stop_reason") == "refusal":
+        return None  # safety decline; a clipped fragment must never pass as the answer
     text = "".join(b.get("text", "") for b in body.get("content", [])
                    if b.get("type") == "text").strip()
     return text or None
@@ -590,6 +594,12 @@ def deep_think(question: str, context: str = "") -> str:
         timeout=300)
     if body is None:
         return f"my deep brain is unavailable: {err}"
+    if body.get("stop_reason") == "refusal":
+        # safety decline, not an outage: say which it was instead of the
+        # "came back empty" note, and never relay a clipped fragment.
+        return ("the deep brain read it and declined: that question crosses "
+                "a safety line, so it won't answer. not an outage. try "
+                "asking it a different way.")
     # display defaults to 'omitted' on 4.8, so thinking blocks are empty; we
     # only want the final text blocks anyway.
     text = "".join(b.get("text", "") for b in body.get("content", [])
@@ -910,6 +920,18 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True,
                 reply = deep_answer
                 break
             return f"My brain is unavailable right now: {err}"
+        if body.get("stop_reason") == "refusal":
+            # Fable 5 safety decline: HTTP 200 with stop_reason 'refusal' and
+            # empty or clipped content. Not an outage and not a blank reply,
+            # so neither deflection is honest. Any partial text is a thought
+            # the classifier cut off, never relay it. A deep answer computed
+            # earlier in this turn still beats the decline note.
+            if deep_answer:
+                reply = deep_answer
+                break
+            return ("i read it, but that one crosses a safety line i won't "
+                    "cross, so i'm not answering it. not a bug on my side. "
+                    "ask it a different way or hit me with something else.")
         content = body.get("content", [])
         if body.get("stop_reason") == "tool_use":
             messages.append({"role": "assistant", "content": content})
@@ -933,7 +955,7 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True,
         # the relay pass came back blank; a computed deep answer beats a shrug
         reply = deep_answer
     if not reply:
-        return "I read it but came back empty — try rephrasing?"
+        return "I read it but came back empty, try rephrasing?"
     # history stores text only (never base64 blobs)
     label = user_text
     if item["kind"] == "photo":
