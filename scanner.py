@@ -549,7 +549,7 @@ class Service:
 
     ADMIN_CMDS = {"/adduser", "/removeuser", "/users", "/risk", "/setaccount",
                   "/test", "/health", "/requests", "/approve", "/reject",
-                  "/done", "/reqfrom", "/backlog"}
+                  "/done", "/reqfrom", "/backlog", "/broadcastcommands"}
 
     def run_command(self, cmd: str, args: str, chat_id: str = ""):
         if cmd in self.ADMIN_CMDS and not telegram.is_owner(chat_id):
@@ -630,6 +630,10 @@ class Service:
         if cmd == "/reqfrom":
             import intake
             return intake.reqfrom_command(args)
+        if cmd in ("/commands", "/cmds"):
+            return cards.public_commands_card()
+        if cmd == "/broadcastcommands":
+            return self.cmd_broadcast_commands(chat_id)
         if cmd in ("/help", "/start"):
             return cards.help_card()
         # bare-symbol shortcut: /spx /qcom /gold /usdjpy /eurusd ... just work.
@@ -865,6 +869,21 @@ class Service:
         extra.remove(target)
         config.state_set("extra_chat_ids", extra)
         return f"Removed {target}. They won't get alerts anymore."
+
+    def cmd_broadcast_commands(self, chat_id: str = ""):
+        """Owner taps /broadcastcommands and the bot sends the everyone-can-use
+        command list to every chat with access. Same text as /commands and
+        broadcast_commands.py (cards.public_commands_card), so all three agree.
+        Returns a short receipt to the owner."""
+        recipients = telegram.chat_ids()
+        if not recipients:
+            return "No one has access yet — add someone with /adduser first."
+        errors = telegram.send(cards.public_commands_card())
+        sent = len(recipients) - len(errors)
+        if errors:
+            return (f"Sent the command list to {sent}/{len(recipients)} chats. "
+                    f"Failed: {'; '.join(errors)}")
+        return f"✅ Sent the command list to all {sent} chats."
 
     def status_text(self) -> str:
         mode, reason = self.current_mode()
