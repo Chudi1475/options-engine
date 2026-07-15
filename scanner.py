@@ -38,6 +38,7 @@ import yfinance as yf
 
 import cards
 import config
+import live_params
 import news
 import positions as poslib
 import quotes
@@ -51,6 +52,12 @@ from strategy import Setup, StrategyConfig, detect_setup
 
 ET = ZoneInfo("America/New_York")
 CT = ZoneInfo("America/Chicago")  # display timezone ONLY — logic stays ET
+# built-in ticker -> Yahoo symbol map, kept as the FALLBACK for open
+# positions: if live_params.json drops a ticker from the watchlist while a
+# position is still open, monitoring must keep resolving its feed symbol
+# (SPX -> ^GSPC); the bare ticker fetches nothing and the position would
+# silently lose its stop/half/trail alerts for the rest of the day.
+DEFAULT_WATCHLIST = StrategyConfig().watchlist
 SESSION_END = time(16, 12)      # loop exits after settle + weekly are done
 MONITOR_START = time(9, 45)
 WEEKLY_AT = time(16, 5)
@@ -273,6 +280,38 @@ class Service:
         self.old_bracket = (self.backtest_old or {}).get(
             "bracket", {"target_pct": 15, "stop_pct": -60})
         self.cfg = StrategyConfig()
+        # Owner-tunable live settings (live_params.json on DATA_DIR): the
+        # no-redeploy path for the knobs that used to be frozen in code.
+        # All-or-nothing: a missing OR invalid file means built-ins, so a
+        # typo can never half-apply, and gate_stats still demands real
+        # backtest stats + the win-rate/expectancy bar for any setup the
+        # file allows. The class constant stays the built-in fallback.
+        self.ALLOWED_SETUPS = Service.ALLOWED_SETUPS
+        try:
+            params, errs, exists = live_params.load()
+        except Exception as e:  # a loader bug must never kill the daemon
+            params, errs, exists = None, [f"loader error: {e}"], True
+        if params is not None:
+            if "allowed_setups" in params:
+                self.ALLOWED_SETUPS = params["allowed_setups"]
+            if "watchlist" in params:
+                self.cfg.watchlist = params["watchlist"]
+            if "entry_start" in params:
+                self.cfg.entry_start = params["entry_start"]
+            if "entry_end" in params:
+                self.cfg.entry_end = params["entry_end"]
+            if "mom_bars" in params:
+                self.cfg.mom_bars = params["mom_bars"]
+            self.live_params_note = ("live_params.json applied: "
+                                     + live_params.summary(params))
+        elif exists:
+            self.live_params_note = ("live_params.json REJECTED, using "
+                                     "built-in settings: " + "; ".join(errs))
+        else:
+            self.live_params_note = "no live_params.json; built-in settings"
+        if getattr(self, "_live_params_last", None) != self.live_params_note:
+            self._live_params_last = self.live_params_note
+            print(f"live params: {self.live_params_note}")
 
     def reset_day(self, now: datetime):
         if self.day != now.date():
@@ -285,6 +324,13 @@ class Service:
             # re-read right after __init__ costs nothing.
             self.reload_tunables()
 
+    def yfs_for(self, ticker: str) -> str:
+        """Ticker -> Yahoo symbol via the live watchlist, falling back to
+        the built-in map so an open position keeps a working feed even when
+        its ticker was removed from live_params.json mid-flight."""
+        return (self.cfg.watchlist.get(ticker)
+                or DEFAULT_WATCHLIST.get(ticker, ticker))
+
     def sigma(self, ticker: str) -> float:
         """Realized vol for estimates. Never raises — a throttled download
         returns 0.0 (estimate falls back to intrinsic) and is retried after
@@ -293,7 +339,7 @@ class Service:
             if time_mod.time() < self._sigma_retry.get(ticker, 0):
                 return 0.0
             try:
-                yfs = self.cfg.watchlist.get(ticker, ticker)
+                yfs = self.yfs_for(ticker)
                 d1 = yf.download(yfs, period="1y", interval="1d",
                                  progress=False, auto_adjust=False)
                 if hasattr(d1.columns, "levels"):
@@ -673,7 +719,7 @@ class Service:
 
     ADMIN_CMDS = {"/adduser", "/removeuser", "/users", "/risk", "/setaccount",
                   "/test", "/health", "/requests", "/approve", "/reject",
-                  "/done", "/reqfrom", "/backlog", "/proposals"}
+                  "/done", "/reqfrom", "/backlog", "/proposals", "/reload"}
 
     def run_command(self, cmd: str, args: str, chat_id: str = ""):
         if cmd in self.ADMIN_CMDS and not telegram.is_owner(chat_id):
@@ -757,6 +803,8 @@ class Service:
         if cmd == "/proposals":
             import learn
             return learn.proposals_command(args)
+        if cmd == "/reload":
+            return self.cmd_reload()
         if cmd in ("/help", "/start"):
             return cards.help_card()
         # bare-symbol shortcut: /spx /qcom /gold /usdjpy /eurusd ... just work.
@@ -772,6 +820,34 @@ class Service:
                 if not r.get("error") and not r.get("note"):
                     return cards.macro_line(r)  # stay silent on a failed fetch
         return None  # silently ignore unknown commands
+
+    def cmd_reload(self):
+        """Owner: re-read the backtest reports and live_params.json right
+        now instead of waiting for the overnight date flip, and reply with
+        exactly what is live. This is how an approved rule change gets
+        applied without a redeploy: edit live_params.json, then /reload."""
+        self.reload_tunables()
+        stats = ("loaded" if self.backtest_old is not None
+                 else "MISSING (no entry alerts until backtest.py runs)")
+        # an allow-listed setup with no backtest stats structurally cannot
+        # alert (gate_stats refuses without real numbers) — say so here
+        # instead of letting the owner wait weeks for a silent no-op
+        per = (self.backtest_old or {}).get("per_setup", {})
+        allow = ", ".join(
+            k if k in per else f"{k} (no backtest stats yet, cannot alert)"
+            for k in sorted(self.ALLOWED_SETUPS))
+        return "\n".join([
+            "Reloaded. Live settings now:",
+            f"Backtest stats: {stats}",
+            f"Live params: {self.live_params_note}",
+            f"Alert allow-list: {allow}",
+            f"Watchlist: {', '.join(self.cfg.watchlist)}",
+            (f"Entry window: {self.cfg.entry_start:%H:%M}-"
+             f"{self.cfg.entry_end:%H:%M} ET"),
+            f"Momentum window: {self.cfg.mom_bars} bars "
+            f"({self.cfg.mom_bars * 5} min)",
+            f"To change these: edit {live_params.path()} then /reload.",
+        ])
 
     def calls_text(self, arg: str = ""):
         """/calls [ticker] — a compact, scannable read of the live call/put
@@ -1240,7 +1316,7 @@ class Service:
             print(f"{now:%H:%M:%S} watching: {states}")
 
     def monitor_one(self, pos: Position, now: datetime):
-        yfs = self.cfg.watchlist.get(pos.ticker, pos.ticker)
+        yfs = self.yfs_for(pos.ticker)
         bars = self.get_bars(yfs, now)
         last_close = (float(bars["Close"].iloc[-1])
                       if bars is not None and not bars.empty else None)

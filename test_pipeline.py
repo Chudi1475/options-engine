@@ -963,6 +963,186 @@ finally:
     import shutil
     shutil.rmtree(_reports, ignore_errors=True)
 
+# --- live_params.json: owner-tunable settings, strict all-or-nothing ---
+# ALLOWED_SETUPS and the entry knobs used to be frozen in code, so applying
+# even an APPROVED rule change meant a redeploy. reload_tunables() now reads
+# live_params.json (any invalid key rejects the WHOLE file; built-ins are the
+# fallback) and the owner-only /reload applies an edit immediately.
+import live_params as livemod
+import telegram
+
+_lp_dir = Path(tempfile.mkdtemp(prefix="liveparams_test_"))
+_lp_file = _lp_dir / "live_params.json"
+_orig_lp_path = livemod.path
+livemod.path = lambda: _lp_file
+_lp_reports = Path(tempfile.mkdtemp(prefix="lp_reports_"))
+_orig_reports_dir = scoreboard.REPORTS_DIR
+
+
+def _write_lp(obj):
+    body = obj if isinstance(obj, str) else _json.dumps(obj)
+    _lp_file.write_text(body, encoding="utf-8")
+
+
+lsvc = scannermod.Service.__new__(scannermod.Service)  # plumbing only
+lsvc.day = None
+lsvc.skipped_today = set()
+lsvc.daily_closes = {}
+lsvc.backtest_old = None
+lsvc.backtest_new = None
+
+try:
+    scoreboard.REPORTS_DIR = _lp_reports
+    (_lp_reports / "backtest_results.json").write_text(_json.dumps(
+        {"per_setup": {"SPX:call": {"win_rate": 74.0, "expectancy_pct": 6.0}},
+         "bracket": {"target_pct": 15, "stop_pct": -60}}), encoding="utf-8")
+    _defaults = scannermod.StrategyConfig()
+
+    # no file -> built-ins exactly (the file is opt-in, not required)
+    lsvc.reload_tunables()
+    check("live params: no file keeps built-ins",
+          lsvc.ALLOWED_SETUPS == scannermod.Service.ALLOWED_SETUPS
+          and lsvc.cfg.watchlist == _defaults.watchlist
+          and lsvc.cfg.entry_start == _defaults.entry_start
+          and lsvc.cfg.entry_end == _defaults.entry_end
+          and lsvc.cfg.mom_bars == _defaults.mom_bars
+          and lsvc.live_params_note == "no live_params.json; built-in settings")
+
+    # a valid file overrides exactly what it names (case-normalized)
+    _write_lp({"allowed_setups": ["spx:CALL", "TSLA:put"],
+               "watchlist": {"spx": "^GSPC", "TSLA": "TSLA"},
+               "entry_start": "09:50", "entry_end": "10:15", "mom_bars": 4})
+    lsvc.reload_tunables()
+    check("live params: valid file applies with normalized case",
+          lsvc.ALLOWED_SETUPS == {"SPX:call", "TSLA:put"}
+          and lsvc.cfg.watchlist == {"SPX": "^GSPC", "TSLA": "TSLA"}
+          and lsvc.cfg.entry_start == time(9, 50)
+          and lsvc.cfg.entry_end == time(10, 15)
+          and lsvc.cfg.mom_bars == 4
+          and lsvc.live_params_note.startswith("live_params.json applied"))
+
+    # the applied allow-list actually gates: QCOM:call is built-in-allowed
+    # but the file dropped it; SPX:call stays allowed AND must still clear
+    # the real-stats bar (the honesty gate is not loosened by the file)
+    _qcom = scannermod.Setup(ticker="QCOM", direction="call", strike=180.0,
+                             spot=179.5, mom_pct=0.4, reason="test")
+    _spx = scannermod.Setup(ticker="SPX", direction="call", strike=7300.0,
+                            spot=7299.0, mom_pct=0.4, reason="test")
+    check("live params: gate honors the file's allow-list",
+          lsvc.gate_stats(_qcom) is None and lsvc.gate_stats(_spx) is not None)
+
+    # a ticker REMOVED from the watchlist while its position is still open
+    # must keep a working feed symbol: bare "SPX" fetches nothing, so the
+    # built-in map is the fallback (else stop/half/trail alerts die silently)
+    _write_lp({"watchlist": {"TSLA": "TSLA"}})
+    lsvc.reload_tunables()
+    check("live params: removed ticker falls back to the built-in feed map",
+          lsvc.cfg.watchlist == {"TSLA": "TSLA"}
+          and lsvc.yfs_for("SPX") == "^GSPC"
+          and lsvc.yfs_for("TSLA") == "TSLA"
+          and lsvc.yfs_for("ZZZ") == "ZZZ")
+
+    # partial file: only the named key changes
+    _write_lp({"mom_bars": 5})
+    lsvc.reload_tunables()
+    check("live params: partial file overrides only what it names",
+          lsvc.cfg.mom_bars == 5
+          and lsvc.ALLOWED_SETUPS == scannermod.Service.ALLOWED_SETUPS
+          and lsvc.cfg.watchlist == _defaults.watchlist
+          and lsvc.cfg.entry_start == _defaults.entry_start)
+
+    # every bad shape rejects the WHOLE file; built-ins stay untouched
+    _bad = [
+        ("not json", "{not json"),
+        ("not an object", _json.dumps([1, 2])),
+        ("unknown key rejects even the valid keys",
+         _json.dumps({"mom_bars": 4, "stop_pct": -50})),
+        ("setup missing :direction", _json.dumps({"allowed_setups": ["SPXcall"]})),
+        ("setup bad direction", _json.dumps({"allowed_setups": ["SPX:strangle"]})),
+        ("setups empty", _json.dumps({"allowed_setups": []})),
+        ("watchlist empty", _json.dumps({"watchlist": {}})),
+        ("watchlist non-text symbol", _json.dumps({"watchlist": {"SPX": 5}})),
+        ("watchlist multi-symbol value",
+         _json.dumps({"watchlist": {"SPX": "SPY QQQ"}})),
+        ("watchlist oversize",
+         _json.dumps({"watchlist": {f"T{i}": "X" for i in range(13)}})),
+        ("time not HH:MM", _json.dumps({"entry_start": "9am"})),
+        ("time premarket", _json.dumps({"entry_start": "08:00"})),
+        ("time before monitoring starts",
+         _json.dumps({"entry_start": "09:35"})),
+        ("oversize file", _json.dumps({"mom_bars": 4}) + " " * 70000),
+        ("window empty",
+         _json.dumps({"entry_start": "10:30", "entry_end": "10:00"})),
+        ("one edge crosses the built-in other edge",
+         _json.dumps({"entry_start": "11:00"})),
+        ("mom_bars zero", _json.dumps({"mom_bars": 0})),
+        ("mom_bars bool", _json.dumps({"mom_bars": True})),
+        ("mom_bars text", _json.dumps({"mom_bars": "3"})),
+    ]
+    for _label, _body in _bad:
+        _write_lp(_body)
+        lsvc.reload_tunables()
+        _ok = (lsvc.ALLOWED_SETUPS == scannermod.Service.ALLOWED_SETUPS
+               and lsvc.cfg.mom_bars == _defaults.mom_bars
+               and lsvc.cfg.watchlist == _defaults.watchlist
+               and lsvc.cfg.entry_start == _defaults.entry_start
+               and "REJECTED" in lsvc.live_params_note)
+        check(f"live params: {_label} -> whole file rejected, built-ins stay",
+              _ok, lsvc.live_params_note)
+
+    # a non-UTF-8 file is a plain validation message, never a crash
+    _lp_file.write_bytes(_json.dumps({"mom_bars": 4}).encode("utf-16"))
+    lsvc.reload_tunables()
+    check("live params: non-UTF-8 file rejected with a plain reason",
+          lsvc.cfg.mom_bars == _defaults.mom_bars
+          and "REJECTED" in lsvc.live_params_note
+          and "UTF-8" in lsvc.live_params_note)
+
+    # breaking the file after a good apply reverts to built-ins: the fallback
+    # is deterministic (a fresh boot with the same bad file runs built-ins too)
+    _write_lp({"mom_bars": 6})
+    lsvc.reload_tunables()
+    _write_lp("{broken")
+    lsvc.reload_tunables()
+    check("live params: a break after a good apply reverts to built-ins",
+          lsvc.cfg.mom_bars == _defaults.mom_bars
+          and "REJECTED" in lsvc.live_params_note)
+
+    # the overnight date flip picks up an edit without a restart
+    _write_lp({"mom_bars": 7})
+    lsvc.day = date(2026, 6, 12)
+    lsvc.reset_day(datetime(2026, 6, 15, 9, 31, tzinfo=ET))
+    check("live params: date flip applies an overnight edit",
+          lsvc.cfg.mom_bars == 7)
+
+    # /reload: owner applies an edit immediately and gets the live settings
+    # back; a non-owner is refused (ADMIN_CMDS)
+    _write_lp({"entry_start": "09:50"})
+    _orig_is_owner = telegram.is_owner
+    telegram.is_owner = lambda cid: cid == "boss"
+    try:
+        _deny = lsvc.run_command("/reload", "", "stranger")
+        _reply = lsvc.run_command("/reload", "", "boss")
+    finally:
+        telegram.is_owner = _orig_is_owner
+    check("live params: /reload is owner-only", "owner-only" in (_deny or ""))
+    check("live params: /reload applies and reports the live settings",
+          _reply is not None and lsvc.cfg.entry_start == time(9, 50)
+          and "09:50" in _reply and "Alert allow-list:" in _reply
+          and "live_params.json applied" in _reply)
+    # only SPX:call has stats in this test's report: the other allow-listed
+    # setups must be flagged as unable to alert instead of silently no-oping
+    check("live params: /reload flags allow-list entries with no stats",
+          "SPY:call (no backtest stats yet, cannot alert)" in _reply
+          and "SPX:call (" not in _reply)
+    check("live params: /reload reply and notes carry no em dash",
+          "—" not in _reply and "—" not in lsvc.live_params_note)
+finally:
+    livemod.path = _orig_lp_path
+    scoreboard.REPORTS_DIR = _orig_reports_dir
+    shutil.rmtree(_lp_dir, ignore_errors=True)
+    shutil.rmtree(_lp_reports, ignore_errors=True)
+
 # --- learn digest: repeated lessons cannot crowd out real ones ---
 # _deterministic_review appended the SAME "staying flat is correct" bullet
 # every quiet night, and _rebuild_digest kept the last DIGEST_KEEP bullets

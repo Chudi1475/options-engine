@@ -497,6 +497,8 @@ def help_card() -> str:
         "/reqfrom add <id> <name> - bring Kelechi/Ryan online (asks + alerts)",
         "/proposals - rule changes my nightly reviews have pitched: "
         "ok or no them (nothing changes without you)",
+        "/reload - apply live_params.json edits and fresh backtest stats "
+        "now, no restart needed",
         "",
         "You can also just TALK to me. Ask anything, or send a chart "
         "screenshot / PDF / CSV and I'll read it and answer like a human.",
