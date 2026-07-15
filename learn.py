@@ -420,10 +420,24 @@ def _deterministic_review(record) -> dict:
                 continue
             if (not t["won"] and o.get("exit_reason") == "stop"
                     and (o.get("mfe_pct") or 0) >= 10):
-                lessons.append(
-                    f"{t['ticker']} peaked +{o['mfe_pct']:.0f}% then stopped out. "
-                    "When a call spikes double digits early, bank half into the "
-                    "spike instead of waiting.")
+                if o.get("banked_half"):
+                    # half WAS banked, so "bank half into the spike" would be
+                    # advice the trade already followed. A 'stop' exit on a
+                    # half_sold position means the runner leg fell from the
+                    # peak to the hard stop before the give-back trail fired
+                    # (step() checks the stop first, and the trail only
+                    # advances on comparable cycles), so that is the lesson.
+                    lessons.append(
+                        f"{t['ticker']} peaked +{o['mfe_pct']:.0f}% and still "
+                        "stopped out even after banking half into the spike. "
+                        "Banking half was right. The runner leg did the "
+                        "damage, it fell from the peak to the hard stop "
+                        "before the give-back trail could fire.")
+                else:
+                    lessons.append(
+                        f"{t['ticker']} peaked +{o['mfe_pct']:.0f}% then stopped out. "
+                        "When a call spikes double digits early, bank half into the "
+                        "spike instead of waiting.")
             elif t["won"] and o.get("banked_half"):
                 lessons.append(
                     f"{t['ticker']} ran the playbook clean: banked half into "

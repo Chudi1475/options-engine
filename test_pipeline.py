@@ -1304,6 +1304,42 @@ finally:
     learn.et_now = _orig_et_now_pp
     learn._market_context = _orig_mktctx_pp
 
+# --- learn fallback: a banked-half stop-out no longer teaches 'bank half' ---
+# The deterministic stop-out lesson ("bank half into the spike instead of
+# waiting") fired on any big-peak stop, including trades that DID bank half
+# at +25% and then rode the runner to the hard stop (step() checks the stop
+# before the give-back trail, so exit_reason is 'stop' even from half_sold).
+# The permanent playbook then coached the bot to do the thing it already did.
+# The banked-half case now draws the honest runner-leg lesson instead.
+_bh = learn._deterministic_review(_pp_rec(
+    _pp_trade("TSLA", paper=False, won=False, exit_reason="stop", mfe=38.0,
+              banked_half=True)))
+check("banked-half stop: lesson credits the half and blames the runner",
+      len(_bh["lessons"]) == 1 and "Banking half was right" in _bh["lessons"][0]
+      and "runner" in _bh["lessons"][0], f"got {_bh['lessons']}")
+check("banked-half stop: the old 'bank half' advice is gone",
+      "instead of waiting" not in _bh["lessons"][0], f"got {_bh['lessons']}")
+check("banked-half stop: quotes the real peak",
+      "+38%" in _bh["lessons"][0], f"got {_bh['lessons']}")
+# _append_lesson diverts rule-change-phrased bullets to the proposal registry;
+# the corrected lesson must read as an observation so it reaches the digest
+check("banked-half stop: lesson survives the rule-change sanitizer",
+      not learn._is_rule_change(_bh["lessons"][0]), f"got {_bh['lessons'][0]!r}")
+check("banked-half stop: no dashes as punctuation in the lesson",
+      "—" not in _bh["lessons"][0] and " - " not in _bh["lessons"][0]
+      and "--" not in _bh["lessons"][0], f"got {_bh['lessons'][0]!r}")
+_bh = learn._deterministic_review(_pp_rec(
+    _pp_trade("SPX", paper=False, won=False, exit_reason="stop", mfe=22.0,
+              banked_half=False)))
+check("no-half stop: still teaches banking half into the spike",
+      len(_bh["lessons"]) == 1 and "instead of waiting" in _bh["lessons"][0],
+      f"got {_bh['lessons']}")
+_bh = learn._deterministic_review(_pp_rec(
+    _pp_trade("SPX", paper=True, won=False, exit_reason="stop", mfe=38.0,
+              banked_half=True)))
+check("banked-half stop on a paper trade: still writes no playbook lesson",
+      _bh["lessons"] == [], f"got {_bh['lessons']}")
+
 # --- learn digest: watch_tomorrow reaches the brain for exactly one session ---
 # Each nightly review writes watch_tomorrow, the one line meant to shape the
 # NEXT session, but _rebuild_digest only pulled the lessons array, so it was
