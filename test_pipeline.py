@@ -350,6 +350,91 @@ check("ledger: all-scratch record renders at 0% without a loss",
       and s["win_rate_pct"] == 0 and "0W - 0L" in assistant.score_line("u3"))
 assistant.TRADES_FILE.unlink()
 
+# --- file intake: a cut-off text file must say so to the model ---
+# _file_blocks used to slice at MAX_TEXT_FILE with no notice, so the brain
+# answered whole-file questions (totals, last rows) from just the head,
+# confidently and wrong. Now a cut file is marked at the top and the bottom.
+_orig_dl = assistant.telegram.download_file
+_orig_cap = assistant.MAX_TEXT_FILE
+_dl_payload = {"data": b""}
+try:
+    # pin the cap like config.STOP_PCT above: the section tests the marking
+    # MECHANISM, so a box running a BOT_MAX_TEXT_FILE override stays green
+    assistant.MAX_TEXT_FILE = 20000
+    assistant.telegram.download_file = (
+        lambda fid, max_bytes=10 * 1024 * 1024: _dl_payload["data"])
+    _doc = {"kind": "document", "file_id": "f1", "file_name": "trades.csv",
+            "mime": "text/csv"}
+
+    _dl_payload["data"] = b"date,pnl\n2026-06-11,+120\n"
+    fb, err = assistant._file_blocks(_doc)
+    check("files: small file renders exactly as before",
+          err is None and fb[0]["text"] ==
+          "[Contents of the file 'trades.csv' the user sent:]\n"
+          "date,pnl\n2026-06-11,+120\n")
+
+    _dl_payload["data"] = b"x" * assistant.MAX_TEXT_FILE
+    fb, err = assistant._file_blocks(_doc)
+    check("files: exactly-at-cap file is not marked truncated",
+          err is None and "TRUNCATED" not in fb[0]["text"]
+          and fb[0]["text"].startswith("[Contents of the file"))
+
+    _full = ("HEAD_ROWS," + "x" * (assistant.MAX_TEXT_FILE - 10)
+             + "y" * 4000 + "LAST_ROW,999")
+    _dl_payload["data"] = _full.encode()
+    fb, err = assistant._file_blocks(_doc)
+    _t_text = fb[0]["text"]
+    check("files: over-cap file keeps the head",
+          err is None and "HEAD_ROWS," in _t_text)
+    check("files: over-cap file drops the tail", "LAST_ROW,999" not in _t_text)
+    check("files: truncation marked at top and bottom",
+          _t_text.startswith(
+              f"[First {assistant.MAX_TEXT_FILE:,} of {len(_full):,} ")
+          and "[TRUNCATED at" in _t_text
+          and "instead of guessing" in _t_text)
+    check("files: body is exactly the first MAX_TEXT_FILE chars",
+          _t_text.split("cut off:]\n", 1)[1].rsplit("\n[TRUNCATED", 1)[0]
+          == _full[:assistant.MAX_TEXT_FILE])
+
+    _dl_payload["data"] = b"\x00\x01"
+    fb, err = assistant._file_blocks(
+        {"kind": "document", "file_id": "f2", "file_name": "data.bin",
+         "mime": "application/zip"})
+    check("files: unknown type refused plainly (no em dash)",
+          fb is None and "yet." in err and "—" not in err)
+finally:
+    assistant.telegram.download_file = _orig_dl
+    assistant.MAX_TEXT_FILE = _orig_cap
+
+# BOT_MAX_TEXT_FILE env knob: parsed on import, junk keeps the built-in.
+# Exercised on a scratch import so this suite never depends on the box's env.
+import importlib.util as _ilu
+import os as _os
+_orig_env_cap = _os.environ.get("BOT_MAX_TEXT_FILE")
+
+
+def _fresh_cap(env_value):
+    if env_value is None:
+        _os.environ.pop("BOT_MAX_TEXT_FILE", None)
+    else:
+        _os.environ["BOT_MAX_TEXT_FILE"] = env_value
+    spec = _ilu.spec_from_file_location("assistant_envknob", assistant.__file__)
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.MAX_TEXT_FILE
+
+
+try:
+    check("files: cap defaults to 20000 with no env", _fresh_cap(None) == 20000)
+    check("files: BOT_MAX_TEXT_FILE raises the cap", _fresh_cap("50000") == 50000)
+    check("files: junk env keeps the built-in", _fresh_cap("plenty") == 20000)
+    check("files: non-positive env keeps the built-in", _fresh_cap("-5") == 20000)
+finally:
+    if _orig_env_cap is None:
+        _os.environ.pop("BOT_MAX_TEXT_FILE", None)
+    else:
+        _os.environ["BOT_MAX_TEXT_FILE"] = _orig_env_cap
+
 # --- chat brain: a computed deep answer must survive to the user ---
 # respond() used to run at max_tokens=1200 (starving the always-on thinking of
 # the Fable 5 brain), could burn all 5 rounds on tool calls, and threw away an
@@ -534,6 +619,10 @@ try:
     check("deep ctx: long turns truncated to the cap",
           "x" * assistant.DEEP_CONTEXT_CHARS + " [...]" in ctx
           and "x" * (assistant.DEEP_CONTEXT_CHARS + 1) not in ctx)
+    ctx = assistant._deep_context("state", [], "y" * 3000)
+    check("deep ctx: long current message is marked cut, not silently sliced",
+          "y" * assistant.DEEP_CONTEXT_CHARS + " [...]" in ctx
+          and "y" * (assistant.DEEP_CONTEXT_CHARS + 1) not in ctx)
     turns = [{"role": "user", "content": f"turn T{i} here"} for i in range(10)]
     ctx = assistant._deep_context("state", turns, "")
     check("deep ctx: only the newest turns ride along",

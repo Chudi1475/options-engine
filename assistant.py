@@ -170,7 +170,15 @@ def _post_anthropic(payload: dict, timeout: int):
         return None, err_msg or f"HTTP {r.status_code}"
     return None, last_err
 MAX_TURNS = 24          # rolling memory per chat (deeper = smoother back-and-forth)
-MAX_TEXT_FILE = 20000   # chars of a text/CSV file passed to the model
+try:
+    # chars of a text/CSV file passed to the model. BOT_MAX_TEXT_FILE (env)
+    # raises the cap without a redeploy; junk or a non-positive value keeps
+    # the built-in, same fallback rule as the config.py env knobs.
+    MAX_TEXT_FILE = int(os.environ.get("BOT_MAX_TEXT_FILE", "") or 20000)
+    if MAX_TEXT_FILE <= 0:
+        MAX_TEXT_FILE = 20000
+except ValueError:
+    MAX_TEXT_FILE = 20000
 
 IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 TEXTY_EXT = (".txt", ".csv", ".md", ".log", ".json", ".py")
@@ -636,8 +644,12 @@ def _deep_context(context_text: str, history: list, user_text: str = "") -> str:
             body = body[:DEEP_CONTEXT_CHARS] + " [...]"
         lines.append(("User: " if turn.get("role") == "user" else "Bot: ") + body)
     if user_text.strip():
-        lines.append("User (the message being answered now): "
-                     + " ".join(user_text.split())[:DEEP_CONTEXT_CHARS])
+        now_body = " ".join(user_text.split())
+        if len(now_body) > DEEP_CONTEXT_CHARS:
+            # marked like the history turns above: an unmarked cut reads to
+            # the deep brain as a message that ended mid-sentence
+            now_body = now_body[:DEEP_CONTEXT_CHARS] + " [...]"
+        lines.append("User (the message being answered now): " + now_body)
     if lines:
         parts.append("RECENT CONVERSATION (oldest first):\n" + "\n".join(lines))
     return "\n\n".join(parts)
@@ -840,7 +852,7 @@ def _file_blocks(item: dict):
     Returns (blocks, error_message)."""
     data = telegram.download_file(item["file_id"])
     if data is None:
-        return None, ("I couldn't download that file — it may be over 10MB "
+        return None, ("I couldn't download that file. It may be over 10MB, "
                       "or Telegram hiccuped. Try again or send a smaller one.")
     mime = item.get("mime", "")
     name = item.get("file_name", "photo")
@@ -855,13 +867,30 @@ def _file_blocks(item: dict):
                             "data": base64.b64encode(data).decode()}}], None
     if mime.startswith("text/") or name.lower().endswith(TEXTY_EXT):
         try:
-            body = data.decode("utf-8", errors="replace")[:MAX_TEXT_FILE]
+            body = data.decode("utf-8", errors="replace")
         except Exception:
             return None, "That file doesn't look readable as text."
+        if len(body) > MAX_TEXT_FILE:
+            # the model must know it saw a partial file: an unmarked cut let
+            # it answer 'whole file' questions (totals, last rows) from just
+            # the head, confidently and wrong. Marked at both ends because
+            # the cliff is at the bottom but the model plans from the top.
+            total = len(body)
+            head = body[:MAX_TEXT_FILE]
+            return [{"type": "text",
+                     "text": (f"[First {MAX_TEXT_FILE:,} of {total:,} "
+                              f"characters of the file '{name}' the user "
+                              "sent; the rest was cut off:]\n"
+                              f"{head}\n"
+                              f"[TRUNCATED at {MAX_TEXT_FILE:,} of {total:,} "
+                              "characters. Totals, counts, last rows or "
+                              "anything else needing the whole file cannot "
+                              "be known from this excerpt; say the file was "
+                              "cut off instead of guessing.]")}], None
         return [{"type": "text",
                  "text": f"[Contents of the file '{name}' the user sent:]\n{body}"}], None
-    return None, (f"I can't read '{name}' ({mime or 'unknown type'}) yet — "
-                  "send text, a photo, a PDF, or a CSV/TXT file.")
+    return None, (f"I can't read '{name}' ({mime or 'unknown type'}) yet. "
+                  "Send text, a photo, a PDF, or a CSV/TXT file.")
 
 
 def respond(item: dict, context_text: str, tools_enabled: bool = True,
