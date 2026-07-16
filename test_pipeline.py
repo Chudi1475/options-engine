@@ -183,6 +183,74 @@ evs = feed(p, at(10, 15), 38)     # comparable: 80-38=42 >= 40 -> give-back
 check("S10 give-back fires on the next comparable cycle",
       [e["type"] for e in evs] == ["runner_trail"])
 
+# --- scenario 11: the old-rules shadow is judged against the bracket pinned
+# at entry, not whichever bracket the overnight backtest loaded today ---
+p = mk_pos()
+p.old_bracket = {"target_pct": 20, "stop_pct": -50}
+feed(p, at(10, 0), 16)            # today's +15 target would have closed it
+check("S11 pinned +20 target outranks today's +15 (shadow stays open)",
+      p.old_rules["status"] == "open")
+feed(p, at(10, 5), 21)
+check("S11 shadow closes at the pinned +20 target",
+      p.old_rules["status"] == "closed"
+      and p.old_rules["exit_reason"] == "old target"
+      and abs(p.old_rules["exit_pct"] - 21) < 0.01)
+
+p = mk_pos()
+p.old_bracket = {"target_pct": 20, "stop_pct": -50}
+feed(p, at(10, 0), -55)           # today's -60 stop would have kept it open
+check("S11 shadow stops at the pinned -50, not today's -60",
+      p.old_rules["status"] == "closed"
+      and p.old_rules["exit_reason"] == "old stop")
+
+# a malformed pin (schema drift, a hand-edited positions.json) falls back to
+# the caller's bracket instead of crashing the monitoring cycle
+p = mk_pos()
+p.old_bracket = {"target_pct": "20"}
+feed(p, at(10, 0), 16)
+check("S11 malformed pin falls back to today's bracket",
+      p.old_rules["status"] == "closed"
+      and p.old_rules["exit_reason"] == "old target")
+
+# bool legs are ints to isinstance (True/False compare as 1/0), so a
+# hand-edited {"stop_pct": false} would stop the shadow out at any red mark;
+# they must count as malformed and fall back
+p = mk_pos()
+p.old_bracket = {"target_pct": True, "stop_pct": False}
+feed(p, at(10, 0), -5)            # bool pin would read this as <= stop 0
+check("S11 bool pin counts as malformed (shadow stays open at -5)",
+      p.old_rules["status"] == "open")
+
+# json.loads parses NaN into a float; both comparisons go False forever and
+# the shadow could never close — malformed, fall back
+p = mk_pos()
+p.old_bracket = {"target_pct": float("nan"), "stop_pct": float("nan")}
+feed(p, at(10, 0), 16)
+check("S11 NaN pin counts as malformed (fallback +15 target closes it)",
+      p.old_rules["status"] == "closed"
+      and p.old_rules["exit_reason"] == "old target")
+
+# legacy record (no pin at all) keeps the old passed-bracket behavior
+p = mk_pos()
+check("S11 legacy position has no pin by default", p.old_bracket is None)
+feed(p, at(10, 0), 16)
+check("S11 legacy position still uses today's bracket",
+      p.old_rules["status"] == "closed"
+      and p.old_rules["exit_reason"] == "old target")
+
+# the pin survives a restart
+pin_path = config.DATA_DIR / "positions_pin_test.json"
+if pin_path.exists():
+    pin_path.unlink()
+pin_book = PositionBook(pin_path)
+p = mk_pos()
+p.old_bracket = {"target_pct": 20, "stop_pct": -50}
+pin_book.add(p)
+q = PositionBook(pin_path).positions[0]
+check("S11 pinned bracket survives restart",
+      q.old_bracket == {"target_pct": 20, "stop_pct": -50})
+pin_path.unlink()
+
 # --- sizing math ---
 alloc = config.suggested_alloc_pct(1.0)
 check("sizing: 1% risk / 30% stop = 3.33% of account", abs(alloc - 3.3333) < 0.01)
@@ -958,6 +1026,26 @@ try:
     svc.reset_day(datetime(2026, 6, 13, 14, 0, tzinfo=ET))
     check("reload: same-day cycle does not reload",
           svc.old_bracket == {"target_pct": 20, "stop_pct": -50})
+
+    # a degenerate "bracket": null parses fine (so the report replaces the
+    # previous one) but .get's default never applies to a PRESENT key —
+    # unvalidated, dict(None) at entry pinning would then block every alert.
+    # It must degrade to the built-in default bracket instead.
+    _write_report("backtest_results.json",
+                  {"per_setup": {"SPX:call": {"win_rate": 74.0,
+                                              "expectancy_pct": 6.0}},
+                   "bracket": None})
+    svc.reset_day(datetime(2026, 6, 16, 9, 31, tzinfo=ET))
+    check("reload: 'bracket': null degrades to the built-in default",
+          svc.old_bracket == {"target_pct": 15, "stop_pct": -60})
+
+    # same for legs that json parses but the shadow can't compare sanely
+    _write_report("backtest_results.json",
+                  {"per_setup": {}, "bracket": {"target_pct": True,
+                                                "stop_pct": -60}})
+    svc.reset_day(datetime(2026, 6, 17, 9, 31, tzinfo=ET))
+    check("reload: bool bracket leg degrades to the built-in default",
+          svc.old_bracket == {"target_pct": 15, "stop_pct": -60})
 finally:
     scoreboard.REPORTS_DIR = _orig_reports_dir
     import shutil
@@ -2007,6 +2095,29 @@ rep = scoreboard.weekly_report(wbook, None, None, TODAY)
 check("weekly: no finished shadow means no verdict at all",
       "winner" not in rep and "OLD exit rules" not in rep, f"got {rep!r}")
 
+# the OLD label quotes exact numbers only when every compared trade shares
+# ONE pinned bracket; a mixed or legacy-unpinned week says so instead of
+# quoting +15/-60 numbers that may be wrong for some of the summed trades
+wbook.positions = [wk_pos("w1", 40.0, 26.0), wk_pos("w2", -30.0, -30.0)]
+for wp in wbook.positions:
+    wp.old_bracket = {"target_pct": 20, "stop_pct": -50}
+rep = scoreboard.weekly_report(wbook, None, None, TODAY)
+check("weekly: uniform pinned week quotes that bracket's real numbers",
+      "OLD exit rules (+20/-50) on the exact same entries" in rep,
+      f"got {rep!r}")
+
+wbook.positions[1].old_bracket = {"target_pct": 15, "stop_pct": -60}
+rep = scoreboard.weekly_report(wbook, None, None, TODAY)
+check("weekly: mixed-bracket week admits it instead of quoting one bracket",
+      "OLD exit rules (each trade's own entry-day bracket)" in rep
+      and "+20/-50" not in rep and "+15/-60" not in rep, f"got {rep!r}")
+
+wbook.positions[1].old_bracket = None  # legacy trade, judged day by day
+rep = scoreboard.weekly_report(wbook, None, None, TODAY)
+check("weekly: a legacy unpinned trade also drops the numbers",
+      "OLD exit rules (each trade's own entry-day bracket)" in rep,
+      f"got {rep!r}")
+
 # --- learn catch-up: a review missed during an outage is no longer lost ---
 # maybe_learn only ever considered now.date(), so a bot down across the whole
 # 21:00-23:45 window (a Friday-night redeploy rolling into the weekend, a
@@ -2222,6 +2333,71 @@ try:
           p.est_entry == 0.0 and p.state == "open")
 finally:
     quotes.get_option_quote = _orig_get_quote
+
+# --- entry pins the old-rules bracket on the position ---
+# reload_tunables re-chooses old_bracket every date flip from the overnight
+# backtest, so a multi-day weekly's shadow used to be judged the next day
+# under a bracket it was never opened on. open_position now stores a COPY of
+# the entry-time bracket on the position, and step() judges the shadow by it.
+
+
+class _EntryBook:
+    def __init__(self):
+        self.added = []
+
+    def open_same_direction(self, direction):
+        return False
+
+    def add(self, pos):
+        self.added.append(pos)
+
+
+_orig_get_quote2 = quotes.get_option_quote
+_orig_earnings = scannermod.news.earnings_inside
+_orig_stats_card = scannermod.scoreboard.stats_for_card
+try:
+    quotes.get_option_quote = lambda *a, **k: None  # entry priced from estimate
+    scannermod.news.earnings_inside = lambda t, e: (False, None)
+    scannermod.scoreboard.stats_for_card = lambda *a, **k: {
+        "win_rate": 72.0, "avg_win_pct": 30.0, "avg_loss_pct": -25.0,
+        "expectancy_pct": 9.0, "ev_pct": 9.0, "trades": 60,
+        "start": "01/01/2026", "end": "06/01/2026", "label": "test stats",
+        "costs_note": "after est. costs", "source": "backtest_old"}
+    svc = Service.__new__(Service)  # plumbing only: every I/O path is stubbed
+    svc.dry = True                  # skips record_alert
+    svc.book = _EntryBook()
+    svc.backtest_old = svc.backtest_new = None
+    svc.sigma = lambda t: 0.25
+    svc.current_mode = lambda: ("green", "test")
+    svc.notify = lambda card: []
+    svc.old_bracket = {"target_pct": 15, "stop_pct": -60}
+    entry_setup = Setup(ticker="SPX", direction="call", strike=7300.0,
+                        spot=7297.0, mom_pct=0.21, reason="t")
+    done = svc.open_position(entry_setup, at(9, 50))
+    check("pin: open_position tracks the position",
+          done is True and len(svc.book.added) == 1)
+    ep = svc.book.added[0]
+    check("pin: entry stores the entry-time bracket",
+          ep.old_bracket == {"target_pct": 15, "stop_pct": -60})
+    # the pin is a copy: tonight's reload mutating svc.old_bracket can't reach it
+    svc.old_bracket["target_pct"] = 99
+    check("pin: a later bracket reload cannot mutate the pin",
+          ep.old_bracket == {"target_pct": 15, "stop_pct": -60})
+    # the exact BACKLOG drift: next day the backtest chose +99/-90, but the
+    # shadow still takes the +15 target it was opened under
+    evs = poslib.step(ep, at(10, 0), ep.entry_mid * 1.16, "test", 16.0, False,
+                      {"target_pct": 99, "stop_pct": -90}, comparable=False)
+    check("pin: non-comparable cycle leaves the shadow open",
+          ep.old_rules["status"] == "open")
+    poslib.step(ep, at(10, 5), ep.entry_mid * 1.16, "estimated", 16.0, False,
+                {"target_pct": 99, "stop_pct": -90}, comparable=True)
+    check("pin: shadow takes the +15 target it opened under, not today's +99",
+          ep.old_rules["status"] == "closed"
+          and ep.old_rules["exit_reason"] == "old target")
+finally:
+    quotes.get_option_quote = _orig_get_quote2
+    scannermod.news.earnings_inside = _orig_earnings
+    scannermod.scoreboard.stats_for_card = _orig_stats_card
 
 # --- once-per-day attempt cap: a crash between a job's send and its dedup
 # mark can no longer re-broadcast the report indefinitely ---

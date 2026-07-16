@@ -277,8 +277,13 @@ class Service:
                     print(f"reloaded {name}: stats changed overnight")
             elif prev is not None:
                 print(f"{name} unreadable on reload — keeping previous stats")
-        self.old_bracket = (self.backtest_old or {}).get(
-            "bracket", {"target_pct": 15, "stop_pct": -60})
+        # the report's bracket is validated, not trusted: a hand-corrupted
+        # "bracket": null (present key, so .get's default never applies) or
+        # bool/NaN legs would crash entry pinning with dict(None) or feed the
+        # shadow garbage comparisons — degrade to the built-in default instead
+        loaded = (self.backtest_old or {}).get("bracket")
+        self.old_bracket = (dict(loaded) if poslib.valid_bracket(loaded)
+                            else {"target_pct": 15, "stop_pct": -60})
         self.cfg = StrategyConfig()
         # Owner-tunable live settings (live_params.json on DATA_DIR): the
         # no-redeploy path for the knobs that used to be frozen in code.
@@ -1281,6 +1286,9 @@ class Service:
             risk_mode=mode, stats_note=display["label"] if display else "",
             win_rate_quoted=display["win_rate"] if display else 0.0,
             ev_quoted=display["ev_pct"] if display else 0.0,
+            # pin the old-rules bracket at entry (a copy, so tonight's reload
+            # can't mutate it) — the shadow is judged under the rules it opened on
+            old_bracket=dict(self.old_bracket),
         )
         news_lines = []
         if setup.ticker != "SPX":

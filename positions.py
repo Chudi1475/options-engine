@@ -10,13 +10,16 @@ Exit system (constants in config.py):
 - hard stop: sell everything at STOP_PCT from entry mid, any time
 - "close before expiry" warning EXPIRY_WARN_MINUTES before the 4 PM ET close
 
-Each position also runs a shadow simulation of the OLD rules (+15% / -60%)
+Each position also runs a shadow simulation of the OLD rules (a single
+target/stop bracket, pinned on the position at entry so the overnight
+backtest re-choosing a bracket never moves the goalposts on an open shadow)
 on the exact same price stream, so the weekly scoreboard can compare the two
 honestly. A position closed by the new rules keeps getting marked until its
 old-rules shadow also closes — otherwise the comparison would be rigged.
 """
 
 import json
+import math
 import os
 import threading
 import time as time_mod
@@ -70,6 +73,12 @@ class Position:
     last_mark_source: str = ""
     last_mark_time: str = ""
     expiry_warned: bool = False
+    old_bracket: dict = None   # the old-rules bracket live AT ENTRY, pinned so
+                               # the shadow is judged against the rules it was
+                               # opened under — the overnight backtest re-choosing
+                               # a bracket must not move the goalposts on an open
+                               # shadow. None on legacy records: step() falls back
+                               # to the caller's current bracket (old behavior).
     old_rules: dict = field(default_factory=lambda: {
         "status": "open", "exit_pct": None, "exit_reason": None, "exit_time": None})
 
@@ -87,6 +96,19 @@ class Position:
 
     def setup_key(self) -> str:
         return f"{self.ticker}:{self.direction}"
+
+
+def valid_bracket(b) -> bool:
+    """A usable old-rules bracket: a dict with real finite numbers on both
+    legs. bool IS an int to isinstance, and json.loads parses NaN/Infinity
+    into floats, so a hand-edited positions.json or report can smuggle legs
+    that compare nonsensically (True/False) or never (NaN); every reader of
+    a bracket from disk funnels through this one test and falls back."""
+    def _num(v):
+        return (isinstance(v, (int, float)) and not isinstance(v, bool)
+                and math.isfinite(v))
+    return (isinstance(b, dict) and _num(b.get("target_pct"))
+            and _num(b.get("stop_pct")))
 
 
 def step(pos: Position, now: datetime, mark: float, mark_source: str,
@@ -155,11 +177,16 @@ def step(pos: Position, now: datetime, mark: float, mark_source: str,
 
     # old-rules shadow on the same prices (for the honest weekly comparison).
     # Only advance it on a comparable mark — a cross-source ratio would rig it.
+    # Judged against the bracket pinned at entry when the position carries one:
+    # a multi-day weekly opened under +15/-60 must not be graded the next day
+    # under a bracket the overnight backtest re-chose. A missing or malformed
+    # pin (legacy records) falls back to the caller's current bracket.
     o = pos.old_rules
     if comparable and o["status"] == "open":
-        if pct <= old_bracket["stop_pct"]:
+        b = pos.old_bracket if valid_bracket(pos.old_bracket) else old_bracket
+        if pct <= b["stop_pct"]:
             o.update(status="closed", exit_pct=pct, exit_reason="old stop", exit_time=ts)
-        elif pct >= old_bracket["target_pct"]:
+        elif pct >= b["target_pct"]:
             o.update(status="closed", exit_pct=pct, exit_reason="old target", exit_time=ts)
 
     expires_today = pos.expires_on() == now.date()

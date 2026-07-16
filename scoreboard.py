@@ -7,9 +7,9 @@ Honesty design:
 - Live EV subtracts SPREAD_COST_PCT because live tracking is mid-to-mid and
   nobody actually fills at the mid. Backtest EV does NOT subtract it again —
   the backtest already charges 1.5% slippage each way plus per-contract fees.
-- Every signal stores both the new-rules result and an old-rules (+15/-60)
-  shadow result on the same prices, so the weekly comparison is apples to
-  apples.
+- Every signal stores both the new-rules result and an old-rules shadow
+  result (a target/stop bracket pinned on the position at entry) on the same
+  prices, so the weekly comparison is apples to apples.
 
 Usage:
     python scoreboard.py            # print the current scoreboard
@@ -27,7 +27,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import config
-from positions import PositionBook
+from positions import PositionBook, valid_bracket
 
 REPORTS_DIR = Path(__file__).parent / "reports"
 
@@ -99,6 +99,25 @@ def stats_for_card(ticker: str, direction: str, book: PositionBook,
     return None
 
 
+def _old_rules_label(both) -> str:
+    """Name the OLD side by the bracket(s) the shadows were actually judged
+    under. Brackets are pinned per position at entry, so one week can mix
+    several; exact numbers are quoted only when every trade shares one pin.
+    Legacy unpinned trades were judged under whichever bracket was loaded on
+    each monitoring day, which the record no longer knows, so any of those
+    also drops the numbers rather than guess."""
+    pins = set()
+    for p in both:
+        b = getattr(p, "old_bracket", None)
+        if not valid_bracket(b):
+            return "OLD exit rules (each trade's own entry-day bracket)"
+        pins.add((b["target_pct"], b["stop_pct"]))
+    if len(pins) == 1:
+        t, s = next(iter(pins))
+        return f"OLD exit rules ({t:+g}/{s:g})"
+    return "OLD exit rules (each trade's own entry-day bracket)"
+
+
 def _week_bounds(today: date):
     monday = today - timedelta(days=today.weekday())
     return monday, monday + timedelta(days=4)
@@ -148,12 +167,13 @@ def weekly_report(book: PositionBook, backtest_old, backtest_new,
         if both:
             old_total = sum(p.old_rules["exit_pct"] for p in both)
             new_matched = sum(p.final_pnl_pct for p in both)
+            old_label = _old_rules_label(both)
             if len(both) < len(week):
-                add(f"OLD exit rules (+15/-60) on the {len(both)} of {len(week)} "
+                add(f"{old_label} on the {len(both)} of {len(week)} "
                     f"trades where the old shadow finished: {old_total:+.0f}%")
                 add(f"NEW rules on those same {len(both)} trades: {new_matched:+.0f}%")
             else:
-                add(f"OLD exit rules (+15/-60) on the exact same entries: {old_total:+.0f}%")
+                add(f"{old_label} on the exact same entries: {old_total:+.0f}%")
             diff = new_matched - old_total
             winner = "NEW" if diff >= 0 else "OLD"
             add(f"This week's winner: {winner} rules by {abs(diff):.0f} points")
