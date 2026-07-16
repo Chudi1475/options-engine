@@ -13,19 +13,35 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import yfinance as yf
 
+import cards
 import config
+import live_params
 import scoreboard
 from backtest import (CONTRACTS, SLIPPAGE, bs_price, expiry_for, realized_vol,
                       years_to_expiry)
 from backtest_new_rules import simulate_new_exits
 from data_feed import DataFeed
 from positions import PositionBook
-from strategy import StrategyConfig, detect_setup, momentum_pct
+from strategy import detect_setup, momentum_pct
 
 ET = ZoneInfo("America/New_York")
 CT = ZoneInfo("America/Chicago")  # display timezone ONLY — logic stays ET
-_cfg = StrategyConfig()
 _feed = DataFeed()
+
+# These reads used to run on a module-level StrategyConfig() frozen at import,
+# so a live_params.json override (added ticker, moved entry window) left every
+# chat read quoting the built-ins. Each read now resolves the EFFECTIVE
+# settings per call: the scanner threads its own live cfg/allow-list in, and
+# Service-less callers (the chat brain's tools, CLI checks) fall back to
+# live_params.effective(), which reads the same file reload_tunables() applies.
+
+
+def _effective(cfg=None, allowed=None):
+    if cfg is None or allowed is None:
+        ecfg, eallowed = live_params.effective()
+        cfg = cfg or ecfg
+        allowed = eallowed if allowed is None else allowed
+    return cfg, allowed
 
 # last 5m bars per yf symbol, refreshed by every read; lets the chart renderer
 # skip its own duplicate download when it runs within seconds of the read
@@ -60,8 +76,9 @@ MACRO_SYMBOLS = {
 
 # Popular, heavily-traded stocks + ETFs available as READ-ONLY /command lookups
 # (e.g. /aapl, /calls nvda, "how's apple"). These are NOT alert tickers — the
-# scanner only ever alerts on StrategyConfig.watchlist, so listing them here
-# gives quick reads without ever texting anyone about them. {TICKER: (disp, yf, dp)}
+# scanner only ever alerts on the live watchlist (StrategyConfig built-ins,
+# overridable via live_params.json), so listing them here gives quick reads
+# without ever texting anyone about them. {TICKER: (disp, yf, dp)}
 LOOKUP_STOCKS = {t: (t, t, 2) for t in (
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "AVGO", "NFLX", "AMD", "TSM",
     "PLTR", "COIN", "MSTR", "SMCI", "SOFI", "BABA", "UBER", "DIS", "JPM", "BAC",
@@ -121,9 +138,13 @@ def _day_5m(yf_symbol, day: date):
     return df
 
 
-def _gate_ok(ticker, direction):
-    """Same eligibility the live scanner uses: rounded 70%+ win rate AND
-    positive expectancy under our real exits."""
+def _gate_ok(ticker, direction, allowed=None):
+    """Same eligibility the live scanner uses: on the alert allow-list, with
+    a rounded 70%+ win rate AND positive expectancy under our real exits.
+    `allowed` is the effective allow-list; None resolves it fresh so a setup
+    the owner just removed stops reading as alert-worthy."""
+    if allowed is None:
+        allowed = live_params.effective()[1]
     bt_old = scoreboard.load_report("backtest_results.json") or {}
     bt_new = scoreboard.load_report("backtest_new_rules.json") or {}
     key = f"{ticker}:{direction}"
@@ -131,6 +152,8 @@ def _gate_ok(ticker, direction):
     new = bt_new.get("per_setup", {}).get(key)
     if not old:
         return False, None
+    if key not in allowed:
+        return False, old
     if round(old["win_rate"]) < config.MIN_WINRATE:
         return False, old
     exp = (new or old)["expectancy_pct"]
@@ -159,13 +182,15 @@ def _resolve_day(date_str):
     return max(set(spx.index.date)), None
 
 
-def analyze_day(ticker="SPX", date_str=None):
+def analyze_day(ticker="SPX", date_str=None, cfg=None, allowed=None):
     """Replay one day for one ticker through the real strategy: did a setup
-    trigger, would we have alerted it, and how would the trade have gone?"""
+    trigger, would we have alerted it, and how would the trade have gone?
+    cfg/allowed default to the effective live settings (live_params-aware)."""
+    cfg, allowed = _effective(cfg, allowed)
     ticker = (ticker or "SPX").upper()
-    if ticker not in _cfg.watchlist:
+    if ticker not in cfg.watchlist:
         return {"error": f"{ticker} isn't on the watchlist "
-                f"({', '.join(_cfg.watchlist)})."}
+                f"({', '.join(cfg.watchlist)})."}
     day, err = _resolve_day(date_str)
     if err:
         return {"note": err}
@@ -173,7 +198,7 @@ def analyze_day(ticker="SPX", date_str=None):
         # container's UTC date (which is already tomorrow after ~8pm ET)
         return {"note": f"{day} is not a completed trading day, so there's no "
                 "real data to analyze. The market is closed weekends."}
-    yfs = _cfg.watchlist[ticker]
+    yfs = cfg.watchlist[ticker]
     bars = _day_5m(yfs, day)
     if bars is None or bars.empty:
         return {"note": f"No intraday data for {ticker} on {day} (free history "
@@ -225,9 +250,9 @@ def analyze_day(ticker="SPX", date_str=None):
     for i in range(len(bars)):
         upto = bars.iloc[: i + 1]
         now = upto.index[-1].to_pydatetime()
-        s = detect_setup(ticker, upto, now, _cfg)
+        s = detect_setup(ticker, upto, now, cfg)
         if s and not any(f["direction"] == s.direction for f in formed):
-            ok, stats = _gate_ok(ticker, s.direction)
+            ok, stats = _gate_ok(ticker, s.direction, allowed)
             formed.append({"time": now.astimezone(CT).strftime("%I:%M %p CT").lstrip("0"),
                            "direction": s.direction, "strike": s.strike,
                            "mom_pct": round(s.mom_pct, 2), "passes_filter": ok,
@@ -236,9 +261,10 @@ def analyze_day(ticker="SPX", date_str=None):
 
     if not formed:
         overview["result"] = ("No setup triggered in the morning window "
-                              "(8:45-9:30 AM CT). The 15-min momentum never lined "
-                              "up the way the strategy needs, so the bot would "
-                              "have stayed silent. No text = no trade.")
+                              f"({cards.entry_window_ct(cfg)}). The 15-min "
+                              "momentum never lined up the way the strategy "
+                              "needs, so the bot would have stayed silent. "
+                              "No text = no trade.")
         return overview
 
     picks = [f for f in formed if f["passes_filter"]] or formed
@@ -248,7 +274,7 @@ def analyze_day(ticker="SPX", date_str=None):
     entry_prem = bs_price(f["setup"].spot, f["strike"],
                           years_to_expiry(f["now"], expiry), sigma, right) * (1 + SLIPPAGE)
     legs = simulate_new_exits(bars, bars.index[bars.index <= f["now"]][-1],
-                              entry_prem, f["strike"], right, sigma, expiry, _cfg)
+                              entry_prem, f["strike"], right, sigma, expiry, cfg)
     result = {
         "would_alert": f["passes_filter"],
         "time": f["time"], "direction": f["direction"], "strike": f["strike"],
@@ -261,21 +287,31 @@ def analyze_day(ticker="SPX", date_str=None):
                        f"({lbl})" for _, px, n, lbl in legs],
     }
     if not f["passes_filter"]:
-        result["why_skipped"] = (f"A {f['direction']} setup formed at {f['time']}, "
-                                 "but it doesn't clear the 70%-win-rate + "
-                                 "positive-expectancy bar, so the bot would skip "
-                                 "it rather than force a weak trade.")
+        if f"{ticker}:{f['direction']}" not in allowed:
+            result["why_skipped"] = (f"A {f['direction']} setup formed at "
+                                     f"{f['time']}, but {ticker} {f['direction']}s "
+                                     "aren't on the alert allow-list, "
+                                     "so the bot would stay silent.")
+        else:
+            result["why_skipped"] = (f"A {f['direction']} setup formed at "
+                                     f"{f['time']}, but it doesn't clear the "
+                                     "70%-win-rate + positive-expectancy bar, so "
+                                     "the bot would skip it rather than force a "
+                                     "weak trade.")
     overview["result"] = result
     return overview
 
 
-def market_now(ticker="SPX"):
+def market_now(ticker="SPX", cfg=None, allowed=None):
     """Live read on a ticker right now: price, today's move, 15-min momentum,
-    and whether a setup is triggering this moment."""
+    and whether a setup is triggering this moment. cfg/allowed default to the
+    effective live settings (live_params-aware); the scanner threads its own."""
+    cfg, allowed = _effective(cfg, allowed)
+    window_ct = cards.entry_window_ct(cfg)
     ticker = (ticker or "SPX").upper()
-    if ticker not in _cfg.watchlist:
+    if ticker not in cfg.watchlist:
         return {"error": f"{ticker} isn't on the watchlist."}
-    yfs = _cfg.watchlist[ticker]
+    yfs = cfg.watchlist[ticker]
     now = datetime.now(ET)
     if now.weekday() >= 5 or not (time(9, 30) <= now.time() <= time(16, 0)):
         # extended hours: keep tracking. Stocks/ETFs get pre/post-market bars;
@@ -284,9 +320,10 @@ def market_now(ticker="SPX"):
         if isinstance(r, dict) and not r.get("error"):
             r["session"] = "extended-hours"
             r.setdefault("disclaimer", "")
+            r["entry_window_ct"] = window_ct
             r["note_session"] = ("After-hours/pre-market read: thinner volume, "
                                  "wider spreads, RTH open can gap. No 0DTE "
-                                 "alerts fire outside 8:45-9:30 AM CT.")
+                                 f"alerts fire outside {window_ct}.")
             return r
     try:
         bars = _feed.today_bars(yfs, now)
@@ -296,20 +333,21 @@ def market_now(ticker="SPX"):
     if bars is None or bars.empty:
         return {"note": "no completed bars yet today"}
     o = float(bars["Open"].iloc[0])
-    mom = momentum_pct(bars, _cfg)
+    mom = momentum_pct(bars, cfg)
     out = {
         "ticker": ticker, "time": now.astimezone(CT).strftime("%I:%M %p CT").lstrip("0"),
         "price": round(price or float(bars["Close"].iloc[-1]), 2),
         "day_open": round(o, 2),
         "move_from_open_pct": round(((price or float(bars["Close"].iloc[-1])) / o - 1) * 100, 2),
         "momentum_15min_pct": round(mom, 2) if mom is not None else None,
-        "in_entry_window": _cfg.entry_start <= now.time() <= _cfg.entry_end,
+        "in_entry_window": cfg.entry_start <= now.time() <= cfg.entry_end,
+        "entry_window_ct": window_ct,
         "data": _feed.backend_for(yfs),
     }
     if out["in_entry_window"]:
-        s = detect_setup(ticker, bars, now, _cfg)
+        s = detect_setup(ticker, bars, now, cfg)
         if s:
-            ok, stats = _gate_ok(ticker, s.direction)
+            ok, stats = _gate_ok(ticker, s.direction, allowed)
             out["live_setup"] = {
                 "direction": s.direction, "strike": s.strike,
                 "would_alert": ok,
@@ -658,7 +696,10 @@ def _do_read(disp, yfs, dec, kind, source):
     # which keeps the bias neutral (chop = wait) instead of reading the gap.
     mom15 = None
     if day_bars is not None and not day_bars.empty:
-        m15 = momentum_pct(day_bars.dropna(subset=["Close"]), _cfg)
+        # effective cfg so an overridden mom_bars keeps this read computing
+        # the same momentum the live scanner trades
+        m15 = momentum_pct(day_bars.dropna(subset=["Close"]),
+                           live_params.effective()[0])
         if m15 is not None:
             mom15 = round(m15, 2)
 

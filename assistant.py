@@ -231,8 +231,9 @@ Scorekeeping — one of your main jobs:
 - When they ask "what's my record / score / how am I doing", call get_score.
 
 Market reads & trade plans — be the SNIPER, decisive:
-- We only ALERT/auto-trade the core four 0DTE names (SPX, SPY, QCOM, TSLA) via
-  market_now / analyze_day — that doesn't change. But when ANYONE asks about ANY
+- We only ALERT/auto-trade the watched 0DTE alert names (the "Alert watchlist"
+  line in LIVE BOT STATE), checked via market_now / analyze_day. That doesn't
+  change. But when ANYONE asks about ANY
   OTHER symbol (a stock, ETF, forex pair, gold, or crypto like BTC/ETH), or asks
   "calls or puts on X", "is X a buy", "what's the play on X" — call macro_read
   with that symbol and GIVE THE PLAN. NEVER refuse with "that's not one of our
@@ -331,7 +332,8 @@ Hard rules:
   a few sentences unless they ask for detail.
 - Chart screenshots: describe what you actually see (trend, levels,
   candles) and connect it to the bot's strategy: 15-minute momentum turns,
-  morning entry window 8:45-9:30 AM CT, sell half +25%, then let the runner run
+  the morning entry window (the exact times are the "Entry window" line in
+  LIVE BOT STATE), sell half +25%, then let the runner run
   and sell it when it gives back ~40 points from its peak, -70% stop.
 - Member commands: /setaccount /risk /status /score /calls /test /help.
   /calls [ticker] shows the live call/put setup per stock (BUY type, strike,
@@ -372,7 +374,8 @@ TOOLS = [
                         "15-min momentum, and whether a setup is triggering. "
                         "Use for 'what's happening', 'any setups now'."),
         "input_schema": {"type": "object", "properties": {
-            "ticker": {"type": "string", "description": "SPX, SPY, QCOM or TSLA"}}},
+            "ticker": {"type": "string", "description":
+                       "a ticker on the alert watchlist (LIVE BOT STATE lists them)"}}},
     },
     {
         "name": "analyze_day",
@@ -381,14 +384,16 @@ TOOLS = [
                         "have alerted it, how would the trade have gone. Use for "
                         "'what would have worked Friday', 'break down yesterday'."),
         "input_schema": {"type": "object", "properties": {
-            "ticker": {"type": "string", "description": "SPX, SPY, QCOM or TSLA"},
+            "ticker": {"type": "string", "description":
+                       "a ticker on the alert watchlist (LIVE BOT STATE lists them)"},
             "date": {"type": "string",
                      "description": "the day as YYYY-MM-DD; omit for the last session"}}},
     },
     {
         "name": "request_new_ticker",
         "description": ("Flag a stock/ETF the bot is NOT equipped for (anything "
-                        "other than SPX, SPY, QCOM, TSLA) that the user wants added. "
+                        "not on the alert watchlist in LIVE BOT STATE) that the "
+                        "user wants added. "
                         "Pings the owner to approve. Call ONLY after the user "
                         "says they'd like it added."),
         "input_schema": {
@@ -729,9 +734,6 @@ def score_line(chat_id: str) -> str:
     return (f"📊 YOUR RECORD: {s['wins']}W - {s['losses']}L{scratch} "
             f"({s['win_rate_pct']}%), total {s['total_dollars']:+,.0f} "
             f"dollars across {s['entries']} logged trades.")
-
-
-SUPPORTED_TICKERS = ("SPX", "SPY", "QCOM", "TSLA")
 
 
 def _request_ticker(ticker: str, chat_id: str, asked_by: str = "") -> str:

@@ -43,8 +43,10 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import config
+import live_params
 import telegram
 from positions import PositionBook
+from strategy import StrategyConfig
 
 ET = ZoneInfo("America/New_York")
 
@@ -278,12 +280,17 @@ def grade_day(session_date):
 
 # ---------------------------- synthesize lessons ----------------------------
 
-REVIEWER_SYSTEM = """You are the trading brain of 'options-engine' doing your
+# The entry window and alert names are spliced in at review time from the
+# EFFECTIVE settings (live_params-aware), so the reviewer grades against the
+# rules actually running and cannot re-propose a change that already shipped
+# via live_params.json. REVIEWER_SYSTEM keeps the built-in render; with no
+# override file the nightly prompt is exactly that text.
+_REVIEWER_TEMPLATE = """You are the trading brain of 'options-engine' doing your
 own nightly review. You trade a 15-minute momentum continuation method on 0DTE
-options (the 'Kelechi' style): spot the morning push in the 9:45-10:30 ET
+options (the 'Kelechi' style): spot the morning push in the __WINDOW__ ET
 window, ride the continuation, sell half at +25%, let the runner run and sell
 when it gives back ~40 points from its peak, hard stop at -70%. You only alert
-SPX, SPY, QCOM, TSLA and only above a 70% backtested win rate.
+__NAMES__ and only above a 70% backtested win rate.
 
 Tonight you are grading YOUR OWN calls to get sharper. Be brutally honest with
 yourself, like a trader journaling after the close. Find the real pattern
@@ -312,6 +319,22 @@ Put 1 to 3 items in lessons (fewer is fine on a quiet day). Set proposed_change
 to a specific string ONLY if a real trade-rule or threshold change is warranted
 (it will be shown to the human for approval, never auto-applied); otherwise
 null."""
+
+
+def _render_reviewer(cfg) -> str:
+    return (_REVIEWER_TEMPLATE
+            .replace("__WINDOW__", live_params.window_et(cfg))
+            .replace("__NAMES__", ", ".join(cfg.watchlist)))
+
+
+REVIEWER_SYSTEM = _render_reviewer(StrategyConfig())
+
+
+def reviewer_system() -> str:
+    """REVIEWER_SYSTEM rendered with the EFFECTIVE entry window and alert
+    names (live_params-aware), so the nightly review grades against the
+    configured rules, not built-ins an override may have replaced."""
+    return _render_reviewer(live_params.effective()[0])
 
 
 def _prior_learning_block(session: str) -> list:
@@ -456,8 +479,9 @@ def synthesize(record) -> dict:
     try:
         import assistant
         brief = _day_brief(record)
-        raw = (assistant.complete_deep(REVIEWER_SYSTEM, brief)
-               or assistant.complete(REVIEWER_SYSTEM, brief, max_tokens=700))
+        system = reviewer_system()
+        raw = (assistant.complete_deep(system, brief)
+               or assistant.complete(system, brief, max_tokens=700))
         if raw:
             txt = raw.strip()
             if txt.startswith("```"):  # strip a ```json fence if the model added one
@@ -844,9 +868,10 @@ def _rebuild_digest():
                                  else "%-m/%-d")
         pin = (f"FOR TODAY (my watch line from the {tag} review): "
                f"{latest[1]}\n\n")
+    window = live_params.window_et(live_params.effective()[0])
     header = ("These are my own observations from grading my calls night after "
               "night. Apply them when reading setups. They NEVER override the "
-              "hard rules (9:45-10:30 entry window, 70% win-rate floor, sell "
+              f"hard rules ({window} entry window, 70% win-rate floor, sell "
               "half at +25%, give-back 40 off peak, -70% stop).\n")
     body = "\n".join(f"- ({tag}) {lesson}" for tag, lesson in bullets) or "- (none yet)"
     LESSONS_DIGEST.write_text(header + "\n" + pin + body + "\n", encoding="utf-8")

@@ -1143,6 +1143,144 @@ finally:
     shutil.rmtree(_lp_dir, ignore_errors=True)
     shutil.rmtree(_lp_reports, ignore_errors=True)
 
+# --- effective-settings text surfaces: no stale built-ins after an override ---
+# reload_tunables() covered the scanner's DECISIONS, but /calls option lines,
+# the green morning card, the chat brain's market tools, the nightly reviewer
+# prompt, the digest header and the recap's ticker->Yahoo map still quoted the
+# built-in window/watchlist/allow-list once live_params.json overrode them.
+# They all render from live_params.effective() now, which reads the same file
+# reload_tunables() applies and falls back to the built-ins the same way.
+import learn as learnmod
+import recap as recapmod
+
+_fx_dir = Path(tempfile.mkdtemp(prefix="liveparams_fx_"))
+_fx_file = _fx_dir / "live_params.json"
+_fx_orig_path = livemod.path
+_fx_reports = Path(tempfile.mkdtemp(prefix="fx_reports_"))
+_fx_orig_reports = scoreboard.REPORTS_DIR
+_fx_orig_llog, _fx_orig_ldig = learnmod.LESSONS_LOG, learnmod.LESSONS_DIGEST
+
+try:
+    livemod.path = lambda: _fx_file
+    scoreboard.REPORTS_DIR = _fx_reports
+    (_fx_reports / "backtest_results.json").write_text(_json.dumps(
+        {"per_setup": {"SPX:call": {"win_rate": 74.0, "expectancy_pct": 6.0}},
+         "bracket": {"target_pct": 15, "stop_pct": -60}}), encoding="utf-8")
+    _fx_dflt = scannermod.StrategyConfig()
+
+    # the CT window renderer: built-ins produce the exact classic sentence
+    check("window text: built-ins render 8:45-9:30 AM CT",
+          cards.entry_window_ct(_fx_dflt) == "8:45-9:30 AM CT")
+    _fx_c = scannermod.StrategyConfig()
+    _fx_c.entry_start, _fx_c.entry_end = time(11, 0), time(13, 30)
+    check("window text: a cross-noon window names AM and PM",
+          cards.entry_window_ct(_fx_c) == "10:00 AM-12:30 PM CT")
+    _fx_c.entry_start, _fx_c.entry_end = time(13, 0), time(14, 0)
+    check("window text: an afternoon window says PM once",
+          cards.entry_window_ct(_fx_c) == "12:00-1:00 PM CT")
+
+    # no file: effective() is the built-ins and the reviewer prompt is the
+    # constant, byte for byte
+    _ecfg, _eallow = livemod.effective()
+    check("effective(): no file returns the built-ins",
+          _ecfg.watchlist == _fx_dflt.watchlist
+          and _ecfg.entry_start == _fx_dflt.entry_start
+          and _ecfg.mom_bars == _fx_dflt.mom_bars
+          and _eallow == livemod.DEFAULT_ALLOWED_SETUPS)
+    check("learn: no overrides means the reviewer prompt IS the constant",
+          learnmod.reviewer_system() == learnmod.REVIEWER_SYSTEM
+          and "9:45-10:30" in learnmod.REVIEWER_SYSTEM
+          and "SPX, SPY, TSLA, QCOM" in learnmod.REVIEWER_SYSTEM)
+
+    # one comprehensive override: SPX off the lists, NVDA added, window moved
+    _fx_file.write_text(_json.dumps(
+        {"allowed_setups": ["TSLA:put"],
+         "watchlist": {"TSLA": "TSLA", "NVDA": "NVDA"},
+         "entry_start": "09:50", "entry_end": "10:15"}), encoding="utf-8")
+    _ecfg, _eallow = livemod.effective()
+    check("effective(): a valid file applies exactly like reload_tunables",
+          _eallow == {"TSLA:put"}
+          and _ecfg.watchlist == {"TSLA": "TSLA", "NVDA": "NVDA"}
+          and _ecfg.entry_start == time(9, 50)
+          and _ecfg.entry_end == time(10, 15))
+
+    _fx_win = cards.entry_window_ct(_ecfg)
+    check("window text: the overridden window renders in CT",
+          _fx_win == "8:50-9:15 AM CT")
+    check("cards: option_line quotes the effective window, not the built-in",
+          f"entry window is {_fx_win}" in cards.option_line(
+              "TSLA", {"price": 310.0, "in_entry_window": False,
+                       "entry_window_ct": _fx_win}))
+    _fx_card = cards.morning_card("green", "calm tape", date(2026, 7, 15),
+                                  window_ct=_fx_win)
+    check("cards: green morning card quotes the effective window",
+          _fx_win in _fx_card and "8:45-9:30" not in _fx_card)
+
+    # market_tools resolves the same file: membership, gate, replay
+    check("market_tools: market_now rejects a ticker the file removed",
+          "isn't on the watchlist" in (mt.market_now("SPX").get("error") or ""))
+    _fx_day5m = mt._day_5m
+    mt._day_5m = lambda yfs, day: None
+    try:
+        _fx_r = mt.analyze_day("NVDA", "2026-07-10")
+        check("market_tools: analyze_day accepts a live-added ticker",
+              "error" not in _fx_r
+              and "No intraday data" in (_fx_r.get("note") or ""))
+        _fx_r2 = mt.analyze_day("SPX", "2026-07-10")
+        check("market_tools: analyze_day rejects with the effective list",
+              "isn't on the watchlist" in (_fx_r2.get("error") or "")
+              and "NVDA" in _fx_r2["error"])
+    finally:
+        mt._day_5m = _fx_day5m
+    check("market_tools: _gate_ok refuses a setup the file removed",
+          mt._gate_ok("SPX", "call")[0] is False)
+    check("market_tools: _gate_ok still passes stats when allow-listed",
+          mt._gate_ok("SPX", "call", {"SPX:call"})[0] is True)
+
+    # the nightly reviewer and the digest header state the effective rules
+    _fx_rs = learnmod.reviewer_system()
+    check("learn: reviewer prompt states the effective window and names",
+          "9:50-10:15" in _fx_rs and "TSLA, NVDA" in _fx_rs
+          and "9:45-10:30" not in _fx_rs and "QCOM" not in _fx_rs)
+    learnmod.LESSONS_LOG = _fx_dir / "lessons_fx.jsonl"
+    learnmod.LESSONS_DIGEST = _fx_dir / "digest_fx.md"
+    learnmod._rebuild_digest()
+    check("learn: digest header quotes the effective entry window",
+          "9:50-10:15 entry window"
+          in learnmod.LESSONS_DIGEST.read_text(encoding="utf-8"))
+
+    # the recap grades an added ticker against its real symbol and keeps the
+    # built-in feed map for a ticker the file removed mid-history
+    check("recap: symbol map honors overrides with the built-in fallback",
+          recapmod.yfs_for(_ecfg, "NVDA") == "NVDA"
+          and recapmod.yfs_for(_ecfg, "SPX") == "^GSPC"
+          and recapmod.yfs_for(_ecfg, "ZZZ") == "ZZZ")
+
+    # a broken file falls back to the built-ins everywhere at once
+    _fx_file.write_text("{broken", encoding="utf-8")
+    _ecfg, _eallow = livemod.effective()
+    check("effective(): an invalid file falls back to the built-ins",
+          _ecfg.watchlist == _fx_dflt.watchlist
+          and _eallow == livemod.DEFAULT_ALLOWED_SETUPS
+          and learnmod.reviewer_system() == learnmod.REVIEWER_SYSTEM)
+
+    # the brain's static prompt and tool text can't go stale: the four names
+    # and the CT window sentence now live only in LIVE BOT STATE
+    import assistant as _fx_asst
+    check("assistant: static prompt no longer hardcodes names or window",
+          "8:45-9:30" not in _fx_asst.SYSTEM
+          and "SPX, SPY, QCOM, TSLA" not in _fx_asst.SYSTEM
+          and "Alert watchlist" in _fx_asst.SYSTEM)
+    check("assistant: tool descriptions no longer hardcode the four names",
+          "SPX, SPY, QCOM or TSLA" not in _json.dumps(_fx_asst.TOOLS)
+          and "other than SPX" not in _json.dumps(_fx_asst.TOOLS))
+finally:
+    livemod.path = _fx_orig_path
+    scoreboard.REPORTS_DIR = _fx_orig_reports
+    learnmod.LESSONS_LOG, learnmod.LESSONS_DIGEST = _fx_orig_llog, _fx_orig_ldig
+    shutil.rmtree(_fx_dir, ignore_errors=True)
+    shutil.rmtree(_fx_reports, ignore_errors=True)
+
 # --- learn digest: repeated lessons cannot crowd out real ones ---
 # _deterministic_review appended the SAME "staying flat is correct" bullet
 # every quiet night, and _rebuild_digest kept the last DIGEST_KEEP bullets
@@ -2362,9 +2500,12 @@ try:
     assistant.complete_deep = lambda s, u, **k: seen_args.append((s, u)) or None
     assistant.complete = lambda s, u, **k: seen_args.append((s, u)) or None
     got = learn.synthesize(_quiet_record("2026-06-11"))
+    # compare against reviewer_system(), not the REVIEWER_SYSTEM constant:
+    # on a box with a real live_params.json the rendered prompt differs from
+    # the built-in render, and that is correct, not a failure
     check("deep review: both brains get the same prompt and brief",
           len(seen_args) == 2 and seen_args[0] == seen_args[1]
-          and seen_args[0][0] == learn.REVIEWER_SYSTEM)
+          and seen_args[0][0] == learn.reviewer_system())
     check("deep review: no brain at all still writes the deterministic review",
           "stayed out" in got["review"], f"got {got.get('review')!r}")
 finally:

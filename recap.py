@@ -28,11 +28,21 @@ import pandas as pd
 import yfinance as yf
 
 import config
+import live_params
 import telegram
 from backtest import SLIPPAGE, bs_price, realized_vol
 from positions import PositionBook
 from scoreboard import load_report
 from strategy import StrategyConfig
+
+
+def yfs_for(cfg, ticker: str) -> str:
+    """Ticker -> Yahoo symbol via the live watchlist, falling back to the
+    built-in map (same semantics as scanner.yfs_for): a legacy alert on a
+    ticker since removed from live_params.json must still grade against its
+    real feed symbol, not a bare-ticker guess that fetches nothing."""
+    return (cfg.watchlist.get(ticker)
+            or StrategyConfig().watchlist.get(ticker, ticker))
 
 ET = ZoneInfo("America/New_York")
 CT = ZoneInfo("America/Chicago")  # display timezone ONLY — logic stays ET
@@ -254,7 +264,9 @@ def market_story(spx_day):
 
 def main(require_date=None):
     dry = "--dry-run" in sys.argv
-    cfg = StrategyConfig()
+    # the EFFECTIVE settings (live_params-aware), so an alert on a ticker the
+    # owner added via live_params.json grades against its real Yahoo symbol
+    cfg = live_params.effective()[0]
     backtest = load_report("backtest_results.json")
     bracket = (backtest or {}).get("bracket", {"target_pct": 15, "stop_pct": -60})
 
@@ -310,7 +322,7 @@ def main(require_date=None):
     if legacy:
         daily_cache = {}
         for rec in legacy:
-            yfs = cfg.watchlist.get(rec["ticker"], rec["ticker"])
+            yfs = yfs_for(cfg, rec["ticker"])
             bars = spx if yfs == "^GSPC" else fetch_5m(yfs)
             if yfs not in daily_cache:
                 d1 = yf.download(yfs, period="1y", interval="1d",

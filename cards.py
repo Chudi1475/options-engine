@@ -2,7 +2,7 @@
 Written so a 6th grader can read every card. Cosmetics live here —
 no trading logic."""
 
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import config
 import fvg
@@ -44,6 +44,20 @@ def contract_str(pos) -> str:
     return f"{disp_ticker(pos.ticker)} {pos.strike:g} {pos.direction.upper()}"
 
 
+def entry_window_ct(cfg) -> str:
+    """The EFFECTIVE entry window as Central-time card text, e.g.
+    '8:45-9:30 AM CT'. cfg holds ET times; the cards speak CT (ET minus one
+    hour, both zones flip DST the same day). Rendering from cfg keeps every
+    window sentence truthful after a live_params.json override."""
+    def _ct(t):
+        return (datetime(2000, 1, 1, t.hour, t.minute)
+                - timedelta(hours=1)).strftime("%I:%M %p").lstrip("0")
+    a, b = _ct(cfg.entry_start), _ct(cfg.entry_end)
+    if a[-2:] == b[-2:]:
+        a = a[:-3]  # both edges share AM/PM: say it once ("8:45-9:30 AM")
+    return f"{a}-{b} CT"
+
+
 def option_line(ticker: str, mn: dict, expiry=None) -> str:
     """One compact, scannable line for a ticker's live read, in the order:
     STOCK -> action+type (BUY CALL / BUY PUT) -> strike -> expiry -> win rate.
@@ -58,7 +72,8 @@ def option_line(ticker: str, mn: dict, expiry=None) -> str:
     pstr = f"${price:g}" if price is not None else "?"
     if not setup:
         if not mn.get("in_entry_window"):
-            return f"{disp}  no setup yet (entry window is 8:45-9:30 AM CT, now {pstr})"
+            win = mn.get("entry_window_ct") or "8:45-9:30 AM CT"
+            return f"{disp}  no setup yet (entry window is {win}, now {pstr})"
         mom = mn.get("momentum_15min_pct")
         mtxt = f"{mom:+.2f}%" if mom is not None else "n/a"
         return f"{disp}  no live setup (now {pstr}, 15m momentum {mtxt})"
@@ -450,9 +465,9 @@ def expiry_card(pos, ev: dict) -> str:
     ])
 
 
-def morning_card(mode: str, reason: str, today: date) -> str:
+def morning_card(mode: str, reason: str, today: date, window_ct: str = "") -> str:
     effects = {
-        "green": "Standard rules. Entry window 8:45-9:30 AM CT; "
+        "green": f"Standard rules. Entry window {window_ct or '8:45-9:30 AM CT'}; "
                  "I'll watch every position until the close.",
         "yellow": "Setups still fire, with a warning banner. Consider smaller size.",
         "red": "HIGH-RISK DAY: consider sitting out. Any alert today is HALF size.",

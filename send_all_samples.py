@@ -12,6 +12,7 @@ from datetime import date
 
 import cards
 import config  # noqa: F401  (loads .env)
+import live_params
 import telegram
 from positions import Position
 from quotes import Quote
@@ -19,11 +20,14 @@ from strategy import Setup
 
 TEST = "🧪 TEST — EXAMPLE ONLY, NOT A REAL ALERT 🧪\n\n"
 today = date.today()
+# the sample card quotes the same effective entry window the live one would
+window_ct = cards.entry_window_ct(live_params.effective()[0])
 
 messages = [
     TEST + "Morning report, RISK MODE 1 of 3:\n\n"
     + cards.morning_card("green", "No major releases scheduled. VIX 17, "
-                         "overnight gap +0.2%. All clear.", today),
+                         "overnight gap +0.2%. All clear.", today,
+                         window_ct=window_ct),
     TEST + "Morning report, RISK MODE 2 of 3:\n\n"
     + cards.morning_card("yellow", "Unemployment Claims at 8:30 AM ET; "
                          "VIX is 27 (elevated fear)", today),

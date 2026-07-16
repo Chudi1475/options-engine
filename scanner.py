@@ -292,16 +292,8 @@ class Service:
         except Exception as e:  # a loader bug must never kill the daemon
             params, errs, exists = None, [f"loader error: {e}"], True
         if params is not None:
-            if "allowed_setups" in params:
-                self.ALLOWED_SETUPS = params["allowed_setups"]
-            if "watchlist" in params:
-                self.cfg.watchlist = params["watchlist"]
-            if "entry_start" in params:
-                self.cfg.entry_start = params["entry_start"]
-            if "entry_end" in params:
-                self.cfg.entry_end = params["entry_end"]
-            if "mom_bars" in params:
-                self.cfg.mom_bars = params["mom_bars"]
+            self.ALLOWED_SETUPS = live_params.apply(
+                self.cfg, params, Service.ALLOWED_SETUPS)
             self.live_params_note = ("live_params.json applied: "
                                      + live_params.summary(params))
         elif exists:
@@ -538,7 +530,7 @@ class Service:
             self.morning_sent_for = today
             # also restore the already-ANNOUNCED mode, so `prev` below isn't the
             # default 'green' — otherwise a restart on a red/yellow day fires a
-            # bogus "UPDATE — RED" escalation for a mode that was already sent
+            # bogus "UPDATE: RED" escalation for a mode that was already sent
             if cached and cached.get("date") == str(today):
                 self.mode, self.mode_reason = cached["mode"], cached["reason"]
         if cached and cached.get("date") == str(today) \
@@ -557,7 +549,9 @@ class Service:
         if self.morning_sent_for == today:
             # already reported; only speak again if the day got riskier
             if prev is not None and risk_gate.SEVERITY[mode] > risk_gate.SEVERITY[prev]:
-                self.notify("UPDATE — " + cards.morning_card(mode, reason, today))
+                self.notify("UPDATE: " + cards.morning_card(
+                    mode, reason, today,
+                    window_ct=cards.entry_window_ct(self.cfg)))
             return
         self.morning_sent_for = today
         # count the broadcast BEFORE it happens: a crash between the notify
@@ -570,7 +564,8 @@ class Service:
                 print(f"morning card already attempted {n - 1} times today "
                       "(restart between send and mark?); marking done")
                 return
-        card = cards.morning_card(mode, reason, today)
+        card = cards.morning_card(mode, reason, today,
+                                  window_ct=cards.entry_window_ct(self.cfg))
         try:  # earnings radar + hot headlines (news must never block the report)
             extra = news.morning_lines(self.cfg.watchlist)
             if extra:
@@ -852,7 +847,9 @@ class Service:
     def calls_text(self, arg: str = ""):
         """/calls [ticker] — a compact, scannable read of the live call/put
         setup for each watched ticker, in STOCK -> BUY CALL/PUT -> strike ->
-        expiry -> win-rate order. Real-time; only the 4 supported tickers."""
+        expiry -> win-rate order. Real-time; only the watched alert tickers.
+        The Service's own cfg/allow-list are threaded through so the read and
+        the scanner can never disagree about what is watched or gated."""
         import market_tools
         from backtest import expiry_for
         now = et_now()
@@ -869,7 +866,8 @@ class Service:
         lines = ["📊 LIVE SETUPS · calls & puts (real-time read):"]
         for t in tickers:
             try:
-                mn = market_tools.market_now(t)
+                mn = market_tools.market_now(t, cfg=self.cfg,
+                                             allowed=self.ALLOWED_SETUPS)
                 try:
                     exp = expiry_for(t, now)
                 except Exception:
@@ -1076,7 +1074,13 @@ class Service:
                  f"Account: {'$' + format(acct, ',.0f') if acct else 'not set (/setaccount)'}",
                  f"Paper mode: {'ON' if config.paper_mode() else 'off'}",
                  f"Data: {self.feed.backend_for('QCOM')} for stocks, "
-                 f"{self.feed.backend_for('^GSPC')} for SPX"]
+                 f"{self.feed.backend_for('^GSPC')} for SPX",
+                 # the LIVE settings, not the built-ins: this block doubles as
+                 # the brain's LIVE BOT STATE, so a live_params.json override
+                 # reaches every chat reply the moment it applies
+                 f"Alert watchlist: {', '.join(self.cfg.watchlist)}",
+                 f"Entry window: {cards.entry_window_ct(self.cfg)} "
+                 f"({self.cfg.entry_start:%H:%M}-{self.cfg.entry_end:%H:%M} ET)"]
         open_pos = [p for p in self.book.positions if p.state != "closed"]
         if open_pos:
             lines.append("Open positions:")
@@ -1093,8 +1097,9 @@ class Service:
     # explicit allow-list: ONLY these setups ever alert, so a backtest re-run
     # shifting the chosen bracket can never silently switch on a money-losing
     # put. Validated calls (incl. SPY, mirroring SPX) + the one probationary
-    # put; every other put tested as a net loser.
-    ALLOWED_SETUPS = {"SPX:call", "SPY:call", "QCOM:call", "TSLA:put"}
+    # put; every other put tested as a net loser. The literal lives in
+    # live_params.py so Service-less surfaces compute the same effective list.
+    ALLOWED_SETUPS = live_params.DEFAULT_ALLOWED_SETUPS
 
     def gate_stats(self, setup):
         """The eligibility filter: backtested win rate of 70+ (rounded the
@@ -1594,7 +1599,8 @@ class Service:
             take = assistant.respond(
                 {"chat_id": "newsdesk", "kind": "text",
                  "text": ("One sentence only, no invented numbers: what could "
-                          "this headline mean for SPX/QCOM/TSLA trades today? "
+                          "this headline mean for "
+                          f"{'/'.join(self.cfg.watchlist)} trades today? "
                           f"Headline: {title}")},
                 self.status_text(), tools_enabled=False)
             # only forward a genuine model answer. assistant.respond returns

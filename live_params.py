@@ -32,9 +32,10 @@ Deliberate boundaries:
   position monitoring, the morning card's news lines) and which tickers
   /calls and the bare-symbol shortcut treat as watched. TEXT surfaces that
   describe the rules (per-ticker /calls reads via market_tools, the brain's
-  prompts, the recap, the hardcoded window sentences in cards) still quote
-  the built-ins; see BACKLOG 'Surfaces that state the entry window...'
-  before relying on them after an override.
+  prompts, the recap, the window sentences in cards) render from the same
+  effective settings: modules with no Service handle call effective() here,
+  which reads this file fresh and falls back to the built-ins exactly like
+  reload_tunables().
 
 scanner.Service.reload_tunables() reads this file at boot and on every
 trading-date flip; the owner-only /reload command applies an edit
@@ -52,6 +53,12 @@ from strategy import StrategyConfig
 FILE_NAME = "live_params.json"
 KNOWN_KEYS = ("allowed_setups", "watchlist", "entry_start", "entry_end",
               "mom_bars")
+# The built-in alert allow-list. scanner.Service.ALLOWED_SETUPS points here;
+# it lives in this module so surfaces WITHOUT a Service handle (market_tools
+# reads, the nightly review, the recap) can compute the same effective
+# settings the scanner runs on, without importing the whole scanner.
+DEFAULT_ALLOWED_SETUPS = frozenset(
+    {"SPX:call", "SPY:call", "QCOM:call", "TSLA:put"})
 _TICKER_RE = re.compile(r"^[A-Z0-9.^=-]{1,10}$")
 _YF_SYMBOL_RE = re.compile(r"^[A-Za-z0-9.^=-]{1,15}$")  # ^GSPC, GC=F, BTC-USD
 MAX_WATCHLIST = 12          # a huge list would slow every 15s poll cycle
@@ -205,6 +212,46 @@ def load(p=None):
     if errors:
         return None, errors, True
     return out, [], True
+
+
+def apply(cfg, params, allowed=DEFAULT_ALLOWED_SETUPS):
+    """Overlay validated overrides onto cfg IN PLACE and return the effective
+    allow-list. The one mapping from file keys to live settings, shared by
+    scanner.reload_tunables() and effective() so they can never disagree."""
+    if "allowed_setups" in params:
+        allowed = params["allowed_setups"]
+    if "watchlist" in params:
+        cfg.watchlist = params["watchlist"]
+    if "entry_start" in params:
+        cfg.entry_start = params["entry_start"]
+    if "entry_end" in params:
+        cfg.entry_end = params["entry_end"]
+    if "mom_bars" in params:
+        cfg.mom_bars = params["mom_bars"]
+    return allowed
+
+
+def effective():
+    """(cfg, allowed_setups) exactly as the scanner sees them after a reload:
+    the StrategyConfig built-ins with any VALID live_params.json applied, and
+    deterministically the built-ins when the file is missing or invalid.
+    For surfaces that describe or replay the rules but hold no Service
+    (market_tools reads, learn, recap). Never raises."""
+    cfg = StrategyConfig()
+    allowed = DEFAULT_ALLOWED_SETUPS
+    try:
+        params, _errs, _exists = load()
+    except Exception:
+        params = None
+    if params:
+        allowed = apply(cfg, params)
+    return cfg, allowed
+
+
+def window_et(cfg) -> str:
+    """The effective entry window as compact ET text, e.g. '9:45-10:30'."""
+    return (f"{cfg.entry_start:%H:%M}".lstrip("0") + "-"
+            + f"{cfg.entry_end:%H:%M}".lstrip("0"))
 
 
 def summary(params):
