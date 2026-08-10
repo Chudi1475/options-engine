@@ -12,3 +12,4 @@ calendar_cache.json
 chat_history.json
 user_trades.json
 *.png
+logs/
