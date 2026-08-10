@@ -44,6 +44,7 @@ import positions as poslib
 import quotes
 import risk_gate
 import scoreboard
+import sniper_book
 import strategy_spec
 import telegram
 from backtest import expiry_for, realized_vol
@@ -1458,6 +1459,45 @@ class Service:
     SNIPER_READS = {"EURUSD=X": "eurusd", "JPY=X": "usdjpy",
                     "^GSPC": "spx", "TSLA": "tsla", "SPY": "spy"}
 
+    def _step_sniper(self, yfs: str, price, now: datetime):
+        """Mark one live price against an open sniper and text the exit if it
+        just closed. Never raises: a tracking fault must not stop the scan."""
+        try:
+            row = sniper_book.step(yfs, price, now)
+        except Exception as e:
+            print(f"{now:%H:%M:%S} sniper tracking error ({yfs}): {e}")
+            return
+        if not row:
+            return
+        dec = int(row.get("decimals", 2))
+        name = row.get("display") or yfs
+        reason, r_mult = row["exit_reason"], row.get("r")
+        if reason == "target":
+            head = f"✅ SNIPER TARGET HIT · {name} {row['direction']}"
+            body = (f"Out at {row['exit_price']:.{dec}f}. "
+                    f"That is the whole trade, all out as planned.")
+        elif reason == "stop":
+            head = f"🛑 SNIPER STOPPED · {name} {row['direction']}"
+            body = (f"Out at {row['exit_price']:.{dec}f}. "
+                    f"One full R. It happens, that is the plan working.")
+        else:
+            head = f"🔔 SNIPER SESSION END · {name} {row['direction']}"
+            body = (f"Closing flat at {row['exit_price']:.{dec}f}: neither the "
+                    "stop nor the target was reached and this pattern does "
+                    "not hold overnight.")
+        lines = [head, body,
+                 f"Entry was {row['entry']:.{dec}f} · stop {row['stop']:.{dec}f}"
+                 f" · target {row['target']:.{dec}f}"]
+        if isinstance(r_mult, (int, float)):
+            lines.append(f"Result: {r_mult:+.2f}R (best {row.get('mfe_r', 0):+.2f}R"
+                         f" · worst {row.get('mae_r', 0):+.2f}R)")
+        rec = sniper_book.record()
+        if rec["n"]:
+            lines.append(f"Live sniper record: {rec['wins']} of {rec['n']} "
+                         f"hit target, {rec['total_r']:+.2f}R total.")
+        lines.append("Your call.")
+        self.notify("\n".join(lines))
+
     def _scan_snipers_once(self, now: datetime):
         import fvg as fvg_mod
         import market_tools
@@ -1465,13 +1505,23 @@ class Service:
         day = f"{now:%Y-%m-%d}"
         for yfs in sorted(fvg_mod.SNIPER_SYMBOLS):
             key = f"{day}:{yfs}"
-            if key in alerted:
+            # A fired sniper still needs watching, so the once-a-day alert
+            # guard can no longer skip the read: it used to `continue` here and
+            # that is exactly the state in which the trade is live and
+            # unmonitored. Read when there is either a signal still to find OR
+            # a position to mark; one read serves both.
+            live = sniper_book.has_open(yfs)
+            if key in alerted and not live:
                 continue
             try:
                 r = market_tools.read_any(self.SNIPER_READS.get(yfs, yfs))
             except Exception:
                 continue
-            if not isinstance(r, dict) or r.get("conviction") != "high":
+            if not isinstance(r, dict):
+                continue
+            if live:
+                self._step_sniper(yfs, r.get("price"), now)
+            if key in alerted or r.get("conviction") != "high":
                 continue
             ticket = ((r.get("fvg") or {}).get("confirming") or {}).get("ticket")
             if not ticket:
@@ -1500,6 +1550,14 @@ class Service:
                        if ticket.get("target_structure") else ""))
             lines.append("One trade per symbol per day. Your call.")
             self.notify("\n".join(lines))
+            # Track it. Until this existed the bot texted a ticket and then
+            # went silent forever: no exit alert, and no way to ever know
+            # whether its own verified pattern actually won.
+            sniper_book.open_trade(
+                symbol=yfs, display=str(r.get("instrument", yfs)),
+                direction=d, entry=ticket["entry"], stop=ticket["stop"],
+                target=ticket["target"], day=day, time_et=f"{now:%H:%M:%S}",
+                decimals=dec)
             try:  # chart to everyone: upload once, fan out by file_id
                 import charts
                 img, _ = charts.render_fvg(r)

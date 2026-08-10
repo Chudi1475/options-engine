@@ -2369,6 +2369,89 @@ finally:
         config.STATE_FILE.unlink()
     config.STATE_FILE = _orig_state_file2
 
+# --- SNIPER exit lifecycle -------------------------------------------------
+# The sniper used to fire one card with entry/stop/target and then go silent
+# forever: no tracking, no exit alert, no record. The bot promoted it as the
+# verified 79% pattern while being structurally unable to observe one outcome.
+import sniper_book
+
+_orig_sniper_ledger = sniper_book.LEDGER
+try:
+    sniper_book.LEDGER = config.DATA_DIR / "sniper_positions_test.json"
+    if sniper_book.LEDGER.exists():
+        sniper_book.LEDGER.unlink()
+
+    # a BUY: stop below, target above (0.4R on a risk of 10.0)
+    row = sniper_book.open_trade("SPY", "SPY", "BUY", entry=100.0, stop=90.0,
+                                 target=104.0, day="2026-08-10",
+                                 time_et="10:00:00")
+    check("sniper: a fired alert is now tracked", row is not None
+          and sniper_book.has_open("SPY"))
+    check("sniper: one live trade per symbol, as measured",
+          sniper_book.open_trade("SPY", "SPY", "BUY", 100.0, 90.0, 104.0,
+                                 "2026-08-10", "10:05:00") is None)
+
+    # drifting price neither exits nor loses the excursion
+    check("sniper: a mid-trade price does not close it",
+          sniper_book.step("SPY", 101.5,
+                           datetime(2026, 8, 10, 10, 5, tzinfo=ET)) is None)
+    check("sniper: best excursion is recorded while open",
+          abs(sniper_book.open_rows()[0]["mfe_r"] - 0.15) < 1e-6)
+
+    # target -> a win booked at exactly the ticket's target, +0.4R
+    done = sniper_book.step("SPY", 104.2,
+                            datetime(2026, 8, 10, 11, 0, tzinfo=ET))
+    check("sniper: hitting target closes the trade and reports it",
+          done is not None and done["exit_reason"] == "target"
+          and abs(done["r"] - 0.4) < 1e-9 and done["exit_price"] == 104.0)
+    check("sniper: a closed trade is no longer monitored",
+          not sniper_book.has_open("SPY"))
+
+    # a SELL is the mirror image: target BELOW entry, stop ABOVE
+    sniper_book.open_trade("TSLA", "TSLA", "SELL", entry=300.0, stop=310.0,
+                           target=296.0, day="2026-08-10", time_et="10:00:00")
+    check("sniper: a SELL ticket pointing the wrong way is refused",
+          sniper_book.open_trade("EURUSD=X", "EUR/USD", "SELL", 1.10, 1.05,
+                                 1.12, "2026-08-10", "10:00:00") is None)
+    d2 = sniper_book.step("TSLA", 295.0,
+                          datetime(2026, 8, 10, 11, 0, tzinfo=ET))
+    check("sniper: SELL hits target on the way DOWN",
+          d2 is not None and d2["exit_reason"] == "target"
+          and abs(d2["r"] - 0.4) < 1e-9)
+
+    # stop wins a tie, exactly as the backtest scored a bar spanning both
+    sniper_book.open_trade("SPY", "SPY", "BUY", 100.0, 90.0, 104.0,
+                           "2026-08-11", "10:00:00")
+    tie = sniper_book.step("SPY", 89.0,
+                           datetime(2026, 8, 11, 11, 0, tzinfo=ET))
+    check("sniper: the stop books a full -1R", tie is not None
+          and tie["exit_reason"] == "stop" and tie["r"] == -1.0)
+
+    # nothing spans a session: still open at 15:55 ET closes flat, never a win
+    sniper_book.open_trade("SPY", "SPY", "BUY", 100.0, 90.0, 104.0,
+                           "2026-08-12", "10:00:00")
+    eod = sniper_book.step("SPY", 101.0,
+                           datetime(2026, 8, 12, 15, 55, tzinfo=ET))
+    check("sniper: an unresolved trade settles flat at session end",
+          eod is not None and eod["exit_reason"] == "session end"
+          and abs(eod["r"] - 0.1) < 1e-9)
+
+    # the live record stays separate from the options book's win rate
+    rec = sniper_book.record()
+    check("sniper: the live record counts only target hits as wins",
+          rec["n"] == 4 and rec["wins"] == 2 and rec["losses"] == 1
+          and rec["flats"] == 1 and rec["win_pct"] == 50.0)
+    check("sniper: total R sums every closed trade",
+          abs(rec["total_r"] - (0.4 + 0.4 - 1.0 + 0.1)) < 1e-6)
+
+    # survives a restart
+    check("sniper: the ledger persists across a reload",
+          len(sniper_book._read()) == 4)
+finally:
+    if sniper_book.LEDGER.exists():
+        sniper_book.LEDGER.unlink()
+    sniper_book.LEDGER = _orig_sniper_ledger
+
 # --- est_entry backfill: throttled vol at entry no longer kills the stop ---
 # If the vol download was throttled at entry, est_entry was stored 0.0 and
 # est_pct stayed None for the position's whole life; the first stale/bid-less
