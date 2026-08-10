@@ -2325,6 +2325,44 @@ try:
     svc.maybe_learn(datetime(2026, 6, 13, 10, 0, tzinfo=ET))
     check("catchup: dry mode never runs or marks",
           config.state_get("learn_sent") == "2026-06-11")
+
+    # LEARN_ENABLED=false switches the nightly review off entirely. It is the
+    # bot's most expensive job (learn.run plus up to 25 deep trade reviews via
+    # review_history, so ~26 API calls a night whether or not anyone texted
+    # it), and the owner needs an off switch that leaves alerts, exits, the
+    # forward ledger and the chat brain untouched. Runs last: it mutates the
+    # shared lruns/learn_sent the catch-up assertions above depend on.
+    svc.dry = False
+    # an earlier case swapped learn.run for a delivery-failure stub that no
+    # longer records calls; put the recording one back so "did it run?" is
+    # observable again
+    learn.run = lambda require_date=None, dry=False: lruns.append(require_date) or []
+    config.state_set("learn_tries", {})
+    _orig_learn_env = os.environ.get("LEARN_ENABLED")
+    try:
+        os.environ["LEARN_ENABLED"] = "false"
+        config.state_set("learn_sent", None)
+        config.state_set("morning_sent", "2026-06-16")
+        _n = len(lruns)
+        svc.maybe_learn(datetime(2026, 6, 16, 23, 50, tzinfo=ET))
+        check("learn kill switch: LEARN_ENABLED=false skips the review",
+              len(lruns) == _n)
+        # marked done, so flipping it back on later reviews that night rather
+        # than back-filling every night skipped while it was off
+        check("learn kill switch: skipped session is marked, not queued",
+              config.state_get("learn_sent") == "2026-06-16")
+
+        # unset env keeps the old behavior exactly: the review still runs
+        del os.environ["LEARN_ENABLED"]
+        config.state_set("learn_sent", None)
+        svc.maybe_learn(datetime(2026, 6, 16, 23, 55, tzinfo=ET))
+        check("learn kill switch: default stays ON when env is unset",
+              len(lruns) == _n + 1)
+    finally:
+        if _orig_learn_env is None:
+            os.environ.pop("LEARN_ENABLED", None)
+        else:
+            os.environ["LEARN_ENABLED"] = _orig_learn_env
 finally:
     learn.run = _orig_learn_run
     if config.STATE_FILE.exists():

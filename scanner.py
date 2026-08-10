@@ -44,6 +44,7 @@ import positions as poslib
 import quotes
 import risk_gate
 import scoreboard
+import strategy_spec
 import telegram
 from backtest import expiry_for, realized_vol
 from data_feed import DataFeed
@@ -283,7 +284,7 @@ class Service:
         # shadow garbage comparisons — degrade to the built-in default instead
         loaded = (self.backtest_old or {}).get("bracket")
         self.old_bracket = (dict(loaded) if poslib.valid_bracket(loaded)
-                            else {"target_pct": 15, "stop_pct": -60})
+                            else dict(poslib.DEFAULT_OLD_BRACKET))
         self.cfg = StrategyConfig()
         # Owner-tunable live settings (live_params.json on DATA_DIR): the
         # no-redeploy path for the knobs that used to be frozen in code.
@@ -1177,9 +1178,9 @@ class Service:
                         pass
                     self.notify(
                         f"⏭️ Standing aside today: SPX opened {gap:+.1f}% "
-                        "above yesterday's close. Big gap-up days lose money "
-                        "for this playbook (won just 57 of 100 in testing vs "
-                        "our usual 74). No entry alerts today; open positions "
+                        f"above yesterday's close. "
+                        f"{strategy_spec.get().gap_skip_sentence()}. "
+                        "No entry alerts today; open positions "
                         "still get managed to the close.")
                 return
         opened = self.book.opened_today(now.date())
@@ -1720,6 +1721,16 @@ class Service:
         if self.dry:
             return
         key = str(learn_session_due(now))
+        if not config.learn_enabled():
+            # Owner switched the nightly review off (LEARN_ENABLED=false).
+            # Mark the session done so flipping it back on later reviews
+            # tonight rather than back-filling every skipped night at once,
+            # and stay quiet: this is a deliberate setting, not an outage.
+            if config.state_get("learn_sent") != key:
+                config.state_set("learn_sent", key)
+                print(f"{now:%H:%M:%S} learn: nightly review is OFF "
+                      f"(LEARN_ENABLED=false); skipping {key}")
+            return
         if config.state_get("learn_sent") == key:
             return
         if not self.book.for_date(key) \

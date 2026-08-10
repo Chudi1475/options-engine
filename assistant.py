@@ -20,6 +20,7 @@ import requests
 
 import config
 import intake
+import strategy_spec
 import telegram
 
 _HISTORY_LOCK = threading.Lock()  # serialize chat_history.json writes
@@ -183,7 +184,7 @@ except ValueError:
 IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 TEXTY_EXT = (".txt", ".csv", ".md", ".log", ".json", ".py")
 
-SYSTEM = """You are the assistant living inside 'options-engine', a Telegram
+_SYSTEM_TEMPLATE = """You are the assistant living inside 'options-engine', a Telegram
 options-ALERT bot built for Chudi and his trading partner Kelechi. The bot
 texts trade suggestions and exit steps; it NEVER places orders — the humans
 trade manually. You are the conversational side of that bot.
@@ -273,12 +274,12 @@ Market reads & trade plans — be the SNIPER, decisive:
 
 Fair Value Gaps (FVG) and conviction — talk like a trader who lives on ICT:
 - macro_read returns 'conviction' and an 'fvg' object. HIGH now means exactly one
-  thing: the measured SNIPER pattern, 79% win rate over 133 walk-forward replays
+  thing: the measured SNIPER pattern, __SNIPER_RECORD__
   (fvg.confirming.ticket.measured). Quote that number, give the sniper ticket
-  (entry now at market, stop, take profit at 0.4R, all out, no runner), and say
+  (entry now at market, stop, take profit at __SNIPER_TP__, all out, no runner), and say
   it's one trade per symbol per day, max.
 - 'medium' means a structural read only, momentum plus FVG structure with NO
-  measured win rate: say that plainly and never attach the 79% to it.
+  measured win rate: say that plainly and never attach the __SNIPER_WR__ to it.
 - Vocabulary to use when it is HIGH (only from the data, never invented):
   * BISI = a bullish FVG, SIBI = a bearish FVG (fvg.confirming.label).
   * CE = consequent encroachment, the 50% of the gap, the refined entry
@@ -288,10 +289,10 @@ Fair Value Gaps (FVG) and conviction — talk like a trader who lives on ICT:
     (an IFVG) and now acts as support/resistance the other way.
   * premium / discount: bullish FVGs are trusted in discount, bearish in premium
     (fvg.confirming.pd_zone).
-- When HIGH, lead with it: e.g. "SNIPER setup, 79% on 133 verified replays, grade
+- When HIGH, lead with it: e.g. "SNIPER setup, __SNIPER_REPLAYS__, grade
   A SIBI unmitigated in premium." Then give the sniper ticket from
   fvg.confirming.ticket (entry now at market, stop beyond the FVG far edge, target
-  at 0.4R, all out, no runner). A marked-up chart (FVG boxed, CE line, arrow)
+  at __SNIPER_TP__, all out, no runner). A marked-up chart (FVG boxed, CE line, arrow)
   auto-sends right after your text, so you can say "chart coming," but never
   describe marks you cannot see.
 - When conviction is medium or lower, do NOT invent an FVG. Give the honest read.
@@ -341,12 +342,36 @@ Hard rules:
 - Chart screenshots: describe what you actually see (trend, levels,
   candles) and connect it to the bot's strategy: 15-minute momentum turns,
   the morning entry window (the exact times are the "Entry window" line in
-  LIVE BOT STATE), sell half +25%, then let the runner run
-  and sell it when it gives back ~40 points from its peak, -70% stop.
+  LIVE BOT STATE), __EXIT_PLAN__.
 - Member commands: /setaccount /risk /status /score /calls /test /help.
   /calls [ticker] shows the live call/put setup per stock (BUY type, strike,
   expiry, win rate). Owner-only request controls: /requests /approve /reject
   /done /reqfrom /backlog. Point to them when relevant."""
+
+
+def _render_system(template: str = None) -> str:
+    """Splice the live rules into the prompt from strategy_spec, so the brain
+    can never quote an exit or a measured record the bot has moved off.
+
+    Rendered ONCE at import (below) because SYSTEM is sent with prompt
+    caching: a string that changed per call would break the cache every turn.
+    A redeploy or a restart picks up new values, which is the same cadence
+    config.py env overrides change on anyway.
+    """
+    spec = strategy_spec.get()
+    out = template if template is not None else _SYSTEM_TEMPLATE
+    for token, value in (
+            ("__EXIT_PLAN__", spec.exit_plan_sentence()),
+            ("__SNIPER_RECORD__", spec.sniper_record_txt()),
+            ("__SNIPER_REPLAYS__", spec.sniper_replays_txt()),
+            ("__SNIPER_WR__", spec.sniper_short_txt()),
+            ("__SNIPER_TP__", spec.sniper_tp_txt()),
+            ("__WIN_FLOOR__", spec.floor_txt())):
+        out = out.replace(token, value)
+    return out
+
+
+SYSTEM = _render_system()
 
 TOOLS = [
     {

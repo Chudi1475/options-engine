@@ -18,3 +18,4 @@ chat_history.json
 user_trades.json
 user_trades_test.json
 *.tmp
+logs/

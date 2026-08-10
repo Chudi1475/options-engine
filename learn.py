@@ -19,7 +19,7 @@ day instead of evaporating overnight.
 
 Guardrail: this NEVER auto-changes a trade rule, threshold, or the allow-list.
 If a lesson implies a rule change, it is PROPOSED to the owner in the nightly
-digest for a human to approve. The bot keeps its picky filter and 70% win-rate
+digest for a human to approve. The bot keeps its picky filter and its win-rate
 floor until Chudi says otherwise. Proposals are tracked in state.json with a
 status (pending, approved, rejected): a repeat of a pending idea is counted,
 not re-pitched every night, /proposals lists and decides everything on the
@@ -44,6 +44,7 @@ from zoneinfo import ZoneInfo
 
 import config
 import live_params
+import strategy_spec
 import telegram
 from positions import PositionBook
 from strategy import StrategyConfig
@@ -288,9 +289,8 @@ def grade_day(session_date):
 _REVIEWER_TEMPLATE = """You are the trading brain of 'options-engine' doing your
 own nightly review. You trade a 15-minute momentum continuation method on 0DTE
 options (the 'Kelechi' style): spot the morning push in the __WINDOW__ ET
-window, ride the continuation, sell half at +25%, let the runner run and sell
-when it gives back ~40 points from its peak, hard stop at -70%. You only alert
-__NAMES__ and only above a 70% backtested win rate.
+window, ride the continuation, __EXIT_PLAN__. You only alert
+__NAMES__ and only above a __WIN_FLOOR__ backtested win rate.
 
 Tonight you are grading YOUR OWN calls to get sharper. Be brutally honest with
 yourself, like a trader journaling after the close. Find the real pattern
@@ -322,9 +322,16 @@ null."""
 
 
 def _render_reviewer(cfg) -> str:
+    # the exit rules and the win-rate floor come from strategy_spec for the
+    # same reason the window and names do: the reviewer has to grade against
+    # the rules actually running, or it proposes changes to a bracket that
+    # already moved
+    spec = strategy_spec.get()
     return (_REVIEWER_TEMPLATE
             .replace("__WINDOW__", live_params.window_et(cfg))
-            .replace("__NAMES__", ", ".join(cfg.watchlist)))
+            .replace("__NAMES__", ", ".join(cfg.watchlist))
+            .replace("__EXIT_PLAN__", spec.exit_plan_sentence())
+            .replace("__WIN_FLOOR__", spec.floor_txt()))
 
 
 REVIEWER_SYSTEM = _render_reviewer(StrategyConfig())
@@ -869,10 +876,11 @@ def _rebuild_digest():
         pin = (f"FOR TODAY (my watch line from the {tag} review): "
                f"{latest[1]}\n\n")
     window = live_params.window_et(live_params.effective()[0])
+    spec = strategy_spec.get()
     header = ("These are my own observations from grading my calls night after "
               "night. Apply them when reading setups. They NEVER override the "
-              f"hard rules ({window} entry window, 70% win-rate floor, sell "
-              "half at +25%, give-back 40 off peak, -70% stop).\n")
+              f"hard rules ({window} entry window, {spec.floor_txt()} "
+              f"win-rate floor, {spec.exit_plan_short()}).\n")
     body = "\n".join(f"- ({tag}) {lesson}" for tag, lesson in bullets) or "- (none yet)"
     LESSONS_DIGEST.write_text(header + "\n" + pin + body + "\n", encoding="utf-8")
 

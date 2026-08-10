@@ -21,6 +21,8 @@ the text card. Pictures are a bonus, never a blocker.
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import strategy_spec
+
 ET = ZoneInfo("America/New_York")
 CT = ZoneInfo("America/Chicago")  # Chudi's time: every displayed time is Central
 
@@ -564,7 +566,9 @@ def render_fvg(r: dict, bars=None):
 
         # ---------------- cosmetics ----------------
         name = r.get("instrument") or r.get("ticker") or symbol
-        title = str(name) + ("  SNIPER · 79% verified" if sniper else "")
+        _spec = strategy_spec.get()
+        title = str(name) + (f"  SNIPER · {_spec.sniper_short_txt()}"
+                             if sniper else "")
         fig.text(0.055, 0.965, title, color=_TXT, fontsize=15.5,
                  fontweight="bold", ha="left", va="top")
         prior = r.get("prior_close")
@@ -578,7 +582,8 @@ def render_fvg(r: dict, bars=None):
                      ha="left", va="top")
         if sniper:
             rconf = rfvg.get("confirming") or {}
-            info = "79% on 133 replays · TP 0.4R all out"
+            info = (f"{_spec.sniper_replays_txt()} · "
+                    f"TP {_spec.sniper_tp_txt()} all out")
             if rconf.get("grade") and rconf.get("label"):
                 info = f"grade {rconf['grade']} {rconf['label']} · " + info
             fig.text(0.055, line2_y - 0.028, info,

@@ -27,6 +27,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import config
+import strategy_spec
 from positions import PositionBook, valid_bracket
 
 REPORTS_DIR = Path(__file__).parent / "reports"
@@ -84,7 +85,9 @@ def stats_for_card(ticker: str, direction: str, book: PositionBook,
     if new:
         s = dict(new)
         s["ev_pct"] = s["expectancy_pct"]  # slippage+fees already inside
-        s["label"] = "NEW-RULES BACKTEST, approx pricing — live stats take over after 30 signals"
+        s["label"] = ("NEW-RULES BACKTEST, approx pricing — live stats take "
+                      f"over after {strategy_spec.get().live_stats_min_total} "
+                      "signals")
         s["costs_note"] = "after est. costs"
         s["source"] = "backtest_new"
         s["old_win_rate"] = old["win_rate"] if old else None
@@ -92,7 +95,8 @@ def stats_for_card(ticker: str, direction: str, book: PositionBook,
     if old:
         s = dict(old)
         s["ev_pct"] = s["expectancy_pct"]
-        s["label"] = "OLD-RULES BACKTEST — live stats take over after 30 signals"
+        s["label"] = ("OLD-RULES BACKTEST — live stats take over after "
+                      f"{strategy_spec.get().live_stats_min_total} signals")
         s["costs_note"] = "after est. costs"
         s["source"] = "backtest_old"
         return s

@@ -17,6 +17,7 @@ import cards
 import config
 import live_params
 import scoreboard
+import strategy_spec
 from backtest import (CONTRACTS, SLIPPAGE, bs_price, expiry_for, realized_vol,
                       years_to_expiry)
 from backtest_new_rules import simulate_new_exits
@@ -139,8 +140,9 @@ def _day_5m(yf_symbol, day: date):
 
 
 def _gate_ok(ticker, direction, allowed=None):
-    """Same eligibility the live scanner uses: on the alert allow-list, with
-    a rounded 70%+ win rate AND positive expectancy under our real exits.
+    """Same eligibility the live scanner uses: on the alert allow-list, with a
+    rounded win rate at or above the live floor (config.MIN_WINRATE) AND
+    positive expectancy under our real exits.
     `allowed` is the effective allow-list; None resolves it fresh so a setup
     the owner just removed stops reading as alert-worthy."""
     if allowed is None:
@@ -295,7 +297,8 @@ def analyze_day(ticker="SPX", date_str=None, cfg=None, allowed=None):
         else:
             result["why_skipped"] = (f"A {f['direction']} setup formed at "
                                      f"{f['time']}, but it doesn't clear the "
-                                     "70%-win-rate + positive-expectancy bar, so "
+                                     f"{strategy_spec.get().floor_txt()}"
+                                     "-win-rate + positive-expectancy bar, so "
                                      "the bot would skip it rather than force a "
                                      "weak trade.")
     overview["result"] = result
@@ -556,6 +559,7 @@ def _do_read(disp, yfs, dec, kind, source):
     PLAN, plus high-impact news. Real numbers only (yfinance, ~15-min delayed;
     when Alpaca keys are set, plain stocks upgrade in place to the same
     real-time IEX feed the live scanner trades from)."""
+    _spec = strategy_spec.get()   # the sniper record + target the brain quotes
     tried = [yfs]
     try:
         d1 = _flatten(yf.download(yfs, period="1mo", interval="1d",
@@ -871,20 +875,23 @@ def _do_read(disp, yfs, dec, kind, source):
                 "The 'conviction' field tells you how hard to lean. 'high' means "
                 "exactly one thing: this read passed the verified SNIPER pattern "
                 "(fvg.sniper true) and its measured record is in "
-                "fvg.confirming.ticket.measured: 79.0% win rate over 133 "
-                "walk-forward replays (chart_backtest_round6). Quote that measured "
+                f"fvg.confirming.ticket.measured: {_spec.sniper_record_txt()} "
+                "(chart_backtest_round6). Quote that measured "
                 "number when and ONLY when conviction is high, and give the sniper "
                 "ticket from fvg.confirming.ticket: entry (market, now), stop, "
-                "target (take profit at 0.4R, all out, no runner), one trade per "
+                f"target (take profit at {_spec.sniper_tp_txt()}, all out, no "
+                "runner), one trade per "
                 "symbol per day. The ticket may also carry target_1r, target_2r "
                 "and target_structure: bigger paydays from the SAME entry and "
                 "stop. Those have NO measured win rate yet (the bot grades them "
                 "forward nightly to earn one); if asked about bigger targets, "
-                "quote them WITH that honesty note, never with the 79. When conviction is 'medium' the plan stands on "
+                f"quote them WITH that honesty note, never with the "
+                f"{_spec.sniper_short_txt()}. When conviction is 'medium' the plan stands on "
                 "structure/momentum alone: say plainly it has NO measured win rate "
                 "(fvg.sniper_reasons lists what failed the sniper gate). You may "
                 "still describe the FVG in fvg.confirming (grade, BISI/SIBI, CE, "
-                "premium/discount) at any conviction, but never attach the 79% to "
+                f"premium/discount) at any conviction, but never attach the "
+                f"{_spec.sniper_short_txt()} to "
                 "a non-sniper read. A marked-up FVG chart is auto-sent right after "
                 "your text. Never invent an FVG or its levels; only cite what "
                 "'fvg' returned.",

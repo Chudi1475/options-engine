@@ -1,0 +1,56 @@
+# Task completion documents
+.claude/completions/**
+
+# Session files
+.claude/sessions/**
+
+# Archived documentation
+docs/archive/**
+
+# User-facing docs (not needed during dev sessions — devs have CLAUDE.md)
+CHANGELOG.md
+README.md
+CONTRIBUTING.md
+GEMINI.md
+AGENTS.md
+.cursorrules
+.windsurfrules
+.clinerules
+.roomodes
+
+# Git
+.git/**
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/**
+
+# OS
+.DS_Store
+
+
+# options-engine: runtime state, data, heavy docs (load on demand)
+.venv/
+__pycache__/
+logs/
+reports/
+data/
+*.log
+*.jsonl
+positions.json
+state.json
+chat_history.json
+calendar_cache.json
+user_trades.json
+bt_exp_*.json
+_racetest_state.*
+GUIDE.txt
+BACKLOG.md
+DEPLOY.md
+DATA_VENDORS.md
+SELF_IMPROVE.md

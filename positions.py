@@ -98,6 +98,14 @@ class Position:
         return f"{self.ticker}:{self.direction}"
 
 
+# The old-rules shadow bracket used when the report's own bracket is missing
+# or unreadable. Defined once here (scanner, recap and strategy_spec all read
+# it) so the fallback can never disagree with itself across files. The VALUE is
+# unchanged from the copies it replaces; the normal path still prefers the
+# bracket in reports/backtest_results.json.
+DEFAULT_OLD_BRACKET = {"target_pct": 15, "stop_pct": -60}
+
+
 def valid_bracket(b) -> bool:
     """A usable old-rules bracket: a dict with real finite numbers on both
     legs. bool IS an int to isinstance, and json.loads parses NaN/Infinity

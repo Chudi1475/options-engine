@@ -94,6 +94,19 @@ def paper_mode() -> bool:
     return os.environ.get("PAPER_MODE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def learn_enabled() -> bool:
+    """Whether the nightly self-review runs. Defaults ON, so a missing env var
+    behaves exactly as before; set LEARN_ENABLED=false to stop it.
+
+    This is the single most expensive thing the bot does: learn.run reviews the
+    day's calls AND deep-reviews up to 25 closed trades (learn.review_history),
+    so one night is ~26 API calls whether or not anyone texted the bot. Alerts,
+    exits, charts, the forward ledger and the chat brain are all unaffected —
+    this flag gates the nightly job only."""
+    return os.environ.get("LEARN_ENABLED", "").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
 class _StateUnavailable(Exception):
     """state.json exists but is momentarily unreadable (e.g. a volume hiccup).
     Raised on a WRITE path so we refuse to clobber real state with one key."""
@@ -227,7 +240,8 @@ def account_value():
 
 def suggested_alloc_pct(risk_pct: float) -> float:
     """% of account to put in so a full stop-out costs exactly risk_pct.
-    Derived from the live STOP_PCT — e.g. risk 1% / stop 70% -> ~1.43%."""
+    Derived from the live STOP_PCT, so a wider stop means a SMALLER position
+    for the same dollar risk. strategy_spec.sizing_sentence() renders it."""
     stop = abs(STOP_PCT) / 100.0
     if stop <= 0:  # guard a STOP_PCT=0 env override from dividing by zero
         stop = 0.70

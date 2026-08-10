@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 
 import config
 import fvg
+import strategy_spec
 
 TIERS = [
     (85.0, "🟢🌟", "GREAT ODDS"),
@@ -191,13 +192,15 @@ def _conviction_line(r: dict) -> str:
         dec = r.get("decimals", 2)
         tk = conf.get("ticket") or {}
         if all(tk.get(k) is not None for k in ("entry", "stop", "target")):
-            sm = fvg.SNIPER_MEASURED
-            return (f"SNIPER setup: wins {sm['win_rate']:.0f} of 100 "
-                    f"({sm['trades']} replays). "
+            spec = strategy_spec.get()
+            return (f"SNIPER setup: wins {spec.sniper.of_100()} "
+                    f"({spec.sniper.trades} replays). "
                     f"entry {fmt_lvl(tk['entry'], dec)}, "
                     f"stop {fmt_lvl(tk['stop'], dec)}, "
                     f"target {fmt_lvl(tk['target'], dec)} "
-                    "(0.4R: a win banks 40% of what the stop risks). chart coming.")
+                    f"({spec.sniper_tp_txt()}: a win banks "
+                    f"{spec.sniper_tp_r * 100:g}% of what the stop risks). "
+                    "chart coming.")
         # high without a sniper ticket should not happen; stay honest, no
         # measured claim, just the structure in plain words
         side = "bullish" if conf["polarity"] == "bull" else "bearish"
@@ -361,15 +364,21 @@ def _winrate_footer(stats: dict) -> str:
         # the 70/75/80/85 tier bar belongs to the OLD-rules gate that
         # qualified this setup; the new exits trade win count for win size
         emoji, label = tier_for(stats["old_win_rate"])
-        return (f"{emoji} Setup tier: {label}. The old +15% target / -60% stop "
+        old = strategy_spec.get().old_bracket_txt()
+        return (f"{emoji} Setup tier: {label}. The old {old} "
                 f"exits won {stats['old_win_rate']:.0f} of 100; the new exits "
                 f"win {stats['win_rate']:.0f} of 100, so they win less often "
                 f"but each win is bigger ({stats['trades']} trades "
                 f"{stats['start']}-{stats['end']}, prices modeled, not real fills)")
     emoji, label = tier_for(stats["win_rate"])
+    # name the exits these stats were actually measured under: the old-rules
+    # report has a bracket, the new-rules report has the give-back rules
+    exits = (f"the old {strategy_spec.get().old_bracket_txt()} exits"
+             if stats["source"] != "backtest_new"
+             else f"the {strategy_spec.get().exit_plan_short()} exits")
     return (f"{emoji} Tested: wins {stats['win_rate']:.0f} of 100, {label} "
             f"({stats['trades']} trades {stats['start']}-{stats['end']}, "
-            "the old +15% target / -60% stop exits, prices modeled, not real fills)")
+            f"{exits}, prices modeled, not real fills)")
 
 
 def entry_card(setup, pos, quote, stats: dict, risk_mode: str,
@@ -400,8 +409,8 @@ def entry_card(setup, pos, quote, stats: dict, risk_mode: str,
     lines.append(f"1️⃣ SELL HALF at +{config.TP_HALF_PCT:g}%")
     gb = config.RUNNER_GIVEBACK_PCT
     lines.append(f"2️⃣ let the rest RUN. I text you to sell when its gain drops "
-                 f"{gb:g} points from its peak (example: +60% falling to "
-                 f"+{60 - gb:g}%)")
+                 f"{gb:g} points from its peak "
+                 f"({strategy_spec.get().giveback_example()})")
     lines.append(f"3️⃣ STOP: {config.STOP_PCT:g}% → sell everything")
     if expiry == today:
         lines.append(f"4️⃣ expires today → I warn you "

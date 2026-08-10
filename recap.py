@@ -29,6 +29,8 @@ import yfinance as yf
 
 import config
 import live_params
+import positions as poslib
+import strategy_spec
 import telegram
 from backtest import SLIPPAGE, bs_price, realized_vol
 from positions import PositionBook
@@ -268,7 +270,12 @@ def main(require_date=None):
     # owner added via live_params.json grades against its real Yahoo symbol
     cfg = live_params.effective()[0]
     backtest = load_report("backtest_results.json")
-    bracket = (backtest or {}).get("bracket", {"target_pct": 15, "stop_pct": -60})
+    # validated, not trusted, and falling back to the ONE shared default:
+    # a present-but-null "bracket" makes .get's default unreachable, so the
+    # old code handed None straight to bracket["target_pct"] below
+    _loaded = (backtest or {}).get("bracket")
+    bracket = (dict(_loaded) if poslib.valid_bracket(_loaded)
+               else dict(poslib.DEFAULT_OLD_BRACKET))
 
     spx = fetch_5m("^GSPC")
     session = max(set(spx.index.date))
@@ -342,15 +349,24 @@ def main(require_date=None):
             lines.append(story)
 
     if not pos_today and not legacy:
-        first_hr = spx_day[spx_day.index.time <= pd.Timestamp("10:30").time()]
+        first_hr = spx_day[spx_day.index.time <= cfg.entry_end]
         drift = pct(float(first_hr["Close"].iloc[-1]), float(first_hr["Open"].iloc[0])) \
             if len(first_hr) else 0.0
         if drift < 0:
-            why_quiet = ("the morning was moving DOWN, and the only setups that "
-                         "pass our filter right now are call (up) setups")
+            # name the down-side setups off the live allow-list: saying "we only
+            # alert calls" was wrong the moment a put joined the list
+            puts = sorted(s.split(":")[0] for s in
+                          strategy_spec.get().allowed_setups
+                          if s.endswith(":put"))
+            why_quiet = (("the morning was moving DOWN, and the only down-side "
+                          f"setup we alert is {', '.join(puts)}, which never "
+                          "triggered") if puts else
+                         ("the morning was moving DOWN, and every setup on our "
+                          "allow-list is a call (up) setup"))
         else:
-            why_quiet = ("no setup cleared our quality bar (wins at least 70 "
-                         "of 100 in testing) during the morning window")
+            why_quiet = (f"no setup cleared our quality bar "
+                         f"({strategy_spec.get().floor_sentence()}) "
+                         "during the morning window")
         lines.append(f"OUR TRADES TODAY: none. The bot stayed quiet because {why_quiet}. "
                      "No text = no trade. Sitting out is a position too.")
 
