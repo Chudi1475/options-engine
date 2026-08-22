@@ -168,6 +168,7 @@ class Service:
         self.premarket_sent_for = None
         self.heartbeat = 0
         self._last_feed_ok = None       # last time a bars fetch returned data
+        self._last_feed_try = None      # last time a bars fetch was attempted
         self._health_last_stamp = 0.0   # monotonic; throttles the alive-stamp
         self._feed_warned = False       # in-memory: feed-stale DM already sent
         self._feed_none_warned = False  # in-memory: no-data-yet DM already sent
@@ -182,7 +183,7 @@ class Service:
         try:
             errors = telegram.send(text)
         except RuntimeError as e:  # e.g. no chat IDs configured — fail LOUD and
-            print(f"send failed ({e}) — queueing for retry")  # queue, don't drop
+            print(f"send failed ({e}), queueing for retry")  # queue, don't drop
             errors = [str(e)]
         log_alert(text, errors)
         if errors:
@@ -278,7 +279,7 @@ class Service:
                 if prev is not None and fresh != prev:
                     print(f"reloaded {name}: stats changed overnight")
             elif prev is not None:
-                print(f"{name} unreadable on reload — keeping previous stats")
+                print(f"{name} unreadable on reload, keeping previous stats")
         # the report's bracket is validated, not trusted: a hand-corrupted
         # "bracket": null (present key, so .get's default never applies) or
         # bool/NaN legs would crash entry pinning with dict(None) or feed the
@@ -348,7 +349,7 @@ class Service:
                     raise ValueError("no daily data")
                 self.daily_closes[ticker] = closes
             except Exception as e:
-                print(f"{ticker}: daily download failed ({e}) — retry in 5 min")
+                print(f"{ticker}: daily download failed ({e}), retry in 5 min")
                 self.daily_closes[ticker] = None
                 self._sigma_retry[ticker] = time_mod.time() + 300
                 return 0.0
@@ -361,6 +362,7 @@ class Service:
         if hit and (now - hit[0]).total_seconds() < config.POLL_SECONDS - 2:
             bars = hit[1]
         else:
+            self._last_feed_try = now  # a real fetch happened (feed-dead check)
             bars = self.feed.today_bars(yfs, now)
             self._bars_cache[yfs] = (now, bars)
         if bars is not None and not bars.empty:
@@ -450,7 +452,7 @@ class Service:
                 f"⚠️ Heartbeat: I was down ~{gap:.0f} min "
                 f"({last.astimezone(CT):%I:%M}–{now.astimezone(CT):%I:%M %p} CT) "
                 "during market hours. "
-                "Back up now — check for any missed alerts.")
+                "Back up now. Check for any missed alerts.")
 
     def health_check(self, now: datetime):
         """Once-a-cycle, in-session health checks. Owner-only DMs."""
@@ -460,20 +462,29 @@ class Service:
         if now.weekday() >= 5 or not (MONITOR_START <= now.time() <= time(16, 0)):
             return
         last_ok = self._last_feed_ok
+        last_try = self._last_feed_try
         if last_ok is None:  # no data has loaded at all this session
-            if now.time() >= time(10, 0) and not self._feed_none_warned:
+            if (now.time() >= time(10, 0) and not self._feed_none_warned
+                    and last_try is not None):
                 self._feed_none_warned = True
                 self._hb_owner(
-                    "⚠️ Heartbeat: no market data has loaded yet this session — "
-                    "the feed may be down. No setups can fire until it recovers.")
+                    "⚠️ Heartbeat: no market data has loaded yet this session. "
+                    "The feed may be down. No setups can fire until it recovers.")
             return
         self._feed_none_warned = False
         stale = (now - last_ok).total_seconds() / 60
-        if stale >= self.FEED_STALE_MIN and not self._feed_warned:
+        # Only a fetch that was TRIED and came back empty means the feed is
+        # dead. With no open position and the entry window shut the loop has
+        # nothing to fetch, and that silence is the bot idling, not the feed
+        # dying. (8/21: the last SPY runner sold at 10:31 CT and a "feed
+        # returned nothing for ~10 min" text went out at 10:41 CT, ten minutes
+        # of nothing-to-do later.)
+        failing = last_try is not None and last_try > last_ok
+        if stale >= self.FEED_STALE_MIN and failing and not self._feed_warned:
             self._feed_warned = True
             self._hb_owner(
                 f"⚠️ Heartbeat: the data feed has returned nothing for ~{stale:.0f} "
-                "min during market hours. Setups/exits may be stalled — check it.")
+                "min during market hours. Setups/exits may be stalled. Check it.")
         elif stale < self.FEED_STALE_MIN and self._feed_warned:
             self._feed_warned = False
             self._hb_owner("✅ Heartbeat: data feed recovered.")
@@ -494,11 +505,28 @@ class Service:
         tail = ("  Heads-up today: " + ", ".join(warns)) if warns else ""
         self._hb_owner(
             f"✅ Heartbeat: session done. {n} alert{'s' if n != 1 else ''} sent, "
-            f"feed {feed}.{tail}  (Once-a-day check — no close ping from me means "
+            f"feed {feed}.{tail}  (Once-a-day check: no close ping from me means "
             "something's wrong.)")
 
+    @staticmethod
+    def _brain_status() -> str:
+        try:
+            import assistant
+            return assistant.brain_status_line()
+        except Exception as e:
+            return f"unknown ({e})"
+
+    @staticmethod
+    def _sniper_line() -> str:
+        """The morning card's sniper-window sentence, from the live spec."""
+        try:
+            import strategy_spec
+            return strategy_spec.get().sniper_watch_sentence()
+        except Exception:
+            return ""
+
     def health_text(self) -> str:
-        """/health — on-demand snapshot for the owner."""
+        """/health: on-demand snapshot for the owner."""
         now = et_now()
         hb = config.state_get("heartbeat") or {}
         last_ok = self._last_feed_ok
@@ -520,6 +548,8 @@ class Service:
             f"{'sent' if config.state_get('morning_sent') == today else 'NOT sent'}",
             f"Alerts today: {len(self.book.for_date(now.date()))}",
             f"Open positions: {open_n}",
+            f"Sniper trades open: {len(sniper_book.open_rows())}",
+            f"Brain: {self._brain_status()}",
         ]
         if warns:
             lines.append("Warnings today: " + ", ".join(warns))
@@ -572,7 +602,8 @@ class Service:
                       "(restart between send and mark?); marking done")
                 return
         card = cards.morning_card(mode, reason, today,
-                                  window_ct=cards.entry_window_ct(self.cfg))
+                                  window_ct=cards.entry_window_ct(self.cfg),
+                                  sniper_line=self._sniper_line())
         try:  # earnings radar + hot headlines (news must never block the report)
             extra = news.morning_lines(self.cfg.watchlist)
             if extra:
@@ -580,7 +611,7 @@ class Service:
         except Exception as e:
             print(f"news scan failed: {e}")
         if config.paper_mode():
-            card += "\n[PAPER MODE is ON — cards are practice, not trades.]"
+            card += "\n[PAPER MODE is ON: cards are practice, not trades.]"
         self.notify(card)
         if not self.dry:  # dry-run must not set the live morning dedup key
             config.state_set("morning_sent", str(today))
@@ -591,7 +622,7 @@ class Service:
             self._hb_owner(
                 f"⚠️ Heartbeat: morning card went out at "
                 f"{now.astimezone(CT):%I:%M %p} CT, after the "
-                f"{ct_wall(self.cfg.entry_start):%H:%M} entry window opened — "
+                f"{ct_wall(self.cfg.entry_start):%H:%M} entry window opened. "
                 "I may have missed early setups today.")
 
     # ---------- telegram commands ----------
@@ -626,7 +657,7 @@ class Service:
                 return assistant.score_line(item["chat_id"])
             return self.run_command(item["cmd"], item["args"], item["chat_id"])
         if item["kind"] == "unsupported":
-            return ("I can read text, photos, PDFs and CSV/TXT files — "
+            return ("I can read text, photos, PDFs and CSV/TXT files, "
                     "not voice or video yet.")
         import assistant
         if not assistant.enabled():
@@ -1044,7 +1075,7 @@ class Service:
         target = args.strip() or (next(iter(pending), "") if pending else "")
         if not target:
             return ("Nobody's waiting to be added. Have them message the bot "
-                    "first, then I'll text you their ID — or use "
+                    "first, then I'll text you their ID, or use "
                     "/adduser <their chat id>.")
         extra = [str(x) for x in config.state_get("extra_chat_ids", [])]
         if target in extra or target in telegram.owner_ids():
@@ -1056,9 +1087,9 @@ class Service:
         telegram.send_to(target,
             "You're in! 🎯 This bot texts options setups in the morning and "
             "walks you through the exits all day. Just talk to me like a "
-            "person — ask anything, send a chart screenshot, or tell me how "
+            "person, ask anything, send a chart screenshot, or tell me how "
             "a trade went and I'll keep your record. Type /help to see more. "
-            "Nothing here is auto-traded — every alert ends 'Your call.'")
+            "Nothing here is auto-traded, every alert ends 'Your call.'")
         return f"✅ Added {name} (id {target}). They'll get every alert now."
 
     def cmd_removeuser(self, args: str):
@@ -1077,7 +1108,7 @@ class Service:
     def status_text(self) -> str:
         mode, reason = self.current_mode()
         acct = config.account_value()
-        lines = [f"{cards.MODE_EMOJI[mode]} Risk mode: {mode.upper()} — {reason}",
+        lines = [f"{cards.MODE_EMOJI[mode]} Risk mode: {mode.upper()}: {reason}",
                  f"Account: {'$' + format(acct, ',.0f') if acct else 'not set (/setaccount)'}",
                  f"Paper mode: {'ON' if config.paper_mode() else 'off'}",
                  f"Data: {self.feed.backend_for('QCOM')} for stocks, "
@@ -1088,6 +1119,14 @@ class Service:
                  f"Alert watchlist: {', '.join(self.cfg.watchlist)}",
                  f"Entry window: {cards.entry_window_ct(self.cfg)} "
                  f"({self.cfg.entry_start:%H:%M}-{self.cfg.entry_end:%H:%M} ET)"]
+        try:
+            import strategy_spec
+            _sp = strategy_spec.get()
+            lines.append(f"Sniper window: {_sp.sniper_window_txt()}, on "
+                         f"{', '.join(sorted(_sp.sniper_symbol_names()))}")
+        except Exception:
+            pass
+        lines.append(f"Brain: {self._brain_status()}")
         open_pos = [p for p in self.book.positions if p.state != "closed"]
         if open_pos:
             lines.append("Open positions:")
@@ -1114,24 +1153,24 @@ class Service:
         AND positive expectancy under the EXITS WE ACTUALLY TRADE (the
         new-rules backtest when it exists, old-rules otherwise)."""
         if self.backtest_old is None:
-            print("No backtest results — refusing to alert without real stats. "
+            print("No backtest results: refusing to alert without real stats. "
                   "Run backtest.py.")
             return None
         key = f"{setup.ticker}:{setup.direction}"
         now = et_now()
         if key not in self.ALLOWED_SETUPS:
             print(f"{now:%H:%M:%S} {key}: not on the alert allow-list "
-                  f"{sorted(self.ALLOWED_SETUPS)} — skipped.")
+                  f"{sorted(self.ALLOWED_SETUPS)}, skipped.")
             return None
         stats = self.backtest_old.get("per_setup", {}).get(key)
         if stats is None:
             print(f"{now:%H:%M:%S} {setup.ticker} {setup.direction}: setup formed "
-                  "but no backtest stats for it — skipped.")
+                  "but no backtest stats for it, skipped.")
             return None
         if round(stats["win_rate"]) < config.MIN_WINRATE:
             print(f"{now:%H:%M:%S} {setup.ticker} {setup.direction}: win rate "
-                  f"{stats['win_rate']:.0f}% is below {config.MIN_WINRATE:.0f}% "
-                  "— skipped, not forcing it.")
+                  f"{stats['win_rate']:.0f}% is below {config.MIN_WINRATE:.0f}%, "
+                  "skipped, not forcing it.")
             return None
         new_stats = (self.backtest_new or {}).get("per_setup", {}).get(key)
         exp = (new_stats or stats)["expectancy_pct"]
@@ -1139,7 +1178,7 @@ class Service:
         if exp <= 0:
             print(f"{now:%H:%M:%S} {setup.ticker} {setup.direction}: wins "
                   f"{stats['win_rate']:.0f}% of the time but LOSES money with "
-                  f"{rules} in testing — skipped, not forcing it.")
+                  f"{rules} in testing, skipped, not forcing it.")
             return None
         return stats
 
@@ -1218,8 +1257,8 @@ class Service:
             try:
                 did_open = self.open_position(setup, now)
             except Exception as e:
-                print(f"{now:%H:%M:%S} {ticker}: failed to open position: {e} "
-                      "— will retry next cycle")
+                print(f"{now:%H:%M:%S} {ticker}: failed to open position: {e}, "
+                      "will retry next cycle")
                 continue  # transient failure must not burn the day's alert
             if did_open:
                 self.skipped_today.add(ticker)
@@ -1242,7 +1281,7 @@ class Service:
             blocked, e_date = False, None
         if blocked:
             print(f"{now:%H:%M:%S} {setup.ticker} {setup.direction}: earnings "
-                  f"{e_date} lands inside this option's life — skipped, "
+                  f"{e_date} lands inside this option's life, skipped, "
                   "not gambling on a report.")
             return True  # final decision for the day
         quote = quotes.get_option_quote(setup.ticker, right, setup.strike, expiry_date)
@@ -1260,8 +1299,8 @@ class Service:
             entry_mid, entry_source = quote.mid, "quote"
             entry_bid = entry_ask = 0.0
         else:
-            print(f"{now:%H:%M:%S} {setup.ticker}: no usable option price yet "
-                  "— will retry next cycle.")
+            print(f"{now:%H:%M:%S} {setup.ticker}: no usable option price yet, "
+                  "will retry next cycle.")
             return False
 
         risk = config.RISK_PER_TRADE_PCT
@@ -1295,7 +1334,7 @@ class Service:
         news_lines = []
         if setup.ticker != "SPX":
             try:
-                news_lines = [f"⚠️ News today — {outlet}: {title}"
+                news_lines = [f"⚠️ News today: {outlet}: {title}"
                               for outlet, title in news.hot_headlines(setup.ticker)[:2]]
             except Exception:
                 pass
@@ -1372,7 +1411,7 @@ class Service:
             if baseline > 0:
                 pos.est_entry = baseline
                 print(f"{now:%H:%M:%S} {pos.ticker}: vol was throttled at "
-                      f"entry — model baseline backfilled at ${baseline:.2f}, "
+                      f"entry, model baseline backfilled at ${baseline:.2f}, "
                       "estimate stop-floor active again")
         # the estimate-based stop floor compares model-to-model: the BS
         # estimate now vs the BS estimate AT ENTRY. (Estimate vs a real quote
@@ -1425,14 +1464,25 @@ class Service:
             print(f"{now:%H:%M:%S} {pos.ticker}: {ev['type']} at {ev['pct']:+.1f}%")
         self.book.save()
 
-    # ---------- sniper watch (own thread, all-day) ----------
-    # The verified 79% pattern used to fire ONLY when someone happened to
-    # text the bot at the right minute. This thread watches the verified
-    # symbols continuously (07:00-16:00 ET weekdays), texts EVERYONE the
-    # moment the pattern forms, sends the marked-up chart, and records every
-    # candidate to the forward ledger so the bot grades itself nightly.
+    # ---------- sniper watch (own thread, US session) ----------
+    # The verified pattern used to fire ONLY when someone happened to text
+    # the bot at the right minute. This thread watches the verified symbols
+    # through the US session (fvg.sniper_window_open: weekdays from 09:50 ET,
+    # 8:50 AM CT, to the close), texts EVERYONE the moment the pattern forms
+    # on a COMPLETED bar, sends the marked-up chart, tracks the trade to its
+    # exit, and records every candidate to the forward ledger so the bot
+    # grades itself nightly. Before 8/22 it ran from 07:00 ET and fired
+    # stock tickets off pre-market bars the backtest never contained.
 
-    SNIPER_WATCH_SECONDS = 240  # 5m bars: checking ~every 4 min misses nothing
+    SNIPER_WATCH_SECONDS = 320  # ceiling on one wait; polls align to bar closes
+
+    def sniper_poll_wait_s(self, now: datetime) -> float:
+        """Seconds until ~20s after the next 5-minute bar closes. The gate
+        acts on COMPLETED bars only, so polling faster repeats one read and
+        polling unaligned (the old flat 240s) could fill up to four minutes
+        after the bar the backtest filled on."""
+        into = (now.minute % 5) * 60 + now.second
+        return max(20.0, min(float(self.SNIPER_WATCH_SECONDS), 300 - into + 20))
 
     def start_sniper_watch(self):
         """Safe to call repeatedly; the thread gates its own hours."""
@@ -1444,26 +1494,72 @@ class Service:
             target=self._sniper_worker, name="sniper-watch", daemon=True)
         self._sniper_thread.start()
 
+    @staticmethod
+    def sniper_watch_mode(now: datetime, has_open: bool) -> str:
+        """'entries' inside the session window; 'step' after the close while
+        a trade is still open (until 16:15 ET, so the 15:55 bar is graded and
+        the settle fires); else 'off'. A ticket fired on the last in-window
+        pass used to be left open all night and then graded against the
+        next morning's bars."""
+        import fvg as fvg_mod
+        if fvg_mod.sniper_window_open(now):
+            return "entries"
+        if (has_open and now.weekday() < 5
+                and time(16, 0) <= now.time() < time(16, 15)):
+            return "step"
+        return "off"
+
+    def _settle_open_snipers(self, now: datetime):
+        """After the close: anything still open settles flat at the last
+        price it saw, even when the read that would normally do it failed."""
+        for row in sniper_book.open_rows():
+            self._step_sniper(row["symbol"], row.get("last_price"), now, None)
+
     def _sniper_worker(self):
         while not self._sniper_stop.is_set():
+            now = et_now()
             try:
-                now = et_now()
-                if now.weekday() < 5 and 7 <= now.hour < 16:
-                    self._scan_snipers_once(now)
+                mode = self.sniper_watch_mode(now, bool(sniper_book.open_rows()))
+                if mode != "off":
+                    self._scan_snipers_once(now, entries_allowed=(mode == "entries"))
+                    if mode == "step":
+                        self._settle_open_snipers(now)
             except Exception as e:
                 print(f"{et_now():%H:%M:%S} sniper watch error (continuing): {e}")
-            self._sniper_stop.wait(self.SNIPER_WATCH_SECONDS)
+            # the wait is measured from NOW, after the scan, so a slow read
+            # cannot push the next poll past the bar it is meant to catch
+            self._sniper_stop.wait(self.sniper_poll_wait_s(et_now()))
 
     # resolve() speaks human names, not raw Yahoo symbols; map the verified
     # sniper universe onto the names it understands
     SNIPER_READS = {"EURUSD=X": "eurusd", "JPY=X": "usdjpy",
                     "^GSPC": "spx", "TSLA": "tsla", "SPY": "spy"}
 
-    def _step_sniper(self, yfs: str, price, now: datetime):
-        """Mark one live price against an open sniper and text the exit if it
-        just closed. Never raises: a tracking fault must not stop the scan."""
+    @staticmethod
+    def sniper_record_line(rec: dict) -> str:
+        """'Live record: 20 wins, 8 stops, 0 flat over 28 trades. Net +0.00R.
+        (A 0.4R target needs 71 of 100 to break even.)' The old line read
+        '20 of 28 hit target, +0.00R total', which looks like a contradiction
+        until you know a 0.4R win pays less than half of what a stop costs."""
+        import strategy_spec
+        spec = strategy_spec.get()
+        be = spec.sniper_breakeven()
+        def _n(count, word):
+            return f"{count} {word}{'' if count == 1 else 's'}"
+        flat = f", {rec['flats']} flat" if rec.get("flats") else ""
+        txt = (f"Live record: {_n(rec['n'], 'trade')}, {_n(rec['wins'], 'win')}, "
+               f"{_n(rec['losses'], 'stop')}{flat}. Net {rec['total_r']:+.2f}R.")
+        if be:
+            txt += (f" A {spec.sniper_tp_txt()} target needs {be:.0f} wins "
+                    "in 100 just to break even.")
+        return txt
+
+    def _step_sniper(self, yfs: str, price, now: datetime, bars=None):
+        """Grade an open sniper against the completed bars the read carried
+        (then the live price) and text the exit if it just closed. Never
+        raises: a tracking fault must not stop the scan."""
         try:
-            row = sniper_book.step(yfs, price, now)
+            row = sniper_book.step(yfs, price, now, bars=bars)
         except Exception as e:
             print(f"{now:%H:%M:%S} sniper tracking error ({yfs}): {e}")
             return
@@ -1485,6 +1581,17 @@ class Service:
             body = (f"Closing flat at {row['exit_price']:.{dec}f}: neither the "
                     "stop nor the target was reached and this pattern does "
                     "not hold overnight.")
+        via = row.get("exit_via")
+        when = ct_hm(row.get("exit_time") or "")
+        if via == "bar":
+            body += f" Graded on the {when} CT five-minute bar."
+        elif via == "poll" and reason != "session end":
+            body += f" Graded on a live print at {when} CT."
+        elif via == "stale":
+            body = (f"Closing this one flat at {row['exit_price']:.{dec}f}, the "
+                    f"last price I saw on {row.get('date', 'that day')}. It was "
+                    "still open when that session ended, and I do not grade "
+                    "a trade against a new day's bars.")
         lines = [head, body,
                  f"Entry was {row['entry']:.{dec}f} · stop {row['stop']:.{dec}f}"
                  f" · target {row['target']:.{dec}f}"]
@@ -1493,12 +1600,13 @@ class Service:
                          f" · worst {row.get('mae_r', 0):+.2f}R)")
         rec = sniper_book.record()
         if rec["n"]:
-            lines.append(f"Live sniper record: {rec['wins']} of {rec['n']} "
-                         f"hit target, {rec['total_r']:+.2f}R total.")
+            lines.append(self.sniper_record_line(rec))
         lines.append("Your call.")
+        print(f"{now:%H:%M:%S} sniper {name} {row['direction']} {reason} at "
+              f"{row['exit_price']} ({r_mult})")
         self.notify("\n".join(lines))
 
-    def _scan_snipers_once(self, now: datetime):
+    def _scan_snipers_once(self, now: datetime, entries_allowed: bool = True):
         import fvg as fvg_mod
         import market_tools
         alerted = config.state_get("sniper_alerted", {})
@@ -1511,7 +1619,7 @@ class Service:
             # unmonitored. Read when there is either a signal still to find OR
             # a position to mark; one read serves both.
             live = sniper_book.has_open(yfs)
-            if key in alerted and not live:
+            if not live and (key in alerted or not entries_allowed):
                 continue
             try:
                 r = market_tools.read_any(self.SNIPER_READS.get(yfs, yfs))
@@ -1520,23 +1628,31 @@ class Service:
             if not isinstance(r, dict):
                 continue
             if live:
-                self._step_sniper(yfs, r.get("price"), now)
-            if key in alerted or r.get("conviction") != "high":
+                self._step_sniper(yfs, r.get("price"), now, r.get("recent_bars"))
+            if (not entries_allowed or key in alerted
+                    or r.get("conviction") != "high"):
                 continue
             ticket = ((r.get("fvg") or {}).get("confirming") or {}).get("ticket")
             if not ticket:
                 continue
-            alerted[key] = f"{now:%H:%M}"
+            # the fill is NOW, after the read, not the pre-scan clock: on a
+            # slow scan those can sit in different bars
+            fired_at = et_now()
+            alerted[key] = f"{fired_at:%H:%M}"
             config.state_set("sniper_alerted",
                              {k: v for k, v in alerted.items()
                               if k.startswith(day)})
-            m = ticket.get("measured", {})
             d = (r.get("plan") or {}).get("direction", "")
             dec = int(r.get("decimals", 2))
+            try:  # the record is read from its report; never let a bad
+                import strategy_spec  # report file hold up the ticket
+                claim = strategy_spec.get().sniper_card_txt()
+            except Exception:
+                claim = ""
             lines = [
                 f"🎯 SNIPER · {r.get('instrument', yfs)} {d}",
-                f"This is the verified pattern: wins {m.get('win_rate', 0):.0f}"
-                f" of 100 ({m.get('trades', 0)} replays).",
+                (f"Verified pattern: {claim}." if claim
+                 else "Verified pattern (record file missing, no number quoted)."),
                 f"Enter now: {ticket['entry']:.{dec}f}",
                 f"Stop: {ticket['stop']:.{dec}f}",
                 f"Take profit: {ticket['target']:.{dec}f} (all out, no greed)",
@@ -1556,8 +1672,11 @@ class Service:
             sniper_book.open_trade(
                 symbol=yfs, display=str(r.get("instrument", yfs)),
                 direction=d, entry=ticket["entry"], stop=ticket["stop"],
-                target=ticket["target"], day=day, time_et=f"{now:%H:%M:%S}",
-                decimals=dec)
+                target=ticket["target"], day=day,
+                time_et=f"{fired_at:%H:%M:%S}", decimals=dec, entry_ts=fired_at)
+            print(f"{fired_at:%H:%M:%S} sniper FIRED {r.get('instrument', yfs)} {d} "
+                  f"entry {ticket['entry']} stop {ticket['stop']} "
+                  f"target {ticket['target']}")
             try:  # chart to everyone: upload once, fan out by file_id
                 import charts
                 img, _ = charts.render_fvg(r)
@@ -1627,6 +1746,20 @@ class Service:
         seen, seen_date = self._load_news_seen()
         first_seed = seen_date != str(now.date())
         fresh = [(o, t) for o, t in hot if t not in seen]
+        # one story, one text: a second outlet retelling a headline already
+        # seen today is marked seen and never sent (8/21 texted one
+        # Canada-tariff story three times between 10:54 and 13:44 ET)
+        if fresh and not first_seed:
+            kept, known = [], list(seen)
+            for o, t in fresh:
+                if news.same_story(t, known):
+                    seen = seen + [t]
+                    continue
+                kept.append((o, t))
+                known.append(t)
+            if len(kept) != len(fresh):
+                self._save_news_seen(seen[-300:], str(now.date()))
+            fresh = kept
         if first_seed:  # day's first pass: seed ALL current headlines silently
             if not all_ok:
                 # only seed once EVERY feed has truly fetched. A partial fetch
@@ -1646,7 +1779,7 @@ class Service:
                              str(now.date()))
         for outlet, title in to_send:
             # 1) RAW alert goes out INSTANTLY — nothing slow runs before it
-            self.notify(f"🚨 BREAKING — {outlet}: {title}")
+            self.notify(f"🚨 BREAKING ({outlet}): {title}")
             print(f"{now:%H:%M:%S} breaking news alert: {title[:60]}")
             # 2) AI 'read' is a best-effort FOLLOW-UP on its OWN thread, so a
             # slow read on headline #1 never delays the RAW alert for #2
@@ -1663,6 +1796,8 @@ class Service:
             import assistant
             if not assistant.enabled():
                 return None
+            if assistant.cooldown_left_s() or assistant.billing_hold():
+                return None  # a resting brain has no read to offer anyone
             take = assistant.respond(
                 {"chat_id": "newsdesk", "kind": "text",
                  "text": ("One sentence only, no invented numbers: what could "
@@ -1674,11 +1809,8 @@ class Service:
             # several failure strings that DON'T contain 'error' ("My brain
             # couldn't connect…", "came back empty…") — those must never reach
             # members as a "Quick read".
-            if take:
-                low = take.lower()
-                if ("error" not in low and not low.startswith("my brain")
-                        and "came back empty" not in low):
-                    return take
+            if take and not assistant.is_outage_text(take):
+                return take
         except Exception:
             pass
         return None
@@ -1876,9 +2008,9 @@ class Service:
               f"{config.POLL_SECONDS}s. Watchlist: {', '.join(self.cfg.watchlist)}. "
               f"Min win rate {config.MIN_WINRATE:.0f}%. Exits: half at "
               f"+{config.TP_HALF_PCT:g}%, give-back {config.RUNNER_GIVEBACK_PCT:g} "
-              f"off peak, stop {config.STOP_PCT:g}%. Being picky — no forced trades.")
+              f"off peak, stop {config.STOP_PCT:g}%. Being picky, no forced trades.")
         if self.backtest_old is None:
-            print("WARNING: reports/backtest_results.json missing — the bot "
+            print("WARNING: reports/backtest_results.json missing: the bot "
                   "will not send entry alerts without real backtest stats.")
         if now.weekday() < 5:
             self.morning_report(now)
@@ -1941,7 +2073,7 @@ class Service:
     def daemon(self):
         print("Daemon mode: running around the clock. Commands answered "
               "any time; sessions run on trading days 8:31-15:12 CT.")
-        self.start_sniper_watch()  # covers 6 AM CT premarket + after-hours
+        self.start_sniper_watch()  # gates itself to the US session window
         while True:
             now = et_now()
             try:
@@ -1990,7 +2122,7 @@ class Service:
             display = {"win_rate": 72.0, "avg_win_pct": 30.0, "avg_loss_pct": -25.0,
                        "expectancy_pct": 9.0, "ev_pct": 9.0, "trades": 60,
                        "start": "01/01/2026", "end": "06/01/2026",
-                       "label": "EXAMPLE NUMBERS — no backtest on disk",
+                       "label": "EXAMPLE NUMBERS, no backtest on disk",
                        "costs_note": "after est. costs", "source": "backtest_old"}
         mode, mode_reason = self.current_mode()
         pos = Position(
@@ -2015,7 +2147,7 @@ class Service:
         msgs.append(cards.stop_card(pos, {"pct": -31.2, "source": src}))
         msgs.append(cards.expiry_card(pos, {"pct": -8.0, "source": src}))
         for i, msg in enumerate(msgs, 1):
-            tagged = (f"🧪 TEST {i}/5 — EXAMPLE ONLY, NOT A REAL ALERT 🧪\n\n{msg}")
+            tagged = (f"🧪 TEST {i}/5: EXAMPLE ONLY, NOT A REAL ALERT 🧪\n\n{msg}")
             if chat_id and not self.dry:   # /test from a chat: reply ONLY to them,
                 err = telegram.send_to(chat_id, tagged)   # never the whole group
                 errors = [err] if err else []

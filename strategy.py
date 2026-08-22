@@ -107,6 +107,6 @@ def detect_setup(ticker: str, bars: pd.DataFrame, now, cfg: StrategyConfig):
     strike = _round_strike(px, increment, up=direction == "call")
     above_open_txt = "above" if above_open else "below"
     reason = (f"15-min momentum {mom:+.2f}%, {above_open_txt} open "
-              f"({(px / day_open - 1) * 100:+.2f}%) — derived rule, see win_study.md")
+              f"({(px / day_open - 1) * 100:+.2f}%), derived rule, see win_study.md")
     return Setup(ticker=ticker, direction=direction, strike=strike,
                  spot=px, mom_pct=mom, reason=reason)

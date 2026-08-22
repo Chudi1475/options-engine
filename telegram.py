@@ -186,7 +186,7 @@ def send_photo_all(image_bytes: bytes, caption: str = "") -> list:
     Returns a list of error strings."""
     ids = chat_ids()
     if not ids:
-        raise RuntimeError("TELEGRAM_CHAT_IDS not set — run scanner.py --setup")
+        raise RuntimeError("TELEGRAM_CHAT_IDS not set, run scanner.py --setup")
     errors = []
     err, fid = _send_photo_raw(ids[0], image_bytes, caption)
     if err:
@@ -208,7 +208,7 @@ def send(text: str) -> list:
     """Send to every configured chat, all at once. Returns error strings."""
     ids = chat_ids()
     if not ids:
-        raise RuntimeError("TELEGRAM_CHAT_IDS not set — run scanner.py --setup")
+        raise RuntimeError("TELEGRAM_CHAT_IDS not set, run scanner.py --setup")
     if len(ids) == 1:
         err = send_to(ids[0], text)
         return [err] if err else []

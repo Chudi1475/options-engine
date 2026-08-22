@@ -59,6 +59,8 @@ def tokens() -> dict:
         "__SNIPER_RECORD__": s.sniper_record_txt() or "not measured yet",
         "__SNIPER_TP__": s.sniper_tp_txt(),
         "__SNIPER_SYMBOLS__": ", ".join(sorted(s.sniper_symbols)),
+        "__SNIPER_WINDOW__": s.sniper_window_txt(),
+        "__SNIPER_OPEN_ET__": s.sniper_open_et.strftime("%H:%M"),
         "__WATCHLIST__": watch,
         "__ALLOWLIST__": allow,
         "__SPREAD_COST__": f"{s.spread_cost_pct:g}%",

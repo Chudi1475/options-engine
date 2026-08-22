@@ -76,7 +76,7 @@ def stats_for_card(ticker: str, direction: str, book: PositionBook,
             and live[key]["trades"] >= config.LIVE_STATS_MIN_SETUP):
         s = dict(live[key])
         s["ev_pct"] = s["expectancy_pct"] - config.SPREAD_COST_PCT
-        s["label"] = f"LIVE RESULTS — {s['trades']} real tracked signals"
+        s["label"] = f"LIVE RESULTS: {s['trades']} real tracked signals"
         s["costs_note"] = "after est. spread"
         s["source"] = "live"
         return s
@@ -85,7 +85,7 @@ def stats_for_card(ticker: str, direction: str, book: PositionBook,
     if new:
         s = dict(new)
         s["ev_pct"] = s["expectancy_pct"]  # slippage+fees already inside
-        s["label"] = ("NEW-RULES BACKTEST, approx pricing — live stats take "
+        s["label"] = ("NEW-RULES BACKTEST, approx pricing; live stats take "
                       f"over after {strategy_spec.get().live_stats_min_total} "
                       "signals")
         s["costs_note"] = "after est. costs"
@@ -95,7 +95,7 @@ def stats_for_card(ticker: str, direction: str, book: PositionBook,
     if old:
         s = dict(old)
         s["ev_pct"] = s["expectancy_pct"]
-        s["label"] = ("OLD-RULES BACKTEST — live stats take over after "
+        s["label"] = ("OLD-RULES BACKTEST: live stats take over after "
                       f"{strategy_spec.get().live_stats_min_total} signals")
         s["costs_note"] = "after est. costs"
         s["source"] = "backtest_old"
@@ -139,11 +139,11 @@ def weekly_report(book: PositionBook, backtest_old, backtest_new,
             if monday <= date.fromisoformat(p.date) <= friday]
     still_open = [p for p in book.positions if p.state != "closed"]
 
-    lines = [f"📊 WEEKLY SCOREBOARD — week of {_fmt_d(monday)}-{_fmt_d(friday)}", ""]
+    lines = [f"📊 WEEKLY SCOREBOARD, week of {_fmt_d(monday)}-{_fmt_d(friday)}", ""]
     add = lines.append
 
     if not week:
-        add("Signals this week: 0. Nothing passed the filter — sitting out "
+        add("Signals this week: 0. Nothing passed the filter. Sitting out "
             "was the trade. No text = no trade, and that's working as designed.")
     else:
         s = _stats([p.final_pnl_pct for p in week])
@@ -162,7 +162,9 @@ def weekly_report(book: PositionBook, backtest_old, backtest_new,
         add(f"NEW exit rules (half at +{config.TP_HALF_PCT:g} → let the runner "
             f"give back {config.RUNNER_GIVEBACK_PCT:g} off peak → stop "
             f"{config.STOP_PCT:g}):")
-        add(f"  this week: {new_total:+.0f}% (adding up each trade's %)")
+        add(f"  this week: {new_total:+.0f}% summed across {len(week)} "
+            f"trade{'s' if len(week) != 1 else ''} "
+            f"({new_total / len(week):+.0f}% per trade on average)")
         # The verdict must compare both rule sets on the SAME trades. A shadow
         # that never closed (non-comparable marks all day) has no old-rules
         # result, so its trade stays out of BOTH sides of the diff instead of
@@ -182,7 +184,7 @@ def weekly_report(book: PositionBook, backtest_old, backtest_new,
             winner = "NEW" if diff >= 0 else "OLD"
             add(f"This week's winner: {winner} rules by {abs(diff):.0f} points")
         if any(p.paper for p in week):
-            add("[PAPER] — some or all of this week's signals were practice mode.")
+            add("[PAPER]: some or all of this week's signals were practice mode.")
     if still_open:
         add("")
         add("Still open: " + ", ".join(
@@ -208,7 +210,7 @@ def weekly_report(book: PositionBook, backtest_old, backtest_new,
         if claims:
             add("For comparison: " + "; ".join(claims) + ".")
         if s_all["trades"] < config.LIVE_STATS_MIN_TOTAL:
-            add(f"Still early — live stats take over the cards at "
+            add(f"Still early: live stats take over the cards at "
                 f"{config.LIVE_STATS_MIN_TOTAL} signals "
                 f"({s_all['trades']} so far).")
     add("")

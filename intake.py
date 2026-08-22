@@ -107,7 +107,7 @@ def reqfrom_command(args: str) -> str:
                 lines.append(f"  {cid}  ({name or 'no name'})")
         lines.append("")
         lines.append("Add someone:  /reqfrom add <chat id> <name>")
-        lines.append("(have Kelechi/Ryan message the bot first — I'll text you "
+        lines.append("(have Kelechi/Ryan message the bot first, I'll text you "
                      "their id)")
         return "\n".join(lines)
     parts = args.split()

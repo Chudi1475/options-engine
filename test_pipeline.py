@@ -2427,11 +2427,12 @@ try:
     check("sniper: the stop books a full -1R", tie is not None
           and tie["exit_reason"] == "stop" and tie["r"] == -1.0)
 
-    # nothing spans a session: still open at 15:55 ET closes flat, never a win
+    # nothing spans a session: still open once the 16:00 ET close has passed
+    # (the 15:55 bar graded) closes flat, never a win
     sniper_book.open_trade("SPY", "SPY", "BUY", 100.0, 90.0, 104.0,
                            "2026-08-12", "10:00:00")
     eod = sniper_book.step("SPY", 101.0,
-                           datetime(2026, 8, 12, 15, 55, tzinfo=ET))
+                           datetime(2026, 8, 12, 16, 0, 20, tzinfo=ET))
     check("sniper: an unresolved trade settles flat at session end",
           eod is not None and eod["exit_reason"] == "session end"
           and abs(eod["r"] - 0.1) < 1e-9)

@@ -30,14 +30,46 @@ API_URL = "https://api.anthropic.com/v1/messages"
 HISTORY_FILE = config.DATA_DIR / "chat_history.json"
 TRADES_FILE = config.DATA_DIR / "user_trades.json"
 
-# ---- usage-limit countdown -------------------------------------------------
-# When Anthropic says the account hit its usage limit, every brain call is
-# paused for exactly 5 hours 5 minutes (the owner's rule), then resumes on its
-# own. The pause survives restarts (state.json) and the owner gets ONE text
-# when it starts and one when the brain is back.
+# ---- brain availability: billing hold + rate-limit cooldown ----------------
+# Two different outages, two different behaviours, and almost no chatter:
+#
+# BILLING HOLD: the API says the credit balance is empty (HTTP 400/402/403
+#   with "credit"/"billing"). Nothing the bot does fixes that; only the owner
+#   topping up does. The brain goes dark, the owner gets ONE text (persisted
+#   in state.json, so restarts and every later failure never repeat it), the
+#   API is probed at most once every BILLING_PROBE_S, and ONE "back online"
+#   text goes out after the first call that succeeds. Before 8/22 an empty
+#   balance was handled as a usage limit: 5h05m countdown, "limit hit" text,
+#   "wait is over" text, the next call failed the same way, repeat. Several
+#   texts a day about one unchanged fact.
+#
+# RATE-LIMIT COOLDOWN: a real 429 usage window. The brain waits it out
+#   (retry-after when the API states one, else USAGE_WAIT_S) and comes back
+#   on its own, silently. /health and /status show the state; nobody is
+#   texted about it.
 USAGE_WAIT_S = 5 * 3600 + 5 * 60
+BILLING_PROBE_S = 6 * 3600
 _COOLDOWN_KEY = "brain_cooldown_until"       # epoch seconds, in state.json
-_COOLDOWN_FLAG = "brain_cooldown_announced"  # so recovery texts exactly once
+_COOLDOWN_FLAG = "brain_cooldown_announced"  # legacy flag, only ever cleared now
+_BILLING_KEY = "brain_billing_hold"          # {since, last_probe, notified, reason}
+_BRAIN_LOCK = threading.Lock()  # chat replies, news takes and /ask fail on
+                                # separate threads; the one-time texts must
+                                # not race into two
+OFFLINE_TEXT = ("my brain is offline right now (the owner has been told). "
+                "Commands still work: /help, /calls, /signal, /chart.")
+_OUTAGE_STARTS = ("my brain", "brain is", "my deep brain", "i read it but")
+
+
+def is_outage_text(text: str) -> bool:
+    """True for every string this module returns INSTEAD of a model answer
+    (offline, resting, unavailable, blank, error). The single predicate the
+    breaking-news thread uses so no outage note is ever forwarded to the
+    members as a 'Quick read'."""
+    low = (text or "").strip().lower()
+    if not low:
+        return True
+    return (low.startswith(_OUTAGE_STARTS) or "came back empty" in low
+            or "error" in low)
 
 # one pooled HTTPS session for every brain call (skips per-call TLS handshake)
 _api_session = requests.Session()
@@ -65,67 +97,153 @@ def _resume_text() -> str:
 
 
 def _start_cooldown(reason: str, wait_s: float = None):
-    """Arm the countdown and tell the owner once. When the API said exactly
-    how long (retry-after), trust that instead of the 5h05m default; the
-    fixed wait is only the fallback for limits with no stated end."""
+    """Arm the rate-limit countdown, silently. When the API said exactly how
+    long (retry-after), trust that instead of the 5h05m default; the fixed
+    wait is only the fallback for limits with no stated end."""
     wait = min(float(wait_s), USAGE_WAIT_S + 3600) if wait_s else USAGE_WAIT_S
     config.state_set(_COOLDOWN_KEY, _now_s() + wait)
-    config.state_set(_COOLDOWN_FLAG, True)
-    try:
-        owner = telegram.primary_owner_id()
-        if owner:
-            telegram.send_to(owner,
-                "🧠⏸️ Claude usage limit hit. The brain is on a 5h05m "
-                f"countdown and will wake back up around {_resume_text()}. "
-                "Alerts, exits, and all non-AI features keep running the "
-                f"whole time. ({reason[:120]})")
-    except Exception:
-        pass
+    print(f"brain: rate limit, resting {wait / 60:.0f} min ({reason[:120]})")
 
 
 def check_cooldown_recovery():
-    """Cheap per-cycle check the scanner calls: when the countdown ends,
-    text the owner ONCE that the brain is back."""
+    """Cheap per-cycle hook the scanner still calls. Recovery is silent now;
+    this only retires the legacy 'announced' flag so an old state.json can
+    never trigger a text."""
     try:
-        if config.state_get(_COOLDOWN_FLAG, False) and cooldown_left_s() == 0:
+        if config.state_get(_COOLDOWN_FLAG, False):
             config.state_set(_COOLDOWN_FLAG, False)
-            owner = telegram.primary_owner_id()
-            if owner:
-                telegram.send_to(owner,
-                    "🧠▶️ The 5h05m wait is over. Brain is back online and "
-                    "answering again.")
     except Exception:
         pass
+
+
+def billing_hold():
+    """The persisted billing hold, or None when the brain is not on one."""
+    hold = config.state_get(_BILLING_KEY)
+    return hold if isinstance(hold, dict) and hold.get("since") else None
+
+
+def _owner_note(text: str) -> bool:
+    """DM the owner. True only when Telegram accepted it."""
+    try:
+        owner = telegram.primary_owner_id()
+        if not owner:
+            return False
+        return telegram.send_to(owner, text) is None
+    except Exception:
+        return False
+
+
+def _start_billing_hold(reason: str):
+    """Record that the API refused for money, probe it again no sooner than
+    BILLING_PROBE_S from now, and tell the owner exactly once per hold. The
+    text counts as delivered only when Telegram accepted it; a failed send
+    is retried on the next refusal instead of being lost for the whole
+    hold."""
+    with _BRAIN_LOCK:
+        hold = billing_hold() or {"since": _now_s(), "notified": False}
+        hold.update(last_probe=_now_s(), reason=(reason or "")[:160])
+        need_text = not hold.get("notified")
+        if need_text:
+            hold["notified"] = True   # claimed, so a parallel thread stays quiet
+        config.state_set(_BILLING_KEY, hold)
+    print(f"brain: OFFLINE on billing ({reason[:120]})")
+    if not need_text:
+        return
+    sent = _owner_note(
+        "🧠 Brain offline: API credits are empty. Chat answers, /ask and "
+        "news reads are off until you top up at console.anthropic.com "
+        "(Plans and Billing; turn on auto reload). Alerts, exits and "
+        "commands keep running. You will not hear about this again "
+        "until it is back.")
+    if not sent:
+        with _BRAIN_LOCK:
+            hold = billing_hold()
+            if hold:
+                hold["notified"] = False
+                config.state_set(_BILLING_KEY, hold)
+
+
+def _end_billing_hold():
+    """The first successful call after a hold: clear it, tell the owner once."""
+    with _BRAIN_LOCK:
+        if billing_hold() is None:
+            return
+        config.state_set(_BILLING_KEY, None)
+    print("brain: back online (credits detected)")
+    _owner_note("🧠 Brain back online. Chat answers and news reads are "
+                "running again.")
+
+
+def brain_status_line() -> str:
+    """One line for /status and /health: online, offline on billing (since
+    when), resting on a rate limit (until when), or not configured."""
+    if not enabled():
+        return "not configured (no API key)"
+    hold = billing_hold()
+    if hold:
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _zi
+        try:
+            since = _dt.fromtimestamp(float(hold["since"]), _zi("America/Chicago"))
+            when = f"{since:%a %I:%M %p CT}".replace(" 0", " ")
+        except (TypeError, ValueError, KeyError):
+            when = "?"
+        return (f"offline, API credits empty since {when}. Top up at "
+                "console.anthropic.com to bring it back.")
+    left = cooldown_left_s()
+    if left:
+        return f"resting on a rate limit, back around {_resume_text()}"
+    return "online"
+
+
+def _looks_like_billing(status: int, err_type: str, err_msg: str) -> bool:
+    """An empty credit balance or a billing refusal: not a limit that ends on
+    its own, so never a countdown."""
+    msg = (err_msg or "").lower()
+    if status == 402:
+        return True
+    if "credit balance" in msg or "purchase credits" in msg or "billing" in msg:
+        return True
+    return status in (400, 403, 429) and "credit" in msg
 
 
 def _looks_like_usage_limit(status: int, err_type: str, err_msg: str,
                             retry_after) -> bool:
+    """A real rate/usage window on HTTP 429 (billing is classified first and
+    never lands here)."""
+    if status != 429:
+        return False
     msg = (err_msg or "").lower()
-    if status in (400, 402, 403) and ("credit" in msg or "billing" in msg):
+    if any(w in msg for w in ("usage limit", "quota", "monthly",
+                              "exceeded your")):
         return True
-    if status == 429:
-        if any(w in msg for w in ("usage limit", "quota", "credit",
-                                  "monthly", "exceeded your")):
+    try:  # a very long server-mandated wait = a usage window, not a blip
+        if retry_after is not None and float(retry_after) > 300:
             return True
-        try:  # a very long server-mandated wait = a usage window, not a blip
-            if retry_after is not None and float(retry_after) > 300:
-                return True
-        except (TypeError, ValueError):
-            pass
+    except (TypeError, ValueError):
+        pass
     return False
 
 
 def _post_anthropic(payload: dict, timeout: int):
     """Single choke point for every Claude call. Returns (body_dict, None) on
     success or (None, honest_error_text) on failure. Handles:
-    - the 5h05m usage-limit countdown (short-circuits while paused),
-    - transient 429/5xx with up to 3 attempts and respectful backoff,
-    - arming the countdown when the account truly runs dry."""
+    - the billing hold (short-circuits between probes, no texts),
+    - the rate-limit countdown (short-circuits while paused, no texts),
+    - transient 429/5xx with up to 3 attempts and respectful backoff."""
     left = cooldown_left_s()
     if left:
         h, m = divmod(left // 60, 60)
-        return None, (f"brain is resting after a Claude usage limit. Back in "
+        return None, (f"brain is resting after a rate limit. Back in "
                       f"{h}h{m:02d}m (around {_resume_text()}).")
+    hold = billing_hold()
+    if hold:
+        try:
+            since_probe = _now_s() - float(hold.get("last_probe") or 0)
+        except (TypeError, ValueError):
+            since_probe = BILLING_PROBE_S
+        if since_probe < BILLING_PROBE_S:
+            return None, OFFLINE_TEXT
     import time as _t
     last_err = "unknown error"
     for attempt in range(3):
@@ -141,15 +259,21 @@ def _post_anthropic(payload: dict, timeout: int):
             continue
         if r.status_code == 200:
             try:
-                return r.json(), None
+                body = r.json()
             except ValueError:
-                return None, "Claude sent back something unreadable"
+                return None, "the model sent back something unreadable"
+            if hold:
+                _end_billing_hold()
+            return body, None
         try:
             err = r.json().get("error", {})
             err_type, err_msg = err.get("type", ""), err.get("message", "")
         except ValueError:
             err_type, err_msg = "", r.text[:200]
         retry_after = r.headers.get("retry-after")
+        if _looks_like_billing(r.status_code, err_type, err_msg):
+            _start_billing_hold(err_msg or f"HTTP {r.status_code}")
+            return None, OFFLINE_TEXT
         if _looks_like_usage_limit(r.status_code, err_type, err_msg,
                                    retry_after):
             try:  # the API often says exactly when: wait THAT, not 5h05m
@@ -157,9 +281,8 @@ def _post_anthropic(payload: dict, timeout: int):
             except (TypeError, ValueError):
                 stated = None
             _start_cooldown(err_msg or f"HTTP {r.status_code}", stated)
-            return None, ("Claude usage limit hit. Brain naps and comes "
-                          f"back around {_resume_text()}. Everything else "
-                          "keeps running.")
+            return None, ("brain is resting after a rate limit, back around "
+                          f"{_resume_text()}. Everything else keeps running.")
         if r.status_code in (429, 500, 502, 503, 529) and attempt < 2:
             try:
                 wait = min(float(retry_after), 30) if retry_after else 2 ** attempt * 2
@@ -186,7 +309,7 @@ TEXTY_EXT = (".txt", ".csv", ".md", ".log", ".json", ".py")
 
 _SYSTEM_TEMPLATE = """You are the assistant living inside 'options-engine', a Telegram
 options-ALERT bot built for Chudi and his trading partner Kelechi. The bot
-texts trade suggestions and exit steps; it NEVER places orders — the humans
+texts trade suggestions and exit steps; it NEVER places orders, the humans
 trade manually. You are the conversational side of that bot.
 
 Personality: you're texting your brother, not writing a report. Talk bro
@@ -208,17 +331,17 @@ Your signature word:
   fits the moment. Don't use it on losses or bad news.
 
 Writing style rules for chat replies:
-- NEVER use em dashes or dashes as punctuation. No "—" and no " - " pauses.
+- NEVER use em dashes or dashes as punctuation: no em dash and no " - " pauses.
   Use commas, periods, or just start a new sentence.
 - Short messages. Lowercase is fine. Emojis are fine in moderation.
 - Never state times, prices, or schedule facts you weren't given. Never
   lecture. Never pad.
-- This is a CONTINUOUS conversation with Chudi, Kelechi, or Ryan — you keep the
+- This is a CONTINUOUS conversation with Chudi, Kelechi, or Ryan, you keep the
   last several messages in mind. Follow the thread, reference what was just
   said, answer follow-ups in context, and keep the back-and-forth flowing like
   a real chat. Don't reset or reintroduce yourself each message.
 
-Reading the market — you HAVE real data tools, use them:
+Reading the market: you HAVE real data tools, use them:
 - When asked what's happening now, what to watch, or whether a setup is
   live, call market_now.
 - When asked what would have worked on a past day, or to break down a
@@ -227,24 +350,24 @@ Reading the market — you HAVE real data tools, use them:
   date yourself using the date in LIVE BOT STATE.
 - NEVER say "I don't have the data" before trying the tool. Only say a
   setup didn't trigger if the tool actually says so. Never invent price
-  levels — quote only what the tool returns. Option prices from these
+  levels, quote only what the tool returns. Option prices from these
   tools are approximated (say so when you give one).
 
-Scorekeeping — one of your main jobs:
-- ANY time the user reports how a trade went — text ("made $1,100 on the
-  SPX call", "lost 400 today") or a screenshot of their broker P&L — call
+Scorekeeping: one of your main jobs:
+- ANY time the user reports how a trade went, text ("made $1,100 on the
+  SPX call", "lost 400 today") or a screenshot of their broker P&L, call
   the log_trade_result tool, then confirm what you logged and give their
   updated record in one line.
 - If the dollar amount isn't clear from what they sent, ask ONE short
   question instead of guessing. NEVER log a number you aren't sure of.
 - When they ask "what's my record / score / how am I doing", call get_score.
 
-Market reads & trade plans — be the SNIPER, decisive:
+Market reads & trade plans: be the SNIPER, decisive:
 - We only ALERT/auto-trade the watched 0DTE alert names (the "Alert watchlist"
   line in LIVE BOT STATE), checked via market_now / analyze_day. That doesn't
   change. But when ANYONE asks about ANY
   OTHER symbol (a stock, ETF, forex pair, gold, or crypto like BTC/ETH), or asks
-  "calls or puts on X", "is X a buy", "what's the play on X" — call macro_read
+  "calls or puts on X", "is X a buy", "what's the play on X", call macro_read
   with that symbol and GIVE THE PLAN. NEVER refuse with "that's not one of our
   setups" or "I can only give a read."
 - macro_read does the math for you: it returns a ready 'plan' object built from
@@ -257,22 +380,22 @@ Market reads & trade plans — be the SNIPER, decisive:
       trend) and to go lighter.
   Quote plan.entry / plan.stop / plan.target EXACTLY as returned. Do not round
   them differently or invent your own.
-- When 'plan' is null, there is NO clean trade right now — either it's chop
+- When 'plan' is null, there is NO clean trade right now, either it's chop
   (bias neutral) or the market's closed and there's no intraday read. Say that
   straight ("no clean setup on X right now") and give the trigger that would make
   one (e.g. "a 15-min push back over <recent_session_high>"). Do NOT fabricate an
-  entry/stop/target to fill the gap, and do NOT hedge endlessly — one honest
+  entry/stop/target to fill the gap, and do NOT hedge endlessly, one honest
   "nothing clean here yet, watch <level>" is the decisive answer.
 - HONESTY still holds: quote ONLY the numbers macro_read returned, never invent a
   level, and never claim a win rate for THAT name (the ONE exception: the measured
   SNIPER pattern below, quoted only when conviction is high; anything else is the
-  same METHOD, not a measured number — say that in one line if it comes up). If
+  same METHOD, not a measured number, say that in one line if it comes up). If
   event_warning is set, LEAD with "wait for it."
   Don't promise profit. End with "Your call."
 - If macro_read returns an "error", the symbol couldn't be found: say so and ask
   them to double-check the ticker.
 
-Fair Value Gaps (FVG) and conviction — talk like a trader who lives on ICT:
+Fair Value Gaps (FVG) and conviction: talk like a trader who lives on ICT:
 - macro_read returns 'conviction' and an 'fvg' object. HIGH now means exactly one
   thing: the measured SNIPER pattern, __SNIPER_RECORD__
   (fvg.confirming.ticket.measured). Quote that number, give the sniper ticket
@@ -298,7 +421,7 @@ Fair Value Gaps (FVG) and conviction — talk like a trader who lives on ICT:
 - When conviction is medium or lower, do NOT invent an FVG. Give the honest read.
   Only ever cite an FVG actually present in the 'fvg' data.
 
-Request intake — the upgrade backlog (one of your main jobs):
+Request intake: the upgrade backlog (one of your main jobs):
 - Chudi, Kelechi, and Ryan are the TRUSTED requesters. LIVE BOT STATE tells
   you if THIS chat is one of them. When a trusted requester asks the bot to
   do, add, change, or fix something, OR asks for something the bot can't do
@@ -337,7 +460,7 @@ Hard rules:
   STATE block, the tools, or what the user sent. Missing a number? Say so.
 - Never promise profits. When a question is really a trading decision,
   give your honest read and end with: Your call.
-- Plain language a 6th grader could read. Short, Telegram-sized answers —
+- Plain language a 6th grader could read. Short, Telegram-sized answers,
   a few sentences unless they ask for detail.
 - Chart screenshots: describe what you actually see (trend, levels,
   candles) and connect it to the bot's strategy: 15-minute momentum turns,
@@ -376,7 +499,7 @@ SYSTEM = _render_system()
 TOOLS = [
     {
         "name": "log_trade_result",
-        "description": ("Record a trade result the user reports — their real "
+        "description": ("Record a trade result the user reports: their real "
                         "fill, win or loss, in dollars. Use whenever they say "
                         "or show how a trade went."),
         "input_schema": {
@@ -441,7 +564,7 @@ TOOLS = [
     },
     {
         "name": "macro_read",
-        "description": ("Live market data for ANY symbol — a STOCK or ETF (AAPL, "
+        "description": ("Live market data for ANY symbol: a STOCK or ETF (AAPL, "
                         "NVDA, QQQ, KO...), a FOREX pair (EUR/USD, USD/JPY...), "
                         "GOLD, or CRYPTO (BTC, ETH, SOL...): price, day move, "
                         "15-min momentum, recent high/low, 20-day trend, a "
@@ -933,9 +1056,9 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True,
                 else "This chat is a MEMBER, not the owner.")
     if intake.is_requester(chat_id):
         req_line = (f"This chat is a TRUSTED REQUESTER ({intake.who_label(chat_id)})"
-                    " — log their actionable asks with log_request.")
+                    " , log their actionable asks with log_request.")
     else:
-        req_line = ("This chat is NOT a trusted requester — chat normally, do "
+        req_line = ("This chat is NOT a trusted requester, chat normally, do "
                     "NOT log requests.")
     context_text = (f"Right now it is {now_ct:%A %Y-%m-%d %I:%M %p} CT.\n"
                     f"{who_line}\n{req_line}\n"
@@ -984,6 +1107,9 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True,
             if deep_answer:  # the deep brain already answered; hand it over
                 reply = deep_answer
                 break
+            low = (err or "").lower()
+            if low.startswith(("my brain", "brain is")):
+                return err[0].upper() + err[1:]
             return f"My brain is unavailable right now: {err}"
         if body.get("stop_reason") == "refusal":
             # Fable 5 safety decline: HTTP 200 with stop_reason 'refusal' and

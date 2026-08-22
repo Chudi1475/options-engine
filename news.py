@@ -55,9 +55,73 @@ HOT_WORDS = re.compile(
     r"|emergency (?:meeting|rate)|circuit breaker",
     re.IGNORECASE)
 
+# The market-wide feeds (CNBC top news, MarketWatch top stories) carry every
+# lawsuit, recall and opinion piece on the wire. Only the macro shocks that
+# move the whole tape count there; the company-level words (lawsuit, recall,
+# downgrade, guidance cut...) stay in HOT_WORDS for the per-TICKER feeds,
+# where a hit is about a name we actually trade. 8/21 fired six BREAKING
+# texts, three of them one Canada-tariff story told three ways and one a
+# Medicare opinion column that said "bankrupt".
+MACRO_HOT = re.compile(
+    r"war|invasion|missile|nuclear|air ?strike|escalat"
+    r"|tariff|sanction|export (?:ban|curb|control|rule)|chip ban"
+    r"|halts? trading|trading halt|circuit breaker|plunge|crash"
+    r"|emergency (?:meeting|rate)|rate (?:cut|hike|decision)|fed"
+    r"|government shutdown|debt ceiling|sovereign default",
+    re.IGNORECASE)
+
+# ETFs and indexes report no earnings; asking Yahoo for a calendar they do
+# not have is a guaranteed 404 on every fetch.
+NO_EARNINGS = {"SPY", "QQQ", "IWM", "DIA", "GLD", "SLV", "ARKK", "SPX",
+               "VIX", "VOO", "VTI", "TLT", "XLF", "XLE", "XLK", "SMH"}
+
 # 30-minute in-memory cache so the loop never hammers the feeds
 _cache = {}
 CACHE_SECONDS = 1800
+
+_STOP = {"the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "as",
+         "at", "by", "is", "are", "was", "were", "it", "its", "this", "that",
+         "with", "from", "says", "said", "say", "here", "what", "could",
+         "would", "will", "after", "before", "over", "into", "about", "than",
+         "amid", "new", "how", "why", "who", "his", "her", "their", "they",
+         "has", "have", "had", "but", "not", "out", "more", "still", "just"}
+
+
+def topic_key(title: str) -> frozenset:
+    """The words that carry a headline's topic: lowercase, 4+ letters, no
+    stop words, digits kept. Two headlines about the same event share most of
+    these even when the outlets phrase them differently."""
+    words = re.findall(r"[a-z0-9][a-z0-9'$.-]*", (title or "").lower())
+    out = set()
+    for w in words:
+        w = w.strip("'.-")
+        if len(w) < 4 or w in _STOP:
+            continue
+        if len(w) > 4 and w.endswith("s") and not w.endswith("ss"):
+            w = w[:-1]   # tariffs/tariff, recalls/recall: one topic word
+        out.add(w)
+    return frozenset(out)
+
+
+def same_story(title: str, sent_titles, min_shared: int = 3,
+               min_overlap: float = 0.4) -> bool:
+    """True when `title` retells a story already in `sent_titles`: at least
+    `min_shared` topic words in common AND they cover at least `min_overlap`
+    of the shorter headline's topic words. Guards the breaking-news thread
+    against texting one tariff story three times as three outlets pick it
+    up, while two different stories that merely share a name still both
+    fire."""
+    key = topic_key(title)
+    if not key:
+        return False
+    for prev in sent_titles or []:
+        pk = topic_key(prev)
+        if not pk:
+            continue
+        shared = len(key & pk)
+        if shared >= min_shared and shared / min(len(key), len(pk)) >= min_overlap:
+            return True
+    return False
 
 
 def _fetch_titles(url: str) -> list:
@@ -93,9 +157,10 @@ def hot_headlines(ticker=None, ttl=CACHE_SECONDS) -> list:
         feeds = [(name, _cached(f"m:{name}", lambda u=url: _fetch_titles(u), ttl))
                  for name, url in MARKET_FEEDS]
     out = []
+    hot = HOT_WORDS if ticker else MACRO_HOT
     for outlet, titles in feeds:
         for t in titles:
-            if t and HOT_WORDS.search(t):
+            if t and hot.search(t):
                 out.append((outlet, t))
     return out
 
@@ -147,16 +212,20 @@ def all_hot_healthy(watchlist: dict, ttl=CACHE_SECONDS):
     out, seen, all_ok = [], set(), True
     for outlet, titles, ok in feeds:
         all_ok = all_ok and ok
+        # the two market-wide feeds are the first two entries (MARKET_FEEDS);
+        # everything after them is a per-ticker feed
+        hot = HOT_WORDS if outlet == TICKER_FEED[0] else MACRO_HOT
         for t in titles:
-            if t and t not in seen and HOT_WORDS.search(t):
+            if t and t not in seen and hot.search(t):
                 seen.add(t)
                 out.append((outlet, t))
     return out, all_ok
 
 
 def next_earnings(ticker: str):
-    """Next scheduled earnings date for a stock, or None (indexes have none)."""
-    if ticker.startswith("^") or ticker == "SPX":
+    """Next scheduled earnings date for a stock, or None (indexes and ETFs
+    have none)."""
+    if ticker.startswith("^") or ticker.upper() in NO_EARNINGS:
         return None
 
     def fetch():
@@ -201,7 +270,7 @@ def morning_lines(watchlist: dict) -> list:
         e = next_earnings(ticker)
         if e is not None and (e - _today()).days <= 7:
             when = "TODAY" if e == _today() else e.strftime("%a %m/%d")
-            lines.append(f"📅 {ticker} earnings {when} — alerts whose option "
+            lines.append(f"📅 {ticker} earnings {when}. Alerts whose option "
                          "lives through it get skipped.")
     flagged = hot_headlines()
     for ticker in watchlist:
@@ -216,7 +285,7 @@ def morning_lines(watchlist: dict) -> list:
             break
         lines.append(f"📰 {outlet}: {title}")
     if flagged:
-        lines.append("(Headlines above tripped the hot-word scan — read "
+        lines.append("(Headlines above tripped the hot-word scan. Read "
                      "them yourself before sizing up.)")
     return lines
 

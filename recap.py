@@ -283,8 +283,8 @@ def main(require_date=None):
     # yfinance hasn't published today's session yet, bail so the caller retries
     # later instead of texting a stale-day recap and marking today done.
     if require_date is not None and str(session) != str(require_date) and not dry:
-        print(f"recap: latest session data is {session}, not {require_date} — "
-              "yfinance not caught up; skipping so we don't grade the wrong day.")
+        print(f"recap: latest session data is {session}, not {require_date}: "
+              "yfinance not caught up, skipping so we don't grade the wrong day.")
         return "STALE"
     spx_day = spx[spx.index.date == session]
     day_name = pd.Timestamp(session).strftime("%A %#m/%#d") if sys.platform.startswith("win") \

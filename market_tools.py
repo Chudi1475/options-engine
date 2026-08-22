@@ -282,7 +282,7 @@ def analyze_day(ticker="SPX", date_str=None, cfg=None, allowed=None):
         "time": f["time"], "direction": f["direction"], "strike": f["strike"],
         "momentum_pct": f["mom_pct"], "win_rate_quoted": f["win_rate"],
         "entry_est_price": round(entry_prem, 2),
-        "pricing": "ESTIMATE — approximated option pricing (no free historical "
+        "pricing": "ESTIMATE: approximated option pricing (no free historical "
         "chains). Real 0DTE fills differ, often a lot. Frame as a rough idea.",
         "exit_result_pct": _weighted_pct(legs, entry_prem),
         "exit_steps": [f"{n} of {CONTRACTS} at {round((px/entry_prem-1)*100):+d}% "
@@ -553,6 +553,53 @@ def _alpaca_eligible(yfs, kind):
             and bool(_ALPACA_SYM.match(yfs or "")))
 
 
+def _sniper_bars(bars, yfs, now):
+    """The bars the SNIPER gate may look at, matching the data its backtest
+    ran on: COMPLETED 5-minute bars only (a bar whose window has not closed
+    is still forming and can un-form the gap it seems to show), and for the
+    stock/index names the REGULAR SESSION only, 09:30-16:00 ET. The round-6
+    stock data never held a pre-market bar and never signalled before 10:00
+    ET; on 8/21 the live gate fired TSLA at 07:03 and SPY at 07:27 ET off
+    pre-market prints it was never measured on. Pure; a bad frame comes back
+    untouched rather than raising."""
+    if bars is None or bars.empty:
+        return bars
+    try:
+        out = bars
+        if getattr(out.index, "tz", None) is not None and now is not None:
+            out = out[out.index <= now - timedelta(minutes=5)]
+        import fvg as _fvg
+        if yfs in _fvg.SNIPER_RTH_SYMBOLS:
+            from datetime import time as _dtime
+            t = out.index.time
+            out = out[(t >= _dtime(9, 30)) & (t < _dtime(16, 0))]
+        # today's session only: the backtest graded each signal on
+        # day_df.iloc[:i + 1] (confirming gap, ATR and open all from the
+        # session in progress), never on yesterday's bars
+        if len(out):
+            last_day = max(out.index.date)
+            out = out[[d == last_day for d in out.index.date]]
+        return out
+    except Exception:
+        return bars
+
+
+def _bars_json(bars, n=12):
+    """The last n bars as JSON-safe rows [iso_ts, open, high, low, close],
+    oldest first, for the sniper ledger's bar-walk. None when empty."""
+    if bars is None or bars.empty:
+        return None
+    rows = []
+    for ts, r in bars.tail(n).iterrows():
+        try:
+            rows.append([ts.isoformat(), round(float(r["Open"]), 6),
+                         round(float(r["High"]), 6), round(float(r["Low"]), 6),
+                         round(float(r["Close"]), 6)])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+    return rows or None
+
+
 def _do_read(disp, yfs, dec, kind, source):
     """Shared read engine for any symbol: price, day move, 15-min momentum,
     recent high/low, 20-day trend, a momentum/trend BIAS, an ATR-sized trade
@@ -779,11 +826,13 @@ def _do_read(disp, yfs, dec, kind, source):
     # Fair Value Gap conviction (ICT / smart-money grade). We never trade on an
     # FVG alone. Conviction "high" is EARNED by exactly one thing: the SNIPER
     # pattern, the walk-forward-verified round-6 config (grade A confirming FVG
-    # on a verified symbol, gap 1.0-3.0 ATR, 07:00 ET+, run-from-open < 8 ATR,
-    # day efficiency < 0.85, stop < 3.6 ATR). It measured 79.0% over 133
-    # replays; nothing else may borrow that number. A plan without the sniper
-    # gate is "medium" (structural read only), no plan but strong gaps = "watch".
+    # on a verified symbol, gap 1.0-3.0 ATR, the US session window from
+    # fvg._SNIPER_OPEN_ET, run-from-open < 8 ATR, day efficiency < 0.85, stop
+    # < 3.6 ATR). Its measured record is read from its report by strategy_spec;
+    # nothing else may borrow that number. A plan without the sniper gate is
+    # "medium" (structural read only), no plan but strong gaps = "watch".
     fvg_info, conviction = None, None
+    sniper_bars_json = None
     try:
         import fvg as _fvg
         fbars = day_bars if (day_bars is not None and not day_bars.empty) \
@@ -795,16 +844,57 @@ def _do_read(disp, yfs, dec, kind, source):
             actionable = [f for f in allf if f["state"] != "filled"]
             # the strongest few to draw, best grade first
             actionable.sort(key=lambda f: (f["score"], f["i"]), reverse=True)
-            sniper = _fvg.sniper_check(fbars, direction, price, atr, conf,
-                                       yfs, datetime.now(ET))
-            is_sniper = bool(plan and conf and sniper.get("passes")
+            # The SNIPER gate sees only the bars its backtest saw: completed
+            # bars, and for stocks the regular session. Its ATR, its
+            # confirming gap and its day open all come from that slice.
+            _now = datetime.now(ET)
+            sbars = _sniper_bars(m5 if have_5m else fbars, yfs, _now)
+            if (yfs in _fvg.SNIPER_SYMBOLS and sbars is not None
+                    and len(sbars) and sbars.index[-1].date() == _now.date()):
+                sniper_bars_json = _bars_json(sbars, 12)  # today's only
+            satr = _atr(sbars) or atr
+            # The gate's direction, momentum and plan come from the SAME
+            # session-only bars as its gap and ATR (the backtest computed
+            # every one of them on the session frame), never from a frame
+            # that still holds pre-market prints.
+            sdir, splan, sbias, smom = direction, plan, bias, mom15
+            if (yfs in _fvg.SNIPER_SYMBOLS and sbars is not None
+                    and len(sbars) >= 4):
+                try:
+                    smom = momentum_pct(sbars.dropna(subset=["Close"]),
+                                        live_params.effective()[0])
+                    sbias = "neutral"
+                    if smom is not None and sma20 is not None and satr and price:
+                        smin = max(MOM_FLOOR_PCT,
+                                   MOM_ATR_MULT * (satr / price * 100))
+                        if smom >= smin:
+                            sbias = "bullish" if above else "bullish-weak"
+                        elif smom <= -smin:
+                            sbias = "bearish" if not above else "bearish-weak"
+                    shi = _nan_none(sbars["High"].max(), dec)
+                    slo = _nan_none(sbars["Low"].min(), dec)
+                    splan = (None if (stale or blackout) else
+                             plan_levels(round(price, dec), sbias, satr,
+                                         shi, slo, dec, kind))
+                    sdir = splan["direction"] if splan else None
+                    smom = round(smom, 2) if smom is not None else None
+                except Exception:
+                    sdir, splan, sbias, smom = direction, plan, bias, mom15
+            sconf = (_fvg.confirming_fvg(sbars, sdir, price, satr, sbias)
+                     if sbars is not None and not sbars.empty else None)
+            sniper = _fvg.sniper_check(sbars, sdir, price, satr, sconf,
+                                       yfs, _now)
+            is_sniper = bool(splan and sconf and sniper.get("passes")
                              and sniper.get("ticket"))
+            if is_sniper:
+                # the ticket, the chart and the card all describe THIS read
+                conf, plan, bias, mom15 = sconf, splan, sbias, smom
             fvg_info = {"confirming": conf, "recent_unfilled": actionable[:6],
                         "sniper": is_sniper}
             if is_sniper:
                 conviction = "high"
                 ticket = dict(sniper["ticket"])
-                ticket["measured"] = dict(_fvg.SNIPER_MEASURED)
+                ticket["measured"] = _spec.sniper_measured_dict()
                 # stretch map: same entry/stop, bigger paydays. These carry NO
                 # measured win rate yet; the forward ledger is earning them one.
                 try:
@@ -830,17 +920,20 @@ def _do_read(disp, yfs, dec, kind, source):
             # (passes AND near-misses) so the bot grades itself every night
             try:
                 import forward_ledger as _fl
-                _tk = (conf.get("ticket") if (conf and is_sniper)
-                       else (sniper.get("ticket") or (conf or {}).get("ticket")))
-                if conf and direction and _tk and _tk.get("entry") is not None:
+                # the ledger describes a candidate in the units the GATE
+                # judged it in: the session-bar gap, ATR and direction
+                _lconf = sconf or conf
+                _ldir = sdir or direction
+                _tk = (_lconf.get("ticket") if (_lconf and is_sniper)
+                       else (sniper.get("ticket") or (_lconf or {}).get("ticket")))
+                if _lconf and _ldir and _tk and _tk.get("entry") is not None:
                     _gap_atr = None
                     try:
-                        _gap_atr = (float(conf["top"]) - float(conf["bottom"])) / atr
+                        _gap_atr = (float(_lconf["top"]) - float(_lconf["bottom"])) / satr
                     except (KeyError, TypeError, ZeroDivisionError):
                         pass
-                    _now = datetime.now(ET)
                     _fl.record_candidate(
-                        yfs, direction, price, atr, _tk, conf,
+                        yfs, _ldir, price, satr, _tk, _lconf,
                         bool(is_sniper), sniper.get("reasons"),
                         gap_atr=_gap_atr, hour_et=_now.hour, now_et=_now)
             except Exception:
@@ -852,6 +945,8 @@ def _do_read(disp, yfs, dec, kind, source):
         "instrument": disp, "ticker": _signal_symbol(disp, kind),
         "symbol": yfs, "kind": kind, "decimals": dec,
         "fvg": fvg_info, "conviction": conviction,
+        # completed bars for the sniper ledger's bar-walk (verified symbols only)
+        "recent_bars": sniper_bars_json,
         "price": round(price, dec), "asof": asof, "stale": stale,
         "prior_close": round(prior_close, dec) if prior_close is not None else None,
         "day_move_pct": round((price / prior_close - 1) * 100, 2) if prior_close else None,
@@ -876,7 +971,7 @@ def _do_read(disp, yfs, dec, kind, source):
                 "exactly one thing: this read passed the verified SNIPER pattern "
                 "(fvg.sniper true) and its measured record is in "
                 f"fvg.confirming.ticket.measured: {_spec.sniper_record_txt()} "
-                "(chart_backtest_round6). Quote that measured "
+                f"({_spec.sniper.source}). Quote that measured "
                 "number when and ONLY when conviction is high, and give the sniper "
                 "ticket from fvg.confirming.ticket: entry (market, now), stop, "
                 f"target (take profit at {_spec.sniper_tp_txt()}, all out, no "

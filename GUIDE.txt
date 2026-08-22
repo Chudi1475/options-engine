@@ -2,14 +2,14 @@
 # Every number below is rendered from strategy_spec, never typed by hand.
 
 ================================================
-  OPTIONS ALERT BOT — HOW TO READ AND USE IT
+  OPTIONS ALERT BOT, HOW TO READ AND USE IT
 ================================================
 
 WHAT THIS IS
 ------------
 A Telegram bot that watches the market every morning (9:45-10:30 ET)
 and texts you when a high-probability options setup appears. It is built
-from a real trader's order history — it looks for the exact pattern
+from a real trader's order history, it looks for the exact pattern
 behind his best trades and ignores everything else. After an alert, it
 keeps watching YOUR trade all day and texts you every exit step.
 
@@ -30,22 +30,22 @@ aside for the whole day. Those days tested badly, so it does not trade them.
 THE ENTRY ALERT (this is the money text)
 -----------------------------------------
   💰 EXPECTED: +10.5% per trade after est. costs
-  (NEW-RULES BACKTEST, approx pricing — live stats take over after 30 signals)
+  (NEW-RULES BACKTEST, approx pricing, live stats take over after 30 signals)
 
-  📈 BUY CALL — SPXW 7300, expires TODAY 6/11
-  Quote: Bid $4.20 / Ask $4.60 — set a LIMIT order near $4.40. Never market-order.
-  Size: ~1.11% of account — risking 1% if stopped
+  📈 BUY CALL, SPXW 7300, expires TODAY 6/11
+  Quote: Bid $4.20 / Ask $4.60, set a LIMIT order near $4.40. Never market-order.
+  Size: ~1.11% of account, risking 1% if stopped
 
-  WHY: SPX just turned UP in the last 15 minutes (+0.21%) — the exact
+  WHY: SPX just turned UP in the last 15 minutes (+0.21%), the exact
   pattern behind Kelechi's best trades.
 
-  EXIT PLAN — I'll text you each step:
+  EXIT PLAN: I'll text you each step:
   1️⃣ SELL HALF at +25%
   2️⃣ let the rest RUN. I text you when it gives back 40 points from its peak
   3️⃣ STOP: -90% → sell everything
   4️⃣ expires today → I warn you 15 min before close
 
-  🟢 Win rate in testing: at least 70 of 100 — SOLID (...)
+  🟢 Win rate in testing: at least 70 of 100, SOLID (...)
   Your call.
 
 (The dollar figures above are an EXAMPLE card, not a claim. The rule numbers
@@ -53,33 +53,33 @@ in it are the live ones.)
 
 WHAT EACH LINE MEANS
 --------------------
-EXPECTED — the average % this exact setup made per trade in testing,
+EXPECTED, the average % this exact setup made per trade in testing,
   after estimated costs. This is the number that matters. (Win rate alone
   can lie: a setup can win often and still lose money.)
 
-Quote / LIMIT — buy with a LIMIT order near the middle price shown.
+Quote / LIMIT, buy with a LIMIT order near the middle price shown.
   NEVER use a market order on options; the spread will eat you.
-  If the price already ran way past the quote, skip the trade — chasing
+  If the price already ran way past the quote, skip the trade, chasing
   was not what got backtested.
 
-Size — how much to put in so that a full stop-out costs you exactly
+Size, how much to put in so that a full stop-out costs you exactly
   1% of your account. At the live -90% stop that works out
   to roughly 1.11% of the account per trade. Text /setaccount 25000
-  to the bot once and it shows real dollar amounts. "CORRELATED — half size"
+  to the bot once and it shows real dollar amounts. "CORRELATED, half size"
   means you already have a same-direction trade open, so this one risks
   0.5% instead.
 
-Win rate — small line on purpose. Nothing below 70 of 100 in testing can
+Win rate, small line on purpose. Nothing below 70 of 100 in testing can
   ever produce an alert, so every card you get already cleared that bar.
   Expected value is still the honest headline: the exit rules trade win
   COUNT for win SIZE by letting winners run.
 
 THE EXIT TEXTS (the bot watches your trade so you don't have to)
 ----------------------------------------------------------------
-💰 SELL HALF — +25% target hit.......sell half, let the rest ride
-   (only bought 1 contract? just sell it — banking the win is the play)
-🔄 GAVE BACK 40 — SELL REST..the move peaked and faded, sell what's left
-🛑 STOP — SELL EVERYTHING.............down -90%. Sell. No hoping.
+💰 SELL HALF, +25% target hit.......sell half, let the rest ride
+   (only bought 1 contract? just sell it, banking the win is the play)
+🔄 GAVE BACK 40, SELL REST..the move peaked and faded, sell what's left
+🛑 STOP, SELL EVERYTHING.............down -90%. Sell. No hoping.
 ⏰ CLOSE BEFORE EXPIRY................15 min to the bell, close it out
 
 The runner exit is a GIVE-BACK trail, not a prediction: once the trade is up,
@@ -87,7 +87,7 @@ the bot tracks its best gain and tells you to sell when it drops 40 points
 off that peak (example: +60% falling to +20%).
 
 Option prices in these texts come from a live quote when available
-(may be ~15 min delayed) or a clearly-labeled estimate — your broker
+(may be ~15 min delayed) or a clearly-labeled estimate, your broker
 shows the real number, the instruction is what matters.
 
 HOW TO TAKE THE TRADE ON ROBINHOOD (60 seconds)
@@ -104,7 +104,7 @@ HOW TO TAKE THE TRADE ON ROBINHOOD (60 seconds)
    cents toward the Ask. If the option already ran far past the quoted
    price, let it go. There's another trade tomorrow.
 7. Then just follow the bot's texts: sell half at +25%, sell the rest on
-   the GAVE BACK text, and if the STOP text comes — sell. Don't
+   the GAVE BACK text, and if the STOP text comes, sell. Don't
    hope. Don't average down. Sell.
 
 TEXTING THE BOT (commands)
@@ -115,7 +115,7 @@ TEXTING THE BOT (commands)
 /test              -> sends fake examples of all 5 alert types
 /help              -> the list above
 
-You can also just TALK to it like a person — ask "why did we stop out
+You can also just TALK to it like a person, ask "why did we stop out
 today?", send a chart screenshot, or send a file, and it reads it and
 answers in plain English. (Needs the AI key set up by the owner.)
 
@@ -124,7 +124,7 @@ THE THREE RULES THAT KEEP YOU ALIVE
 1. If you didn't get a text, there is no trade. Boredom is not a setup.
 2. The stop is the stop. One ignored stop can erase a week of wins.
 3. Size off the text (~1.11% of account). Losing streaks happen even
-   when nothing is wrong — size so that 5 losses in a row barely sting.
+   when nothing is wrong, size so that 5 losses in a row barely sting.
 
 HONESTY NOTES (read once)
 -------------------------

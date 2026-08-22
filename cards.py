@@ -184,9 +184,9 @@ _GAP_ZONE = {
 
 def _conviction_line(r: dict) -> str:
     """Conviction 'high' is the verified SNIPER pattern: quote the measured
-    record from fvg.SNIPER_MEASURED (the one source of truth; a new backtest
-    round updates it there). Anything below high gets no measured claim, so
-    no line."""
+    record strategy_spec reads from its report file (fvg.SNIPER_MEASURED is
+    only the offline fallback). Anything below high gets no measured claim,
+    so no line."""
     conf = (r.get("fvg") or {}).get("confirming")
     if r.get("conviction") == "high" and conf:
         dec = r.get("decimals", 2)
@@ -474,19 +474,23 @@ def expiry_card(pos, ev: dict) -> str:
     ])
 
 
-def morning_card(mode: str, reason: str, today: date, window_ct: str = "") -> str:
+def morning_card(mode: str, reason: str, today: date, window_ct: str = "",
+                 sniper_line: str = "") -> str:
     effects = {
         "green": f"Standard rules. Entry window {window_ct or '8:45-9:30 AM CT'}; "
                  "I'll watch every position until the close.",
         "yellow": "Setups still fire, with a warning banner. Consider smaller size.",
         "red": "HIGH-RISK DAY: consider sitting out. Any alert today is HALF size.",
     }
-    return "\n".join([
+    lines = [
         f"{MODE_EMOJI[mode]} RISK MODE: {mode.upper()}, "
         f"{today.strftime('%A')} {fmt_day(today)}",
         reason,
         effects[mode],
-    ])
+    ]
+    if sniper_line:  # when the chart pattern can fire, so a text is never a surprise
+        lines.append(sniper_line)
+    return "\n".join(lines)
 
 
 def help_card() -> str:

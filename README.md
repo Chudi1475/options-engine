@@ -2,7 +2,7 @@
 
 # options-engine
 
-Options strategy engine: trade history analysis, strategy definition, honest backtesting, and a live Telegram alert service with all-day position tracking. **Analysis and alerts only — never places orders.**
+Options strategy engine: trade history analysis, strategy definition, honest backtesting, and a live Telegram alert service with all-day position tracking. **Analysis and alerts only, never places orders.**
 
 ## Setup
 
@@ -26,13 +26,13 @@ python scanner.py --weekly   # send the weekly scoreboard now
 
 What it does each trading day (ET):
 
-- **morning** — risk mode DM: 🟢 GREEN / 🟡 YELLOW / 🔴 RED, from the free
+- **morning**, risk mode DM: 🟢 GREEN / 🟡 YELLOW / 🔴 RED, from the free
   ForexFactory econ calendar (FOMC/CPI/PPI/NFP = RED) + VIX + overnight gap
   (+ optional web-search news check with `ANTHROPIC_API_KEY`). RED halves
   all suggested sizes. Override any time: text `/risk red` to the bot.
   SPX opening more than 1% above yesterday's close stands the whole
   day down.
-- **9:45-10:30** — entry window. The signal (15-minute momentum turn,
+- **9:45-10:30**, entry window. The signal (15-minute momentum turn,
   `strategy.py`) is unchanged from the win study; alerts only fire for
   setups with a ≥70% backtested win rate **and** positive expectancy.
   Entry cards lead with **expected value per trade** (the honest stat),
@@ -40,13 +40,13 @@ What it does each trading day (ET):
   a full stop-out costs exactly 1% of the account (`/setaccount`),
   which is about 1.11% of it per trade at the live stop.
   Live allow-list: QCOM:call, SPX:call, SPY:call, TSLA:put.
-- **all day** — every alert becomes a tracked position (`positions.json`,
+- **all day**, every alert becomes a tracked position (`positions.json`,
   survives restarts). The bot texts each exit step: **SELL HALF at +25%**,
   then the runner runs until it gives back 40 points from its peak
   (example: +60% falling to +20%), **hard stop -90%**, and a **close-before-expiry**
   warning 15 min before the bell. Each position also runs an
   old-rules (+10/-60) shadow sim on the same prices.
-- **Friday after close** — weekly scoreboard: live win rate, EV/trade,
+- **Friday after close**, weekly scoreboard: live win rate, EV/trade,
   new-rules vs old-rules totals, vs what the backtests claimed.
 
 Telegram commands: `/setaccount 25000`, `/risk green|yellow|red`,
@@ -57,9 +57,13 @@ Telegram commands: `/setaccount 25000`, `/risk green|yellow|red`,
 ## The SNIPER chart pattern
 
 The high-conviction path is the walk-forward-verified FVG setup: measured at
-79% win rate over 133 walk-forward replays, target 0.4R all out, one trade per symbol per day,
-on EURUSD=X, JPY=X, SPY, TSLA, ^GSPC. Its gate constants live in `fvg.py` and change only
-with a new verified backtest round.
+81.1% win rate over 53 out-of-sample replays, target 0.4R all out, one trade per symbol per day,
+on EURUSD=X, JPY=X, SPY, TSLA, ^GSPC. It fires 8:50 AM CT to the close, weekdays (from 09:50 ET),
+on completed 5-minute bars only, and for the stock and index names on
+regular-session bars only (never pre-market). Every fired ticket is tracked in
+`sniper_book.py` and graded bar by bar the way the backtest graded it. Its gate
+constants live in `fvg.py` and change only with a new verified backtest round;
+the record is re-scored under the live window by `rescore_round6_session.py`.
 
 ## Module map
 
@@ -122,11 +126,11 @@ python risk_gate.py --study    # 5y VIX/gap regime study
 
 ## Deploying
 
-`DEPLOY.md` — Railway in ~6 commands ($5/mo), persistent volume, plus free
+`DEPLOY.md`, Railway in ~6 commands ($5/mo), persistent volume, plus free
 Alpaca keys for real-time stock data. One rule: never run two copies at
 once (double alerts + Telegram conflicts).
 
 ## Sharing
 
 `GUIDE.txt` is the plain-English explainer to send anyone who receives the
-alerts — what every message means and how to execute on Robinhood.
+alerts, what every message means and how to execute on Robinhood.

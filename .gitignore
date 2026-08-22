@@ -5,6 +5,8 @@ data/*.csv
 reports/*
 !reports/backtest_results.json
 !reports/backtest_new_rules.json
+!reports/chart_backtest_round6.json
+!reports/chart_backtest_round6_session.json
 alerts.log
 alerts_sent.jsonl
 positions.json

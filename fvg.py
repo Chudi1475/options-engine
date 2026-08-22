@@ -24,6 +24,8 @@ lower-timeframe entry; here the caller's momentum/20-day bias is the bias proxy
 and the bars' own range is the dealing range.
 """
 
+from datetime import time as _time
+
 import pandas as pd
 
 # a gap this small is micro-noise even if the wicks technically miss
@@ -31,21 +33,59 @@ _MIN_GAP_ATR = 0.05
 
 # ---------------------------------------------------------------------------
 # SNIPER pattern: the walk-forward-verified config from
-# reports/chart_backtest_round6.json (procedural winner, OOS 79.0% / 62 trades,
-# 133 trades total across IS+OOS). Every constant here mirrors that config;
-# change them only with a new verified backtest round.
+# reports/chart_backtest_round6.json (procedural winner), re-scored under the
+# live session floor in reports/chart_backtest_round6_session.json. Every
+# constant here mirrors that config; change them only with a new verified
+# backtest round. The measured record itself is read from the report by
+# strategy_spec (never typed here); SNIPER_MEASURED below is only the
+# offline fallback when the report file is missing.
 # ---------------------------------------------------------------------------
 SNIPER_SYMBOLS = {"EURUSD=X", "JPY=X", "^GSPC", "TSLA", "SPY"}
+# Yahoo symbols whose verified data was the REGULAR US session only. The
+# backtest's stock/index bars ran 09:30-16:00 ET and it never signalled one
+# stock trade before 10:00 ET, so pre-market bars are outside the pattern:
+# the live gate evaluates these names on regular-session bars only.
+SNIPER_RTH_SYMBOLS = {"^GSPC", "TSLA", "SPY"}
 _SNIPER_MIN_GAP_ATR = 1.0    # FVG gap floor (x ATR)
 _SNIPER_MAX_GAP_ATR = 3.0    # FVG gap cap (x ATR)
-_SNIPER_MIN_HOUR_ET = 7      # entries only 07:00 ET or later
+# entries only from 09:50 ET (8:50 AM CT), the US session. The backtest's
+# SKIP_FIRST_BARS=4 made 09:50 the first bar a stock could signal on; the
+# owner's rule (8/22) is no alerts at 6 or 7 AM CT, so forex keeps the same
+# single floor. The 22 pre-09:50 replays this drops are listed in
+# reports/chart_backtest_round6_session.json (all forex).
+_SNIPER_OPEN_ET = _time(9, 50)
+_SNIPER_MIN_SESSION_BARS = 5  # backtest SKIP_FIRST_BARS=4: signal on bar 5+
+_SNIPER_MAX_BAR_AGE_MIN = 12  # the last completed bar must be this fresh
 _SNIPER_MAX_RUN_ATR = 8.0    # skip if price already ran this far from the open
 _SNIPER_MAX_DAY_EFF = 0.85   # skip a one-way day: abs(close-open)/(high-low)
 _SNIPER_MAX_RISK_ATR = 3.6   # skip if the stop sits this far away or more
 _SNIPER_STOP_BUF_ATR = 0.1   # stop = FVG far edge +/- this buffer
 _SNIPER_TP_R = 0.4           # take profit, all out, no runner
-SNIPER_MEASURED = {"win_rate": 79.0, "trades": 133,
-                   "basis": "walk-forward replay, chart_backtest_round6"}
+# offline fallback only (strategy_spec reads the report when it exists):
+# the OUT-OF-SAMPLE pair from the session re-score, rate with its own count.
+SNIPER_MEASURED = {"win_rate": 83.3, "trades": 48, "wins": 40,
+                   "basis": "out-of-sample walk-forward replays, "
+                            "chart_backtest_round6_session"}
+
+
+def sniper_window_open(now_et) -> bool:
+    """True when the clock allows a sniper ENTRY: a weekday at/after
+    _SNIPER_OPEN_ET and before the 16:00 ET close. Pure; the one place the
+    window is defined so the watcher thread, the gate and the text surfaces
+    can never disagree."""
+    try:
+        return (now_et.weekday() < 5
+                and _SNIPER_OPEN_ET <= now_et.time() < _time(16, 0))
+    except (AttributeError, TypeError):
+        return False
+
+
+def sniper_open_ct_txt() -> str:
+    """The entry floor as Central wall-clock text, e.g. '8:50 AM CT'. ET is
+    always CT+1 (same DST dates), display only."""
+    from datetime import datetime as _dt, timedelta as _td
+    t = _dt(2000, 1, 3, _SNIPER_OPEN_ET.hour, _SNIPER_OPEN_ET.minute) - _td(hours=1)
+    return t.strftime("%I:%M %p").lstrip("0") + " CT"
 # middle-candle body must clear this multiple of ATR to count as real
 # displacement (strong = institutional impulse, not a drift)
 _DISP_STRONG_ATR = 1.0
@@ -271,7 +311,8 @@ def sniper_check(bars, direction, price, atr, conf, yf_symbol, now_et):
       - yf_symbol is one of the five verified symbols (SNIPER_SYMBOLS)
       - `conf` is a grade A confirming FVG in the plan `direction`
       - FVG gap size >= 1.0*ATR and < 3.0*ATR
-      - clock (now_et) is 07:00 ET or later
+      - clock (now_et) is inside the US session window: a weekday at/after
+        _SNIPER_OPEN_ET (09:50 ET) and before 16:00 ET
       - price has run < 8*ATR from today's session open in the trade direction
       - day efficiency abs(close-open)/(high-low) < 0.85
       - stop distance < 3.6*ATR, stop = FVG far edge -0.1*ATR (BUY, bottom
@@ -309,11 +350,12 @@ def sniper_check(bars, direction, price, atr, conf, yf_symbol, now_et):
                 reasons.append(f"FVG gap {size / atr:.2f} ATR at/over the "
                                f"{_SNIPER_MAX_GAP_ATR:g} ATR cap")
 
-        if now_et is None or not hasattr(now_et, "hour"):
+        if now_et is None or not hasattr(now_et, "time"):
             reasons.append("no session clock")
-        elif now_et.hour < _SNIPER_MIN_HOUR_ET:
-            # gate stays 07:00 ET internally; the user-facing label is CT
-            reasons.append(f"before {_SNIPER_MIN_HOUR_ET - 1}:00 AM CT")
+        elif not sniper_window_open(now_et):
+            # gate stays on ET internally; the user-facing label is CT
+            reasons.append(f"outside the US session window (from "
+                           f"{sniper_open_ct_txt()}, weekdays)")
 
         # today's session only: bars may span days when intraday fell back
         db = bars
@@ -338,8 +380,23 @@ def sniper_check(bars, direction, price, atr, conf, yf_symbol, now_et):
                 day_close = float(c.iloc[-1])
         except (KeyError, TypeError, ValueError, IndexError):
             pass
+        try:  # a stalled feed can hand the gate a quarter-hour-old signal bar
+            last_ts = db.index[-1].to_pydatetime()
+            if (now_et is not None and last_ts.tzinfo is not None
+                    and getattr(now_et, "tzinfo", None) is not None):
+                age_min = (now_et - last_ts).total_seconds() / 60 - 5
+                if age_min > _SNIPER_MAX_BAR_AGE_MIN:
+                    reasons.append(f"last completed bar is {age_min:.0f} "
+                                   "minutes old, feed is stale")
+        except Exception:
+            pass
         if day_open is None:
             reasons.append("can't read today's session bars")
+        elif len(db) < _SNIPER_MIN_SESSION_BARS:
+            # the backtest skipped the first 4 bars of every session
+            # (SKIP_FIRST_BARS=4): the earliest signal bar was the fifth
+            reasons.append(f"only {len(db)} completed session bars, the "
+                           f"pattern needs {_SNIPER_MIN_SESSION_BARS}")
         else:
             run = (price - day_open) if direction == "BUY" else (day_open - price)
             if run >= _SNIPER_MAX_RUN_ATR * atr:

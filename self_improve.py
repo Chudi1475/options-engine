@@ -85,8 +85,9 @@ Hard rules:
   history (no rebase/reset/amend).
 - Verify before committing: compile every file you touched with
   .venv/Scripts/python.exe -m py_compile, then run
-  .venv/Scripts/python.exe test_pipeline.py, test_adduser.py and
-test_no_hardcoded_stats.py. All must pass. If you change a rule number, change
+  .venv/Scripts/python.exe test_pipeline.py, test_adduser.py,
+test_no_hardcoded_stats.py, test_session_fixes.py and test_no_em_dash.py.
+All must pass. If you change a rule number, change
 it in config.py and let strategy_spec render it: never type a stat into a card,
 a prompt or a doc, and run `python gen_docs.py` after a config change.
 - Commit with git add <files> && git commit -m "<what and why, one line>".
@@ -175,7 +176,8 @@ def run_checks(files: list) -> bool:
                 say(f"gate: compile failed: {r.stderr[:300]}")
                 return False
         for test in ("test_pipeline.py", "test_adduser.py",
-                     "test_no_hardcoded_stats.py"):
+                     "test_no_hardcoded_stats.py", "test_session_fixes.py",
+                     "test_no_em_dash.py"):
             r = subprocess.run([PYEXE, test], cwd=REPO, timeout=600,
                                capture_output=True, text=True, errors="replace")
             if r.returncode != 0:

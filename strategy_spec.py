@@ -33,6 +33,7 @@ quoting a number that no longer has a source.
 """
 
 import json
+from datetime import time as _time
 import re
 from dataclasses import dataclass
 
@@ -47,7 +48,11 @@ import positions as poslib
 # ---------------------------------------------------------------------------
 REPORT_OLD_RULES = "reports/backtest_results.json"
 REPORT_NEW_RULES = "reports/backtest_new_rules.json"
-REPORT_SNIPER = "reports/chart_backtest_round6.json"
+# the live sniper record: the round-6 winner re-scored under the live session
+# floor (a measurement of a fixed config, see rescore_round6_session.py).
+# The un-floored source report stays as the fallback.
+REPORT_SNIPER = "reports/chart_backtest_round6_session.json"
+REPORT_SNIPER_SOURCE = "reports/chart_backtest_round6.json"
 REPORT_REGIME = "bt_exp_regime_split.json"
 
 # The text surfaces that must not hand-type a stat. Kept here so the guard
@@ -104,6 +109,7 @@ class Measured:
     trades: int = None
     source: str = ""
     basis: str = ""
+    wins: int = None
 
     def __bool__(self) -> bool:
         return self.win_rate is not None
@@ -158,7 +164,8 @@ class StrategySpec:
     sniper_symbols: frozenset
     sniper_min_gap_atr: float
     sniper_max_gap_atr: float
-    sniper_min_hour_et: int
+    sniper_open_et: _time
+    sniper_rth_symbols: frozenset
     sniper_max_run_atr: float
     sniper_max_day_eff: float
     sniper_max_risk_atr: float
@@ -218,23 +225,71 @@ class StrategySpec:
         return f"{self.mom_minutes}-minute momentum"
 
     def sniper_record_txt(self) -> str:
-        """The measured record as 'N% win rate over M walk-forward replays'.
-        '' when the report is missing, so the claim drops instead of going
-        stale."""
+        """The measured record as 'N% win rate over M out-of-sample
+        walk-forward replays'. '' when the report is missing, so the claim
+        drops instead of going stale."""
         if not self.sniper:
             return ""
         return (f"{self.sniper.win_rate:g}% win rate over "
-                f"{self.sniper.trades} walk-forward replays")
+                f"{self.sniper.trades} {self.sniper.basis or 'replays'}")
 
-    def sniper_short_txt(self) -> str:
-        """'79% verified' for chart titles. '' with no report."""
-        return f"{self.sniper.win_rate:g}% verified" if self.sniper else ""
-
-    def sniper_replays_txt(self) -> str:
-        """The compact 'N% on M replays' chart caption. '' with no report."""
+    def sniper_card_txt(self) -> str:
+        """The entry-card claim: 'won 40 of 48 out-of-sample replays (83 of
+        100)'. The rate is always shown next to ITS OWN count. '' with no
+        report."""
         if not self.sniper:
             return ""
-        return f"{self.sniper.win_rate:g}% on {self.sniper.trades} replays"
+        if self.sniper.wins is not None and self.sniper.trades:
+            return (f"hit target {self.sniper.wins} of {self.sniper.trades} "
+                    f"in out-of-sample testing ({self.sniper.of_100()})")
+        return (f"{self.sniper.of_100()} over {self.sniper.trades} "
+                f"{self.sniper.basis or 'replays'}")
+
+    def sniper_measured_dict(self) -> dict:
+        """The record as the JSON-safe dict carried on a sniper ticket."""
+        if not self.sniper:
+            return {}
+        return {"win_rate": self.sniper.win_rate, "trades": self.sniper.trades,
+                "wins": self.sniper.wins, "basis": self.sniper.basis,
+                "source": self.sniper.source}
+
+    def sniper_open_ct_txt(self) -> str:
+        """The sniper entry floor as CT wall-clock text ('8:50 AM CT')."""
+        from datetime import datetime as _dt, timedelta as _td
+        t = (_dt(2000, 1, 3, self.sniper_open_et.hour,
+                 self.sniper_open_et.minute) - _td(hours=1))
+        return t.strftime("%I:%M %p").lstrip("0") + " CT"
+
+    def sniper_window_txt(self) -> str:
+        """'8:50 AM CT to the close, weekdays': when a sniper can fire."""
+        return f"{self.sniper_open_ct_txt()} to the close, weekdays"
+
+    def sniper_watch_sentence(self) -> str:
+        """The morning-card line: what the sniper watches and from when."""
+        names = sorted(self.sniper_symbol_names())
+        listed = ", ".join(names[:-1]) + f" and {names[-1]}" if len(names) > 1 \
+            else (names[0] if names else "")
+        return (f"Sniper chart pattern: watching {listed} from "
+                f"{self.sniper_open_ct_txt()} to the close. Nothing fires "
+                "before that.")
+
+    def sniper_symbol_names(self) -> list:
+        """Human names for the verified symbols (Yahoo codes stay internal)."""
+        names = {"EURUSD=X": "EUR/USD", "JPY=X": "USD/JPY", "^GSPC": "SPX"}
+        return [names.get(s, s) for s in self.sniper_symbols]
+
+    def sniper_short_txt(self) -> str:
+        """'83% verified' for chart titles (whole number: a chart chip is not
+        the place for a decimal). '' with no report."""
+        return f"{self.sniper.win_rate:.0f}% verified" if self.sniper else ""
+
+    def sniper_replays_txt(self) -> str:
+        """The compact 'N% on M out-of-sample replays' chart caption. '' with
+        no report."""
+        if not self.sniper:
+            return ""
+        return (f"{self.sniper.win_rate:.0f}% on {self.sniper.trades} "
+                "out-of-sample replays")
 
     def sniper_tp_txt(self) -> str:
         return f"{self.sniper_tp_r:g}R"
@@ -287,6 +342,15 @@ class StrategySpec:
                     f"{REPORT_NEW_RULES} was generated with {name} {was:g} but "
                     f"config.py now runs {live:g}: every stat quoted from that "
                     "report describes a bracket the bot no longer trades")
+        # the sniper record must describe the session floor the gate runs
+        snip = _read_report(REPORT_SNIPER) or {}
+        floor = snip.get("session_open_et") if isinstance(snip, dict) else None
+        live_floor = self.sniper_open_et.strftime("%H:%M")
+        if floor and floor != live_floor:
+            out.append(
+                f"{REPORT_SNIPER} was scored with the session floor {floor} ET "
+                f"but fvg.py now opens at {live_floor} ET: the sniper record on "
+                "the cards describes a window the gate no longer runs")
         return out
 
 
@@ -305,14 +369,33 @@ def _measured_from_setup(report: dict, path: str, basis: str) -> Measured:
 
 
 def _sniper_measured() -> Measured:
-    """The SNIPER record from fvg.SNIPER_MEASURED, which mirrors its report."""
+    """The SNIPER record, read from its report: the OUT-OF-SAMPLE pair (rate
+    with its own count) of the session re-score. Falls back to the un-floored
+    round-6 report's OOS leg, then to fvg.SNIPER_MEASURED, then to an empty
+    record so the claim drops instead of going stale."""
+    basis = "out-of-sample replays"
+    rep = _read_report(REPORT_SNIPER) or {}
+    oos = rep.get("oos") if isinstance(rep, dict) else None
+    if isinstance(oos, dict) and _num(oos.get("win_rate_pct")) is not None:
+        return Measured(win_rate=_num(oos.get("win_rate_pct")),
+                        trades=_num(oos.get("trades")),
+                        wins=_num(oos.get("wins")),
+                        source=REPORT_SNIPER, basis=basis)
+    src = _read_report(REPORT_SNIPER_SOURCE) or {}
+    oos = (src.get("best") or {}).get("oos") if isinstance(src, dict) else None
+    if isinstance(oos, dict) and _num(oos.get("win_rate_pct")) is not None:
+        return Measured(win_rate=_num(oos.get("win_rate_pct")),
+                        trades=_num(oos.get("trades")),
+                        wins=_num(oos.get("wins")),
+                        source=REPORT_SNIPER_SOURCE, basis=basis)
     raw = getattr(fvg, "SNIPER_MEASURED", None)
     if not isinstance(raw, dict):
-        return Measured(source=REPORT_SNIPER, basis="walk-forward replays")
+        return Measured(source=REPORT_SNIPER, basis=basis)
     return Measured(win_rate=_num(raw.get("win_rate")),
                     trades=_num(raw.get("trades")),
-                    source=REPORT_SNIPER,
-                    basis=str(raw.get("basis") or "walk-forward replays"))
+                    wins=_num(raw.get("wins")),
+                    source="fvg.SNIPER_MEASURED (report missing)",
+                    basis=str(raw.get("basis") or basis))
 
 
 def _regime_measured(bucket: str) -> Measured:
@@ -378,7 +461,8 @@ def get() -> StrategySpec:
         sniper_symbols=frozenset(fvg.SNIPER_SYMBOLS),
         sniper_min_gap_atr=fvg._SNIPER_MIN_GAP_ATR,
         sniper_max_gap_atr=fvg._SNIPER_MAX_GAP_ATR,
-        sniper_min_hour_et=fvg._SNIPER_MIN_HOUR_ET,
+        sniper_open_et=fvg._SNIPER_OPEN_ET,
+        sniper_rth_symbols=frozenset(fvg.SNIPER_RTH_SYMBOLS),
         sniper_max_run_atr=fvg._SNIPER_MAX_RUN_ATR,
         sniper_max_day_eff=fvg._SNIPER_MAX_DAY_EFF,
         sniper_max_risk_atr=fvg._SNIPER_MAX_RISK_ATR,
