@@ -291,12 +291,31 @@ class Service:
         config.state_set(f"{job}_tries", {key: n})
         return n
 
+    @staticmethod
+    def load_extra_closures() -> dict:
+        """Push the owner's unscheduled closures into the calendar module.
+
+        Called at boot and on every trading-date flip, so a closure texted in
+        at 6am is live for that morning without a redeploy. market_calendar
+        itself stays pure and file-free; this is the only thing that injects."""
+        try:
+            stored = config.state_get("extra_closures", {}) or {}
+            live = market_calendar.set_extra_closures(stored)
+            if live:
+                print("extra market closures in effect: "
+                      + ", ".join(f"{d} ({r})" for d, r in sorted(live.items())))
+            return live
+        except Exception as e:
+            print(f"could not load extra closures (ignoring): {e}")
+            return {}
+
     def reload_tunables(self):
         """Pick up the overnight backtest without a redeploy. The daemon
         lives for weeks, but backtest.py rewrites the report jsons overnight,
         so re-read them (and rebuild cfg) whenever the trading date flips.
         A report that is missing or unreadable keeps the previous in-memory
         stats: stale-but-verified beats wiping the alert gate mid-flight."""
+        self.load_extra_closures()
         for attr, name in (("backtest_old", "backtest_results.json"),
                            ("backtest_new", "backtest_new_rules.json")):
             fresh = scoreboard.load_report(name)
@@ -799,12 +818,14 @@ class Service:
     ADMIN_CMDS = {"/adduser", "/removeuser", "/users", "/risk", "/setaccount",
                   "/test", "/health", "/requests", "/approve", "/reject",
                   "/done", "/reqfrom", "/backlog", "/proposals", "/reload",
-                  "/brain", "/calendar"}
+                  "/brain", "/calendar", "/closed", "/open"}
 
     def run_command(self, cmd: str, args: str, chat_id: str = ""):
         if cmd in self.ADMIN_CMDS and not telegram.is_owner(chat_id):
             return ("That's an owner-only command. You can use /status, "
                     "/score, /help, or just talk to me.")
+        if cmd in ("/closed", "/open"):
+            return self.cmd_closed(cmd, args)
         if cmd == "/brain":
             return self.cmd_brain()
         if cmd == "/calendar":
@@ -1120,6 +1141,55 @@ class Service:
             return f"No request #{rid}. Use /requests to see open ones."
         notified = intake.notify_asker(entry, status, note)
         return intake.confirm_line(entry, status, notified)
+
+    def cmd_closed(self, cmd: str, args: str):
+        """/closed YYYY-MM-DD [reason] marks a day the market is shut that no
+        rule can predict: a hurricane, a funeral, an exchange outage. /open
+        YYYY-MM-DD takes it back. /closed with no date lists what is set.
+
+        This is the answer to the one honest gap in the calendar. The regular
+        holidays are derived and never need touching; unscheduled closures
+        happen every few years and always at short notice, so they have to be
+        settable from a phone rather than by editing a file and redeploying."""
+        stored = dict(config.state_get("extra_closures", {}) or {})
+        parts = args.split(None, 1)
+        raw = parts[0].strip() if parts else ""
+        if not raw:
+            if not stored:
+                return ("No extra closures set. Every regular holiday is "
+                        "already built in; this is only for the unscheduled "
+                        "kind.\nUsage: /closed 2026-10-29 hurricane")
+            lines = ["Extra market closures set:"]
+            for d, r in sorted(stored.items()):
+                lines.append(f"  {d}: {r}")
+            lines.append("Remove one with /open <date>.")
+            return "\n".join(lines)
+        try:
+            day = date.fromisoformat(raw)
+        except ValueError:
+            return f"'{raw}' is not a date. Use YYYY-MM-DD, like 2026-10-29."
+        if cmd == "/open":
+            if raw not in stored:
+                return f"{day} was not on the extra-closure list."
+            stored.pop(raw)
+            config.state_set("extra_closures", stored)
+            self.load_extra_closures()
+            return (f"{day} is back to a normal session."
+                    if market_calendar.is_trading_day(day)
+                    else f"{day} is off the list, but it still is not a "
+                         "session (weekend or a real holiday).")
+        if day.weekday() >= 5:
+            return f"{day} is a {day:%A}. The market is already shut."
+        built_in = market_calendar.holiday_name(day)
+        if built_in and raw not in stored:
+            return f"{day} is already a known holiday ({built_in})."
+        stored[raw] = (parts[1].strip() if len(parts) > 1
+                       else "unscheduled market closure")
+        config.state_set("extra_closures", stored)
+        self.load_extra_closures()
+        return (f"Marked {day:%a %b} {day.day} closed: {stored[raw]}.\n"
+                "No setups, no sniper tickets and no recap that day. "
+                f"Undo with /open {raw}")
 
     def cmd_brain(self):
         """/brain: check the paid API right now and say what came back.

@@ -55,12 +55,22 @@ def holiday_card(closures: list, today: date, back_on: date) -> str:
     when = market_calendar.day_reference(closures[0][0], today)
     names = " and ".join(n for _, n in closures)
     verb = "are" if len(closures) > 1 else "is"
+    back = market_calendar.day_reference(back_on, today)
+    # Thanksgiving is the case that forces this: the closure notice goes out
+    # Wednesday, Thursday is shut, and the short Friday would never get
+    # announced at all because no session sits between it and the notice. So
+    # the return day carries its own warning when it is a half day.
+    if market_calendar.is_early_close(back_on):
+        tail = (f"Back at it {back}, and it is a short one, the market closes "
+                "at 12:00 PM CT.")
+    else:
+        tail = f"Back at it {back}."
     return "\n".join([
         f"📅 NO TRADING {when.upper()}",
         "",
         f"{when.capitalize()} {verb} {names}. The market is closed, so no "
         "trades will be sent.",
-        f"Back at it {market_calendar.day_reference(back_on, today)}.",
+        tail,
     ])
 
 

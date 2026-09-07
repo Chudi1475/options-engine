@@ -152,6 +152,40 @@ check("day_reference dates anything a week or more out",
       "Sep" in mc.day_reference(date(2026, 9, 14), date(2026, 9, 4)))
 
 # --------------------------------------------------------------------------
+# 2b. unscheduled closures, the one thing no rule can derive
+# --------------------------------------------------------------------------
+# The market really does shut without warning: four days after 9/11, two for
+# Hurricane Sandy, and a day for each state funeral. Roughly once every few
+# years, always at short notice, which is exactly when "edit a file and
+# redeploy" is the wrong answer. The owner sets these from Telegram.
+check("a past unscheduled closure is known",
+      mc.holiday_name(date(2012, 10, 29)) == "Hurricane Sandy")
+check("the 9/11 closure covers all four days",
+      all(mc.holiday_name(date(2001, 9, d)) for d in (11, 12, 13, 14)))
+check("2026-10-29 is an ordinary session to start with",
+      mc.is_trading_day(date(2026, 10, 29)))
+try:
+    mc.set_extra_closures({"2026-10-29": "hurricane"})
+    check("an injected closure shuts that day",
+          not mc.is_trading_day(date(2026, 10, 29))
+          and mc.holiday_name(date(2026, 10, 29)) == "hurricane")
+    check("the calendar walks over an injected closure",
+          mc.next_trading_day(date(2026, 10, 28)) == date(2026, 10, 30))
+    check("the eve notice picks up an injected closure",
+          mc.upcoming_closures(date(2026, 10, 28))
+          == [(date(2026, 10, 29), "hurricane")])
+    check("an injected closure shuts the sniper too",
+          not __import__("fvg").sniper_window_open(
+              datetime(2026, 10, 29, 11, 0, tzinfo=ET)))
+    mc.set_extra_closures({"not-a-date": "typo", "2026-11-01": "a Sunday"})
+    check("a typo or a weekend is dropped, never raised",
+          mc.extra_closures() == {})
+finally:
+    mc.set_extra_closures({})
+check("clearing the overrides restores the normal session",
+      mc.is_trading_day(date(2026, 10, 29)))
+
+# --------------------------------------------------------------------------
 # 3. the cards
 # --------------------------------------------------------------------------
 import cards
@@ -175,7 +209,7 @@ eve = cards.holiday_card([(date(2026, 11, 26), "Thanksgiving")],
 check("the night-before card says tomorrow, not a weekday name",
       "NO TRADING TOMORROW" in eve and "Tomorrow is Thanksgiving." in eve, eve)
 check("the night-before card says when we resume",
-      "Back at it Friday." in eve, eve)
+      "Back at it Friday" in eve, eve)
 check("the card stays short: four lines, no filler",
       len([l for l in eve.splitlines() if l.strip()]) == 3, eve)
 
@@ -197,6 +231,70 @@ check("half day card says setups still go out",
 # the house rule: no em dashes in anything a member reads
 for name, text in (("holiday card", card), ("half day card", half)):
     check(f"no em dash in the {name}", "—" not in text and "–" not in text)
+
+# --------------------------------------------------------------------------
+# 3b. ten years of notices, simulated day by day
+# --------------------------------------------------------------------------
+# The bug this caught: the Thanksgiving notice goes out Wednesday, Thursday is
+# shut, and the short Friday had no session left to announce it from, so every
+# day-after-Thanksgiving half day went unannounced. Ten years of every closure
+# is the only way to see that.
+_sent, _dupes, _key = {}, [], None
+_d, _end = date(2026, 1, 1), date(2036, 1, 1)
+while _d < _end:
+    if mc.is_trading_day(_d):
+        _cl = mc.upcoming_closures(_d)
+        _half = None
+        if not _cl:
+            _n = mc.next_trading_day(_d)
+            _r = mc.early_close_reason(_n)
+            if _r:
+                _half = (_n, _r)
+        if _cl or _half:
+            _k = f"closed:{_cl[0][0]}" if _cl else f"half:{_half[0]}"
+            if _k == _key:
+                pass
+            elif _k in _sent:
+                _dupes.append((_k, _d))
+            else:
+                _sent[_k] = (_d, cards.holiday_card(
+                    _cl, _d, mc.next_trading_day(_cl[-1][0])) if _cl
+                    else cards.half_day_card(_half[0], _half[1], _d))
+                _key = _k
+    _d += timedelta(days=1)
+
+_years = range(2026, 2036)
+_closures = [x for y in _years for x in sorted(mc.holidays(y))]
+_halfs = [x for y in _years for x in sorted(mc.early_closes(y))]
+_covered = set()
+for _k, (_e, _t) in _sent.items():
+    _target = date.fromisoformat(_k.split(":")[1])
+    if _k.startswith("half"):
+        _covered.add(_target)
+    if "short one" in _t:      # the closure card warned about the return day
+        _covered.add(mc.next_trading_day(_target))
+_missed = [x for x in _closures
+           if f"closed:{x}" not in _sent and x >= date(2026, 1, 2)]
+_missed_half = [x for x in _halfs
+                if x not in _covered and x >= date(2026, 1, 2)]
+
+check("ten years of closures each get exactly one notice",
+      not _missed and not _dupes,
+      f"missed {_missed[:3]}, dupes {_dupes[:3]}")
+check("ten years of half days are all announced somehow",
+      not _missed_half, f"missed {_missed_half[:3]}")
+check("every notice lands on the last session before the closure",
+      all(mc.prev_trading_day(date.fromisoformat(k.split(":")[1])) == e
+          for k, (e, t) in _sent.items()),
+      "a notice fired on the wrong evening")
+check("no notice in ten years carries an em dash",
+      not [1 for _, (_, t) in _sent.items() if "—" in t or "–" in t])
+check("the closure count is sane (9 or 10 a year)",
+      all(9 <= len(mc.holidays(y)) <= 10 for y in _years),
+      str({y: len(mc.holidays(y)) for y in _years}))
+check("the Thanksgiving notice warns that Friday is short",
+      "short one" in _sent["closed:2026-11-26"][1],
+      _sent["closed:2026-11-26"][1])
 
 # --------------------------------------------------------------------------
 # 4. the live loop asks the calendar, not weekday()

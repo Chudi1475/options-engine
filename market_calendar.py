@@ -56,9 +56,49 @@ JUNETEENTH_FROM = 2022
 # handful that exist live here. Keep this list short and sourced; anything you
 # cannot point at a real NYSE notice for does not belong in it.
 ONE_OFF_CLOSURES = {
+    date(2001, 9, 11): "September 11 attacks",
+    date(2001, 9, 12): "September 11 attacks",
+    date(2001, 9, 13): "September 11 attacks",
+    date(2001, 9, 14): "September 11 attacks",
+    date(2004, 6, 11): "National Day of Mourning (Ronald Reagan)",
+    date(2007, 1, 2): "National Day of Mourning (Gerald Ford)",
+    date(2012, 10, 29): "Hurricane Sandy",
+    date(2012, 10, 30): "Hurricane Sandy",
     date(2018, 12, 5): "National Day of Mourning (George H. W. Bush)",
     date(2025, 1, 9): "National Day of Mourning (Jimmy Carter)",
 }
+
+# Closures nobody can derive and nobody has shipped code for yet: a hurricane,
+# a funeral announced last week, an exchange outage. They happen roughly once
+# every few years, which is exactly often enough that "edit the file and
+# redeploy" is the wrong answer at the moment it matters.
+#
+# So the live bot injects them at runtime from its own state (the owner texts
+# /closed 2026-10-29 hurricane) and this module stays pure: nothing here reads
+# a file, a network or a clock, so the backtests that import it still replay
+# the same history they always did. set_extra_closures is the only way in.
+_EXTRA_CLOSURES = {}
+
+
+def set_extra_closures(mapping) -> dict:
+    """Replace the runtime closure overrides. Accepts {date or 'YYYY-MM-DD':
+    reason}. Returns what is now in effect. Bad entries are dropped rather
+    than raised: a typo in a Telegram command must not take the bot down."""
+    global _EXTRA_CLOSURES
+    clean = {}
+    for k, v in (mapping or {}).items():
+        try:
+            d = k if isinstance(k, date) else date.fromisoformat(str(k))
+        except (TypeError, ValueError):
+            continue
+        if d.weekday() < 5:      # a weekend closure is not news
+            clean[d] = str(v or "unscheduled market closure")[:80]
+    _EXTRA_CLOSURES = clean
+    return dict(_EXTRA_CLOSURES)
+
+
+def extra_closures() -> dict:
+    return dict(_EXTRA_CLOSURES)
 
 
 def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
@@ -136,6 +176,10 @@ def holidays(year: int) -> dict:
         out[xmas] = "Christmas Day"
 
     for d, name in ONE_OFF_CLOSURES.items():
+        if d.year == year:
+            out[d] = name
+
+    for d, name in _EXTRA_CLOSURES.items():
         if d.year == year:
             out[d] = name
 
