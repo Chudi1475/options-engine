@@ -174,6 +174,30 @@ def _end_billing_hold():
                 "running again.")
 
 
+def probe_billing() -> bool:
+    """Ask the API whether the balance is back, with the smallest call that
+    exists: one token, cheapest model, no system prompt. True when the brain
+    is live again.
+
+    Without this, a billing hold only ended when some OTHER call happened to
+    succeed. With the nightly review switched off and nobody chatting, nothing
+    ever called, so the bot went on reporting "credits empty" for days after
+    the owner had topped up, and the only way to find out was to text it. The
+    daemon now runs this on the probe interval instead."""
+    if not enabled() or billing_hold() is None:
+        return billing_hold() is None
+    body, err = _post_anthropic(
+        {"model": os.environ.get("BILLING_PROBE_MODEL",
+                                 "claude-haiku-4-5-20251001").strip(),
+         "max_tokens": 1,
+         "messages": [{"role": "user", "content": "hi"}]},
+        timeout=30, purpose="probe")
+    # _post_anthropic clears the hold itself on a 200 and re-arms it on
+    # another billing refusal, so there is nothing to do with the result here
+    # beyond reporting it.
+    return body is not None
+
+
 def brain_status_line() -> str:
     """One line for /status and /health: online, offline on billing (since
     when), resting on a rate limit (until when), or not configured."""
@@ -183,13 +207,20 @@ def brain_status_line() -> str:
     if hold:
         from datetime import datetime as _dt
         from zoneinfo import ZoneInfo as _zi
-        try:
-            since = _dt.fromtimestamp(float(hold["since"]), _zi("America/Chicago"))
-            when = f"{since:%a %I:%M %p CT}".replace(" 0", " ")
-        except (TypeError, ValueError, KeyError):
-            when = "?"
-        return (f"offline, API credits empty since {when}. Top up at "
-                "console.anthropic.com to bring it back.")
+
+        def _when(k):
+            try:
+                t = _dt.fromtimestamp(float(hold[k]), _zi("America/Chicago"))
+                return f"{t:%a %I:%M %p CT}".replace(" 0", " ")
+            except (TypeError, ValueError, KeyError):
+                return "?"
+        # The last-checked time matters as much as the since time. "Empty
+        # since Thursday" reads as current truth even when nothing has asked
+        # the API since Thursday, which is exactly how this line ended up
+        # claiming no credit while the account had money in it.
+        return (f"offline, API refused on billing since {_when('since')} "
+                f"(last checked {_when('last_probe')}). If you have topped up, "
+                "it re-checks by itself within 6 hours, or /brain checks now.")
     left = cooldown_left_s()
     if left:
         return f"resting on a rate limit, back around {_resume_text()}"
@@ -225,12 +256,23 @@ def _looks_like_usage_limit(status: int, err_type: str, err_msg: str,
     return False
 
 
-def _post_anthropic(payload: dict, timeout: int):
+def _post_anthropic(payload: dict, timeout: int, purpose: str = "chat"):
     """Single choke point for every Claude call. Returns (body_dict, None) on
     success or (None, honest_error_text) on failure. Handles:
+    - the SPENDING POLICY (config.api_allows): the metered key is a last
+      resort, so work the bot decided to do by itself is refused here unless
+      API_MODE=full, and a daily cap backstops a retry loop,
     - the billing hold (short-circuits between probes, no texts),
     - the rate-limit countdown (short-circuits while paused, no texts),
-    - transient 429/5xx with up to 3 attempts and respectful backoff."""
+    - transient 429/5xx with up to 3 attempts and respectful backoff.
+
+    purpose is "chat" when a human is waiting on the answer, "scheduled" when
+    the bot decided to spend on its own. Callers that do not say default to
+    "chat", so a new caller can never accidentally get the cheaper-looking
+    permissive path; it gets the one a human is entitled to."""
+    allowed, why = config.api_allows(purpose)
+    if not allowed:
+        return None, why
     left = cooldown_left_s()
     if left:
         h, m = divmod(left // 60, 60)
@@ -261,9 +303,11 @@ def _post_anthropic(payload: dict, timeout: int):
             try:
                 body = r.json()
             except ValueError:
+                config.api_note_call(purpose)  # it billed even if we can't read it
                 return None, "the model sent back something unreadable"
             if hold:
                 _end_billing_hold()
+            config.api_note_call(purpose)
             return body, None
         try:
             err = r.json().get("error", {})
@@ -636,10 +680,15 @@ def model() -> str:
     return os.environ.get("BOT_BRAIN_MODEL", "claude-sonnet-4-6").strip()
 
 
-def complete(system: str, user: str, max_tokens: int = 700):
+def complete(system: str, user: str, max_tokens: int = 700,
+             purpose: str = "scheduled"):
     """One-shot completion, no tools and no chat history. Returns the text or
     None on any failure. Used by the nightly learn job (learn.py) to synthesize
-    lessons from the day's graded calls."""
+    lessons from the day's graded calls.
+
+    purpose defaults to "scheduled" here, unlike the raw choke point: every
+    caller of this function today is background work the bot chose to do, so
+    the default that cannot surprise anyone is the one that does not spend."""
     if not enabled():
         return None
     body, err = _post_anthropic(
@@ -647,7 +696,7 @@ def complete(system: str, user: str, max_tokens: int = 700):
          "output_config": {"effort":
              os.environ.get("BOT_BRAIN_EFFORT", "high").strip()},
          "messages": [{"role": "user", "content": user}]},
-        timeout=120)
+        timeout=120, purpose=purpose)
     if body is None:
         return None
     if body.get("stop_reason") == "refusal":
@@ -684,7 +733,8 @@ def deep_model() -> str:
     return os.environ.get("BOT_DEEP_MODEL", "claude-opus-4-8").strip()
 
 
-def complete_deep(system: str, user: str, max_tokens: int = 8000):
+def complete_deep(system: str, user: str, max_tokens: int = 8000,
+                  purpose: str = "scheduled"):
     """complete() on the DEEP model with extended thinking: one-shot, no tools,
     no chat history. Returns the text or None on any failure so callers can
     fall back to complete(). Used by the nightly learn job: the review it
@@ -700,7 +750,7 @@ def complete_deep(system: str, user: str, max_tokens: int = 8000):
              os.environ.get("BOT_DEEP_EFFORT", "xhigh").strip()},
          "system": system,
          "messages": [{"role": "user", "content": user}]},
-        timeout=300)
+        timeout=300, purpose=purpose)
     if body is None:
         return None
     if body.get("stop_reason") == "refusal":
@@ -735,12 +785,16 @@ Rules:
 - Your answer is relayed straight to the trader, so write it to be read as-is."""
 
 
-def deep_think(question: str, context: str = "") -> str:
+def deep_think(question: str, context: str = "", purpose: str = "chat") -> str:
     """Escalate a hard / out-of-scope question to Opus 4.8 with extended
     reasoning (adaptive thinking + high effort) for a high-quality answer.
     Returns the answer text, or a short honest failure note. This is a slow call
     (deep reasoning can take a minute-plus), so callers run it off the main loop
-    with a typing indicator."""
+    with a typing indicator.
+
+    purpose is "chat" because the /ask path is a human waiting. The nightly
+    coach uses the same function with purpose="scheduled" so the spending
+    policy can tell the two apart."""
     if not enabled():
         return "my deep brain isn't plugged in yet (no ANTHROPIC_API_KEY)."
     user = question if not context else f"{context}\n\nQuestion: {question}"
@@ -753,7 +807,7 @@ def deep_think(question: str, context: str = "") -> str:
          "output_config": {"effort": effort},
          "system": DEEP_SYSTEM,
          "messages": [{"role": "user", "content": user}]},
-        timeout=300)
+        timeout=300, purpose=purpose)
     if body is None:
         return f"my deep brain is unavailable: {err}"
     if body.get("stop_reason") == "refusal":

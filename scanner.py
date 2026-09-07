@@ -39,6 +39,7 @@ import yfinance as yf
 import cards
 import config
 import live_params
+import market_calendar
 import news
 import positions as poslib
 import quotes
@@ -66,6 +67,30 @@ WEEKLY_AT = time(16, 5)
 LEARN_START = time(21, 0)       # nightly self-review fires at a RANDOM minute
 LEARN_END = time(23, 45)        # inside this window (kept before midnight ET so
                                 # the same-day date/dedup logic never rolls over)
+HOLIDAY_NOTICE_AT = time(17, 0)  # the eve-of-holiday heads-up goes out after the
+                                 # close of the last session before a closure,
+                                 # early enough to still be that evening in CT
+
+
+def is_session_day(d: date) -> bool:
+    """Whether the US equity market actually trades that ET date.
+
+    Every scheduled job used to ask weekday() instead, which is wrong on the
+    nine or ten market holidays a year. On those days the bot ran a full
+    session against a feed that never ticks, texted a morning card, and the
+    nightly review then graded the empty day as a deliberate 'we stayed out,
+    being picky' lesson that the chat brain reads back on every reply."""
+    return market_calendar.is_trading_day(d)
+
+
+def session_end_for(d: date) -> time:
+    """When the session loop should shut down for the day. SESSION_END is the
+    16:00 close plus the 12 minutes the settle and weekly jobs need; a 13:00
+    half day gets the same 12 minutes after ITS close."""
+    close = market_calendar.session_close(d)
+    if close == market_calendar.EARLY_CLOSE:
+        return time(13, 12)
+    return SESSION_END
 
 
 def et_now() -> datetime:
@@ -100,18 +125,20 @@ def learn_target(day) -> time:
 
 def learn_session_due(now: datetime) -> date:
     """The session whose nightly self-review is due at this tick: today once
-    the random 21:00-23:45 window opens on a weekday, otherwise the most
-    recent prior weekday. Weekend ticks and post-outage restarts therefore
-    point back at the session that may have been missed instead of forgetting
-    it; catch-up is bounded to that single most recent session, so a long
-    outage can never backfill a week of owner DMs."""
+    the random 21:00-23:45 window opens on a TRADING day, otherwise the most
+    recent prior trading day. Weekend ticks, holiday ticks and post-outage
+    restarts therefore point back at the session that may have been missed
+    instead of forgetting it; catch-up is bounded to that single most recent
+    session, so a long outage can never backfill a week of owner DMs.
+
+    Holidays are skipped the same way weekends are. Reviewing Thanksgiving
+    would find no positions and no morning card, and the review would either
+    be suppressed as a suspected outage or invent a lesson about a day the
+    market was shut."""
     d = now.date()
-    if d.weekday() < 5 and now.time() >= learn_target(d):
+    if is_session_day(d) and now.time() >= learn_target(d):
         return d
-    d -= timedelta(days=1)
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d
+    return market_calendar.prev_trading_day(d)
 
 
 def keep_awake(on: bool):
@@ -491,8 +518,12 @@ class Service:
 
     def health_eod(self, now: datetime):
         """One owner-only end-of-session 'all clear', so silence is meaningful:
-        no close ping = something is wrong."""
-        if self.dry or now.weekday() >= 5 or now.time() < WEEKLY_AT:
+        no close ping = something is wrong.
+
+        A holiday gets no all-clear, because there was no session to clear.
+        Silence still means something that day: the eve-of-holiday notice sent
+        the night before is what says the quiet is expected."""
+        if self.dry or not is_session_day(now.date()) or now.time() < WEEKLY_AT:
             return
         today = str(now.date())
         if self._hb_warned_once("eod", today):
@@ -515,6 +546,18 @@ class Service:
             return assistant.brain_status_line()
         except Exception as e:
             return f"unknown ({e})"
+
+    @staticmethod
+    def _next_closure_line(today: date) -> str:
+        """The next market holiday, for /health. Scans a year ahead so the
+        answer is never 'none' just because the year rolled over."""
+        d = today
+        for _ in range(400):
+            d += timedelta(days=1)
+            name = market_calendar.holiday_name(d)
+            if name:
+                return f"{name} on {d:%a %b} {d.day}"
+        return "none found"
 
     @staticmethod
     def _sniper_line() -> str:
@@ -550,6 +593,9 @@ class Service:
             f"Open positions: {open_n}",
             f"Sniper trades open: {len(sniper_book.open_rows())}",
             f"Brain: {self._brain_status()}",
+            f"Today: {market_calendar.describe(now.date())}",
+            f"Next close: {self._next_closure_line(now.date())}",
+            config.api_usage_line(),
         ]
         if warns:
             lines.append("Warnings today: " + ", ".join(warns))
@@ -752,12 +798,17 @@ class Service:
 
     ADMIN_CMDS = {"/adduser", "/removeuser", "/users", "/risk", "/setaccount",
                   "/test", "/health", "/requests", "/approve", "/reject",
-                  "/done", "/reqfrom", "/backlog", "/proposals", "/reload"}
+                  "/done", "/reqfrom", "/backlog", "/proposals", "/reload",
+                  "/brain", "/calendar"}
 
     def run_command(self, cmd: str, args: str, chat_id: str = ""):
         if cmd in self.ADMIN_CMDS and not telegram.is_owner(chat_id):
             return ("That's an owner-only command. You can use /status, "
                     "/score, /help, or just talk to me.")
+        if cmd == "/brain":
+            return self.cmd_brain()
+        if cmd == "/calendar":
+            return self.cmd_calendar()
         if cmd == "/adduser":
             return self.cmd_adduser(args)
         if cmd == "/removeuser":
@@ -1069,6 +1120,48 @@ class Service:
             return f"No request #{rid}. Use /requests to see open ones."
         notified = intake.notify_asker(entry, status, note)
         return intake.confirm_line(entry, status, notified)
+
+    def cmd_brain(self):
+        """/brain: check the paid API right now and say what came back.
+
+        This exists because the bot spent days telling the owner his credits
+        were empty when they were not. A billing hold used to sit there until
+        some unrelated call happened to succeed, and the status line reported
+        the stale verdict as if it were current. One token answers it."""
+        import assistant
+        if not assistant.enabled():
+            return "No ANTHROPIC_API_KEY is set, so there is no brain to check."
+        hold = assistant.billing_hold()
+        if hold is None:
+            return "\n".join(["Brain: " + assistant.brain_status_line(),
+                              config.api_usage_line()])
+        ok = assistant.probe_billing()
+        if ok:
+            return "\n".join(["Checked just now: the API answered, so the "
+                              "brain is back online.",
+                              config.api_usage_line()])
+        return "\n".join(["Checked just now and the API still refused.",
+                          assistant.brain_status_line(),
+                          config.api_usage_line()])
+
+    def cmd_calendar(self):
+        """/calendar: what the bot thinks the market is doing next."""
+        now = et_now()
+        lines = [f"📅 {market_calendar.describe(now.date())}"]
+        d, found = now.date(), 0
+        while found < 4:
+            d += timedelta(days=1)
+            name = market_calendar.holiday_name(d)
+            reason = market_calendar.early_close_reason(d)
+            if name:
+                lines.append(f"  {d:%a %b} {d.day}: {name}, closed")
+                found += 1
+            elif reason:
+                lines.append(f"  {d:%a %b} {d.day}: {reason}, closes 12 PM CT")
+                found += 1
+            if (d - now.date()).days > 400:
+                break
+        return "\n".join(lines)
 
     def cmd_adduser(self, args: str):
         pending = config.state_get("pending_chats", {})
@@ -1819,8 +1912,11 @@ class Service:
 
     def maybe_recap(self, now: datetime):
         """Send the daily 3:05 PM CT (16:05 ET) recap from inside the bot,
-        so the cloud needs no separate scheduled task."""
-        if self.dry or now.weekday() >= 5 or now.time() < WEEKLY_AT:
+        so the cloud needs no separate scheduled task.
+
+        Nothing to recap on a day the market never opened, and recap.main
+        would grade an empty holiday as a day the bot chose to sit out."""
+        if self.dry or not is_session_day(now.date()) or now.time() < WEEKLY_AT:
             return
         today = str(now.date())
         if config.state_get("recap_sent") == today:
@@ -1964,6 +2060,65 @@ class Service:
         except Exception as e:
             print(f"{now:%H:%M:%S} learn failed (attempt {n} recorded, will retry): {e}")
 
+    def maybe_holiday_notice(self, now: datetime):
+        """Text everyone the evening before the market is shut, so the silence
+        the next morning reads as expected rather than broken.
+
+        It fires on the EVENING OF THE LAST SESSION before a closure, not
+        literally the night before, and those differ whenever the holiday is a
+        Monday: the Friday evening text says "Labor Day is Monday" because
+        cards.holiday_card asks market_calendar.day_reference how a person
+        would say that date out loud. Sunday night nobody is looking at their
+        phone for a trading bot anyway.
+
+        Same shape as the other scheduled jobs: once per closure, dedup key
+        recorded BEFORE the send so a crash between the broadcast and the mark
+        cannot re-text everyone, and bounded attempts so an unreachable member
+        cannot make it retry all night."""
+        if self.dry or now.time() < HOLIDAY_NOTICE_AT:
+            return
+        today = now.date()
+        if not is_session_day(today):
+            # Only a real session's evening announces the next closure. Without
+            # this the bot would re-announce Christmas from inside the
+            # Christmas Eve holiday, and on a weekend it would announce a
+            # Monday holiday twice.
+            return
+        closures = market_calendar.upcoming_closures(today)
+        half = None
+        if not closures:
+            nxt = market_calendar.next_trading_day(today)
+            reason = market_calendar.early_close_reason(nxt)
+            if reason:
+                half = (nxt, reason)
+        if not closures and not half:
+            return
+        key = (f"closed:{closures[0][0]}" if closures else f"half:{half[0]}")
+        if config.state_get("holiday_notice_sent") == key:
+            return
+        n = self._job_attempt("holiday_notice", key)
+        if n > self.MAX_JOB_ATTEMPTS:
+            config.state_set("holiday_notice_sent", key)
+            print(f"{now:%H:%M:%S} holiday notice already attempted {n - 1} "
+                  f"times for {key}; marking done")
+            return
+        try:
+            if closures:
+                back_on = market_calendar.next_trading_day(closures[-1][0])
+                msg = cards.holiday_card(closures, today, back_on)
+            else:
+                msg = cards.half_day_card(half[0], half[1], today)
+            errs = self.notify(msg)
+            if errs and n < self.MAX_JOB_ATTEMPTS:
+                print(f"{now:%H:%M:%S} holiday notice send errors, will "
+                      f"retry: {errs}")
+                return  # don't mark sent, notify() has already queued them
+            config.state_set("holiday_notice_sent", key)
+            print(f"{now:%H:%M:%S} holiday notice sent for {key}")
+        except Exception as e:
+            print(f"{now:%H:%M:%S} holiday notice failed (attempt {n} "
+                  f"recorded, will retry): {e}")
+
     def maybe_weekly(self, now: datetime):
         # Friday after the close — with weekend catch-up if the bot was
         # offline at 16:05 (daemon mode picks it up later)
@@ -2012,7 +2167,7 @@ class Service:
         if self.backtest_old is None:
             print("WARNING: reports/backtest_results.json missing: the bot "
                   "will not send entry alerts without real backtest stats.")
-        if now.weekday() < 5:
+        if is_session_day(now.date()):
             self.morning_report(now)
         keep_awake(True)
         self.start_news_watch()  # instant breaking-news alerts, own thread
@@ -2021,7 +2176,8 @@ class Service:
             while True:
                 now = et_now()
                 self.reset_day(now)
-                if now.time() >= SESSION_END or now.weekday() >= 5:
+                if now.time() >= session_end_for(now.date()) \
+                        or not is_session_day(now.date()):
                     self.maybe_recap(now)
                     self.maybe_request_digest(now)
                     self.maybe_weekly(now)
@@ -2042,6 +2198,8 @@ class Service:
                     try:  # announce "brain is back" when the 5h05m wait ends
                         import assistant
                         assistant.check_cooldown_recovery()
+                        assistant.probe_billing()  # self-limits to one real
+                        # call per BILLING_PROBE_S; see probe_billing
                     except Exception:
                         pass
                     self.maybe_recap(now)
@@ -2077,18 +2235,22 @@ class Service:
         while True:
             now = et_now()
             try:
-                if now.weekday() < 5:
+                if is_session_day(now.date()):
                     if time(9, 0) <= now.time() < time(9, 30) \
                             and self.premarket_sent_for != now.date():
                         self.reset_day(now)
                         self.morning_report(now, include_gap=False, premarket=True)
-                    if time(9, 31) <= now.time() < SESSION_END:
+                    if time(9, 31) <= now.time() < session_end_for(now.date()):
                         self.run_session()
                         continue
                 self.flush_pending()
                 try:  # announce "brain is back" when the 5h05m wait ends
                     import assistant
                     assistant.check_cooldown_recovery()
+                    # and check whether a billing hold has been topped up. One
+                    # token, and it self-limits to one real call per probe
+                    # interval, so an empty balance costs nothing to watch.
+                    assistant.probe_billing()
                 except Exception:
                     pass
                 self.maybe_recap(now)   # catch-up: a recap missed/STALE during
@@ -2101,6 +2263,10 @@ class Service:
                                         # evening time (self-guards once per
                                         # session; catches up the most recent
                                         # missed session after an outage)
+                self.maybe_holiday_notice(now)  # "Thanksgiving is tomorrow,
+                                        # no trades will be sent" on the
+                                        # evening of the last session before
+                                        # a market closure
                 self.handle_commands(timeout=45)  # long-poll, responsive + cheap
             except Exception as e:
                 print(f"daemon error (continuing): {e}")

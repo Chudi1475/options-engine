@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 
 import config
 import fvg
+import market_calendar
 import strategy_spec
 
 TIERS = [
@@ -39,6 +40,42 @@ def expiry_str(expiry: date, today: date) -> str:
 
 def disp_ticker(ticker: str) -> str:
     return "SPXW" if ticker == "SPX" else ticker
+
+
+def holiday_card(closures: list, today: date, back_on: date) -> str:
+    """The heads-up the evening before the market is shut. Deliberately short:
+    what day, why, no trades, when we are back. Nothing else.
+
+    closures is [(date, name)] in date order, so a closure sitting next to a
+    weekend reads as one message instead of two. back_on is the next real
+    session, which is how the reader knows the quiet is expected rather than
+    the bot being broken."""
+    if not closures:
+        return ""
+    when = market_calendar.day_reference(closures[0][0], today)
+    names = " and ".join(n for _, n in closures)
+    verb = "are" if len(closures) > 1 else "is"
+    return "\n".join([
+        f"📅 NO TRADING {when.upper()}",
+        "",
+        f"{when.capitalize()} {verb} {names}. The market is closed, so no "
+        "trades will be sent.",
+        f"Back at it {market_calendar.day_reference(back_on, today)}.",
+    ])
+
+
+def half_day_card(day: date, reason: str, today: date) -> str:
+    """The evening-before note for a 13:00 ET close. A different message from a
+    full closure on purpose: trading still happens, the day is just short, and
+    calling a half day 'closed' would be wrong."""
+    when = market_calendar.day_reference(day, today)
+    return "\n".join([
+        f"📅 SHORT DAY {when.upper()}",
+        "",
+        f"{when.capitalize()} is {reason}, so the market closes early at "
+        "12:00 PM CT.",
+        "Setups still go out. Everything just wraps up at noon instead of 3.",
+    ])
 
 
 def contract_str(pos) -> str:

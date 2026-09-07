@@ -28,6 +28,8 @@ from datetime import time as _time
 
 import pandas as pd
 
+import market_calendar
+
 # a gap this small is micro-noise even if the wicks technically miss
 _MIN_GAP_ATR = 0.05
 
@@ -69,13 +71,23 @@ SNIPER_MEASURED = {"win_rate": 83.3, "trades": 48, "wins": 40,
 
 
 def sniper_window_open(now_et) -> bool:
-    """True when the clock allows a sniper ENTRY: a weekday at/after
-    _SNIPER_OPEN_ET and before the 16:00 ET close. Pure; the one place the
+    """True when the clock allows a sniper ENTRY: a TRADING DAY at/after
+    _SNIPER_OPEN_ET and before that day's close. Pure; the one place the
     window is defined so the watcher thread, the gate and the text surfaces
-    can never disagree."""
+    can never disagree.
+
+    A market holiday is not a trading day even though it is a weekday. Two of
+    the five sniper symbols are forex, which does keep quoting on Thanksgiving
+    or Labor Day, so without this check the bot would fire EUR/USD and USD/JPY
+    tickets on a session the round-6 replay never contained: that config was
+    validated on the US session, and a US holiday is not one. Half days close
+    at 13:00 ET, so the window closes with them rather than three hours after
+    the tape stops."""
     try:
-        return (now_et.weekday() < 5
-                and _SNIPER_OPEN_ET <= now_et.time() < _time(16, 0))
+        d = now_et.date()
+        if not market_calendar.is_trading_day(d):
+            return False
+        return _SNIPER_OPEN_ET <= now_et.time() < market_calendar.session_close(d)
     except (AttributeError, TypeError):
         return False
 

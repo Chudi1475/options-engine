@@ -211,6 +211,14 @@ def anthropic_news_check(today: date):
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         return None
+    # This runs every trading morning whether or not anyone asked for it, and
+    # it posts to Anthropic directly rather than through assistant's choke
+    # point, so the spending policy has to be applied here by hand. Without it
+    # this one call quietly bills a web search every session.
+    allowed, why = config.api_allows("scheduled")
+    if not allowed:
+        print(f"risk gate: skipping the paid news check, {why}")
+        return None
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -228,6 +236,7 @@ def anthropic_news_check(today: date):
                     "colon, then a reason of at most 12 words."}],
             },
             timeout=90)
+        config.api_note_call("scheduled")
         text = "".join(b.get("text", "") for b in r.json().get("content", [])
                        if b.get("type") == "text")
         m = re.search(r"\b(GREEN|YELLOW|RED)\b\s*[:\-]?\s*(.*)", text,

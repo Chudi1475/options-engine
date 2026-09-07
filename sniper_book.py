@@ -46,6 +46,7 @@ from datetime import datetime, time as _time
 from zoneinfo import ZoneInfo
 
 import config
+import market_calendar
 
 LEDGER = config.DATA_DIR / "sniper_positions.json"
 ET = ZoneInfo("America/New_York")
@@ -57,6 +58,18 @@ ET = ZoneInfo("America/New_York")
 # at the last price. Forex ran to the end of the ET day in the backtest, so
 # settling it here too is STRICTER than the measurement, never looser.
 SETTLE_ET = _time(16, 0)
+
+
+def _settle_at(now_et) -> _time:
+    """The settle clock for the day a position is being stepped on. Normally
+    SETTLE_ET, but 13:00 ET on a half day: on the Friday after Thanksgiving the
+    tape stops at 13:00 and the 16:00 rule would hold a trade open for three
+    hours of bars that never print, then settle it against a last price that
+    went stale at lunch. Returns SETTLE_ET for anything it cannot date."""
+    try:
+        return market_calendar.session_close(now_et.date())
+    except (AttributeError, TypeError, ValueError):
+        return SETTLE_ET
 
 
 def _read() -> list:
@@ -266,7 +279,7 @@ def step(symbol: str, price: float, now_et=None, bars=None) -> dict:
         tgt_hit = price >= row["target"] if buy else price <= row["target"]
         settle = (now_et is not None
                   and getattr(now_et, "time", lambda: None)() is not None
-                  and now_et.time() >= SETTLE_ET)
+                  and now_et.time() >= _settle_at(now_et))
 
         if stop_hit:                      # checked FIRST: ties are losses
             row.update(state="closed", exit_price=row["stop"],

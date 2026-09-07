@@ -27,10 +27,31 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime, time
 
 import config
+import market_calendar
 
 CLOSE_T = time(16, 0)
 _warn = 16 * 60 - int(config.EXPIRY_WARN_MINUTES)
 WARN_T = time(_warn // 60, _warn % 60)
+
+
+def close_t(d) -> time:
+    """The closing bell for that ET date: CLOSE_T normally, 13:00 on a half
+    day. A 0DTE contract dies when the market shuts, so on the Friday after
+    Thanksgiving the fixed 16:00 rule keeps an already-expired position open
+    for three hours and then books its 'expiry close' against a mark that went
+    stale at lunch."""
+    try:
+        return market_calendar.session_close(d)
+    except (AttributeError, TypeError, ValueError):
+        return CLOSE_T
+
+
+def warn_t(d) -> time:
+    """The close-it-before-expiry warning, EXPIRY_WARN_MINUTES before that
+    day's real bell rather than always before 16:00."""
+    c = close_t(d)
+    m = max(c.hour * 60 + c.minute - int(config.EXPIRY_WARN_MINUTES), 0)
+    return time(m // 60, m % 60)
 
 
 @dataclass
@@ -199,11 +220,11 @@ def step(pos: Position, now: datetime, mark: float, mark_source: str,
 
     expires_today = pos.expires_on() == now.date()
     if (expires_today and pos.state != "closed" and not pos.expiry_warned
-            and now.time() >= WARN_T):
+            and now.time() >= warn_t(now.date())):
         pos.expiry_warned = True
         events.append({"type": "expiry_warn", "pct": eff, "source": mark_source})
 
-    if expires_today and now.time() >= CLOSE_T:
+    if expires_today and now.time() >= close_t(now.date()):
         if pos.state != "closed":
             pos.final_exit = {"time": ts, "pct": eff, "mark": mark,
                               "reason": "expiry close"}
@@ -339,7 +360,7 @@ class PositionBook:
                     continue
                 exp = p.expires_on()
                 if exp < now.date() or (exp == now.date()
-                                        and now.time() >= CLOSE_T):
+                                        and now.time() >= close_t(exp)):
                     self._force_expire(p, save=save)
                     settled.append(p)
             except Exception as e:

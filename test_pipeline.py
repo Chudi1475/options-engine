@@ -452,7 +452,7 @@ def _scripted(responses):
     """Fake _post_anthropic: pops scripted (body, err) pairs, records payloads."""
     seen = []
 
-    def fake(payload, timeout):
+    def fake(payload, timeout, purpose="chat"):
         seen.append(payload)
         return responses.pop(0)
     return fake, seen
@@ -1756,6 +1756,11 @@ try:
     _orig_cd_pp = _pp_assistant.cooldown_left_s
     _orig_comp_pp = _pp_assistant.complete
     learn.REVIEWS_FILE = config.DATA_DIR / "trade_reviews_paper_test.jsonl"
+    # review_history is scheduled work, so the spending policy refuses it by
+    # default now. This block is testing the review LOGIC against a mocked
+    # API, so it opts in explicitly and puts the env back afterwards.
+    _orig_api_mode_pp = _os.environ.get("API_MODE")
+    _os.environ["API_MODE"] = "full"
     try:
         if learn.REVIEWS_FILE.exists():
             learn.REVIEWS_FILE.unlink()
@@ -1788,6 +1793,10 @@ try:
         _pp_assistant.enabled = _orig_en_pp
         _pp_assistant.cooldown_left_s = _orig_cd_pp
         _pp_assistant.complete = _orig_comp_pp
+        if _orig_api_mode_pp is None:
+            _os.environ.pop("API_MODE", None)
+        else:
+            _os.environ["API_MODE"] = _orig_api_mode_pp
 finally:
     for f in (learn.LESSONS_LOG, learn.LESSONS_DIGEST):
         if f.exists():
@@ -2833,7 +2842,7 @@ try:
     os.environ["ANTHROPIC_API_KEY"] = "test-key"
     seen = {}
 
-    def _fake_post(payload, timeout):
+    def _fake_post(payload, timeout, purpose="chat"):
         seen["payload"], seen["timeout"] = payload, timeout
         return {"content": [{"type": "thinking", "thinking": "hmm"},
                             {"type": "text", "text": "part one "},
@@ -2851,11 +2860,11 @@ try:
     check("deep review: complete_deep returns text blocks only",
           out == "part one and two", f"got {out!r}")
 
-    assistant._post_anthropic = lambda payload, timeout: (None, "boom")
+    assistant._post_anthropic = lambda payload, timeout, purpose="chat": (None, "boom")
     check("deep review: API failure returns None so callers can fall back",
           assistant.complete_deep("s", "u") is None)
 
-    assistant._post_anthropic = lambda payload, timeout: (
+    assistant._post_anthropic = lambda payload, timeout, purpose="chat": (
         {"content": [{"type": "thinking", "thinking": "x"}]}, None)
     check("deep review: an empty completion returns None, not ''",
           assistant.complete_deep("s", "u") is None)

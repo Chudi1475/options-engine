@@ -116,6 +116,16 @@ def review_history(max_new: int = 25) -> int:
             if getattr(p, "state", "") == "closed"
             and getattr(p, "final_pnl_pct", None) is not None
             and p.id not in seen]
+    # This loop is one paid call per trade against a backlog of about a
+    # hundred, which is most of what the metered balance ever gets spent on.
+    # Under the default spending policy it does not run at all: the same
+    # reviews happen on the desktop through --export-backlog and come back
+    # through --import-reviews, and the ids dedup either way.
+    allowed, why = config.api_allows("scheduled")
+    if todo and not allowed:
+        print(f"learn: {len(todo)} trade(s) waiting on a deep review, but {why}. "
+              "Run: python learn.py --export-backlog reviews.json")
+        return 0
     # brain paused (usage-limit countdown)? DEFER the whole batch to the next
     # night instead of permanently writing cause='unknown' for every trade —
     # once an id lands in trade_reviews.jsonl it is never re-reviewed.
@@ -1027,7 +1037,140 @@ def run(require_date=None, dry=False):
     return []
 
 
+# ------------------- the offline review lane -------------------
+# review_history is the single most expensive thing this bot does: one paid
+# call per closed trade, bounded at 25 a night, against a backlog of about a
+# hundred. That balance is metered pay-per-use and has hit $0 more than once,
+# taking the whole chat brain down with it.
+#
+# So the reviews move off the bot. export_backlog writes exactly the briefs
+# review_history would have sent, the reasoning happens on the owner's own
+# desktop, and import_reviews writes the answers back in the bot's own row
+# format. The nightly loop then skips every one of them permanently, because
+# _reviewed_ids dedups on the trade id and does not care who wrote the row.
+
+
+def _brief_for(p, story: str) -> str:
+    """The exact text review_history hands the model for one trade, so an
+    offline review reasons over the same evidence the nightly one would."""
+    tag = "[PAPER] " if getattr(p, "paper", False) else ""
+    brief = (f"{tag}Trade: {p.ticker} {p.strike:g} {p.direction.upper()} on {p.date}, "
+             f"alerted {p.time_et} ET. Entry momentum {getattr(p, 'mom_pct', None)}, "
+             f"quoted win rate {getattr(p, 'win_rate_quoted', None)}, risk mode "
+             f"{getattr(p, 'risk_mode', None)}. Outcome: {{verdict}}, final "
+             f"{p.final_pnl_pct}%, peak {getattr(p, 'mfe_pct', None)}%, trough "
+             f"{getattr(p, 'mae_pct', None)}%, exit "
+             f"'{(getattr(p, 'final_exit', None) or {}).get('reason')}'. "
+             f"Story: {story}")
+    return brief
+
+
+def export_backlog(path: str) -> int:
+    """Write every not-yet-reviewed closed trade to a JSON file for offline
+    review. Read-only: nothing in DATA_DIR is touched."""
+    import recap
+    book = PositionBook()
+    seen = _reviewed_ids()
+    todo = [p for p in book.positions
+            if getattr(p, "state", "") == "closed"
+            and getattr(p, "final_pnl_pct", None) is not None
+            and p.id not in seen]
+    out = []
+    for p in todo:
+        verdict, story = recap.position_story(p)
+        out.append({
+            "id": p.id, "date": p.date, "ticker": p.ticker,
+            "direction": p.direction, "strike": p.strike,
+            "paper": bool(getattr(p, "paper", False)),
+            "final_pnl_pct": p.final_pnl_pct, "verdict": verdict,
+            "brief": _brief_for(p, story).replace("{verdict}", verdict),
+            "breaking_news": _breaking_news_for(p.date),
+        })
+    payload = {"system": CAUSE_SYSTEM,
+               "row_schema": ["id", "date", "ticker", "direction", "strike",
+                              "paper", "final_pnl_pct", "verdict", "why",
+                              "cause", "cause_detail", "lesson", "reviewed_at",
+                              "reviewer"],
+               "causes": ["setup", "news", "geopolitics", "macro_event",
+                          "volatility", "time_decay", "execution", "unknown"],
+               "already_reviewed": len(seen), "pending": len(out),
+               "trades": out}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    print(f"exported {len(out)} pending trade(s) to {path} "
+          f"({len(seen)} already reviewed)")
+    return len(out)
+
+
+def import_reviews(path: str, reviewer: str = "offline") -> int:
+    """Append offline-written reviews to trade_reviews.jsonl.
+
+    Refuses a row whose id is already reviewed (the ledger is append-only and
+    a trade is reviewed once, ever) and refuses a cause the bot does not use,
+    because an unknown cause would silently drop out of every cause rollup.
+    Each row is stamped with the reviewer so provenance survives: a number in
+    this bot always has to say where it came from."""
+    causes = {"setup", "news", "geopolitics", "macro_event", "volatility",
+              "time_decay", "execution", "unknown"}
+    with open(path, encoding="utf-8-sig") as f:
+        data = json.load(f)
+    rows = data.get("reviews") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        print("import: expected a JSON list, or an object with a 'reviews' list")
+        return 0
+    seen = _reviewed_ids()
+    written = skipped = 0
+    for r in rows:
+        if not isinstance(r, dict) or not r.get("id"):
+            skipped += 1
+            continue
+        if r["id"] in seen:
+            print(f"import: {r['id']} is already reviewed, skipping")
+            skipped += 1
+            continue
+        cause = (r.get("cause") or "unknown").strip()
+        if cause not in causes:
+            print(f"import: {r['id']} has unknown cause {cause!r}, skipping")
+            skipped += 1
+            continue
+        entry = {"id": r["id"], "date": r.get("date", ""),
+                 "ticker": r.get("ticker", ""),
+                 "direction": r.get("direction", ""),
+                 "strike": r.get("strike"), "paper": bool(r.get("paper")),
+                 "final_pnl_pct": r.get("final_pnl_pct"),
+                 "verdict": r.get("verdict", ""), "why": r.get("why", ""),
+                 "cause": cause, "cause_detail": r.get("cause_detail", ""),
+                 "lesson": (r.get("lesson") or "").strip(),
+                 "reviewed_at": (r.get("reviewed_at")
+                                 or et_now().strftime("%Y-%m-%d %H:%M:%S %Z")),
+                 "reviewer": r.get("reviewer") or reviewer}
+        with REVIEWS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        if entry["lesson"]:
+            _append_lesson({"session": entry["date"],
+                            "graded_at": entry["reviewed_at"],
+                            "wins": 0, "losses": 0, "trades": [],
+                            "review": f"deep review {entry['ticker']} "
+                                      f"{entry['date']}: {entry['why']}",
+                            "lessons": [entry["lesson"]],
+                            "watch_tomorrow": "", "proposed_change": None})
+        seen.add(entry["id"])
+        written += 1
+    print(f"imported {written} review(s), skipped {skipped}")
+    return written
+
+
 def main():
+    if "--export-backlog" in sys.argv:
+        i = sys.argv.index("--export-backlog")
+        return export_backlog(sys.argv[i + 1] if i + 1 < len(sys.argv)
+                              else "review_backlog.json")
+    if "--import-reviews" in sys.argv:
+        i = sys.argv.index("--import-reviews")
+        if i + 1 >= len(sys.argv):
+            print("usage: learn.py --import-reviews <file.json>")
+            return 0
+        return import_reviews(sys.argv[i + 1])
     dry = "--dry-run" in sys.argv
     date = None
     if "--date" in sys.argv:

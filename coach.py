@@ -181,7 +181,9 @@ def reflect(session_date) -> dict:
         raw = assistant.deep_think(
             "Coach this trading day. Reply with the strict JSON only.",
             context=COACH_SYSTEM + "\n\nDOSSIER:\n"
-            + json.dumps(dossier, default=str)[:24000])
+            + json.dumps(dossier, default=str)[:24000],
+            purpose="scheduled")  # nobody is waiting on this; it never
+                                  # spends the metered key unless API_MODE=full
         s, e = raw.find("{"), raw.rfind("}")
         parsed = json.loads(raw[s:e + 1]) if s != -1 else None
         if not isinstance(parsed, dict):
