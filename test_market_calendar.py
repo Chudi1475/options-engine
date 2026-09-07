@@ -323,6 +323,33 @@ check("learn_session_due still returns today on a normal trading night",
       scanner.learn_session_due(datetime(2026, 9, 8, 23, 50, tzinfo=ET))
       == date(2026, 9, 8))
 
+# the /closed override has to survive a restart, which means it lives in
+# state.json and gets re-injected on boot and on every trading-date flip
+import pathlib
+import tempfile as _tf
+_saved_state3 = config_mod.STATE_FILE
+config_mod.STATE_FILE = pathlib.Path(_tf.mkdtemp()) / "state.json"
+try:
+    config_mod.state_set("extra_closures", {"2026-10-29": "hurricane"})
+    mc.set_extra_closures({})          # simulate a fresh process
+    check("a fresh process starts with no overrides",
+          scanner.is_session_day(date(2026, 10, 29)))
+    live = scanner.Service.load_extra_closures()
+    check("boot re-injects the owner's closures from state",
+          not scanner.is_session_day(date(2026, 10, 29))
+          and live.get(date(2026, 10, 29)) == "hurricane", str(live))
+    config_mod.state_set("extra_closures", {})
+    scanner.Service.load_extra_closures()
+    check("clearing state clears the override on the next reload",
+          scanner.is_session_day(date(2026, 10, 29)))
+    config_mod.state_set("extra_closures", {"nonsense": "typo"})
+    scanner.Service.load_extra_closures()
+    check("a corrupt override entry is ignored, not fatal",
+          scanner.is_session_day(date(2026, 10, 29)))
+finally:
+    config_mod.STATE_FILE = _saved_state3
+    mc.set_extra_closures({})
+
 # --------------------------------------------------------------------------
 # 5. the sniper does not fire on a day the session never happened
 # --------------------------------------------------------------------------
