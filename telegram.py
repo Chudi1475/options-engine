@@ -104,8 +104,26 @@ def send_to(chat_id, text: str):
     return None
 
 
+def test_mode() -> bool:
+    """True when BOT_TEST_MODE is set. Every outbound Telegram call becomes a
+    no-op, and the message is printed instead.
+
+    This exists because the offline test suites really did text a live human.
+    assistant._start_billing_hold and _end_billing_hold DM the owner, and any
+    test that exercises the billing path reached the real Telegram API, so a
+    run of the suite put "Brain offline" / "Brain back online" on Chudi's and
+    Kelechi's phones. Individual tests stubbing the transport is not enough:
+    one test that forgets, once, and a real person gets paged. The guard
+    belongs at the wire, where nothing can route around it."""
+    import os
+    return bool(os.environ.get("BOT_TEST_MODE", "").strip())
+
+
 def _send_one(chat_id, text: str):
     """Send one already-fitting message. Returns an error string or None."""
+    if test_mode():
+        print(f"[test mode, not sent -> {chat_id}] {text[:120]}")
+        return None
     try:
         r = _session.post(
             f"https://api.telegram.org/bot{_token()}/sendMessage",
@@ -136,6 +154,8 @@ def send_chat_action(chat_id, action: str = "typing"):
     thinks. Never raises — a hiccup here must never block the actual reply.
     Short timeout so a stall can't push the next refresh past Telegram's ~5s
     typing-status expiry and make the indicator flicker off."""
+    if test_mode():
+        return
     try:
         _session.post(
             f"https://api.telegram.org/bot{_token()}/sendChatAction",
@@ -155,6 +175,9 @@ def _send_photo_raw(chat_id, photo, caption: str = ""):
     """Send one photo. `photo` is bytes (multipart upload) or a Telegram
     file_id string (instant, no upload). Returns (error|None, file_id|None)
     so a broadcast can upload once and reuse the file_id everywhere else."""
+    if test_mode():
+        print(f"[test mode, photo not sent -> {chat_id}]")
+        return None, None
     try:
         if isinstance(photo, (bytes, bytearray)):
             r = _session.post(

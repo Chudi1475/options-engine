@@ -1,4 +1,9 @@
 """Offline test of the add-user / access-control flow. No network."""
+
+import os as _bot_test_os  # NO TEST MAY EVER TEXT A REAL PERSON:
+_bot_test_os.environ["BOT_TEST_MODE"] = "1"  # telegram.test_mode()
+# turns every outbound send into a no-op. Set BEFORE any repo import,
+# because assistant/scanner DM the owner on the billing paths.
 import os
 import sys
 

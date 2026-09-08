@@ -14,6 +14,11 @@ for one symbol per class and fails loudly listing every failure:
 Also runs under pytest (the --net half only when RUN_NET_TESTS=1 is set).
 """
 
+
+import os as _bot_test_os  # NO TEST MAY EVER TEXT A REAL PERSON:
+_bot_test_os.environ["BOT_TEST_MODE"] = "1"  # telegram.test_mode()
+# turns every outbound send into a no-op. Set BEFORE any repo import,
+# because assistant/scanner DM the owner on the billing paths.
 import os
 import sys
 

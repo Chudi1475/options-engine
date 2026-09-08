@@ -20,6 +20,11 @@ No network, no Telegram, no repo scripts executed.
 Run:  python test_market_calendar.py     (exit code 0 = all good)
 """
 
+
+import os as _bot_test_os  # NO TEST MAY EVER TEXT A REAL PERSON:
+_bot_test_os.environ["BOT_TEST_MODE"] = "1"  # telegram.test_mode()
+# turns every outbound send into a no-op. Set BEFORE any repo import,
+# because assistant/scanner DM the owner on the billing paths.
 import os
 import sys
 from datetime import date, datetime, time, timedelta
@@ -40,6 +45,19 @@ def check(name, cond, detail=""):
     print(f"[{status}] {name}" + (f"  ({detail})" if detail and not cond else ""))
     if not cond:
         failures.append(name)
+
+
+# Before anything else: prove the wire is dead. The suites really did text a
+# live person on every run, because the billing paths DM the owner and only
+# some tests remembered to stub the transport.
+import telegram as _tg_guard
+
+check("BOT_TEST_MODE is armed", _tg_guard.test_mode())
+check("no test can reach Telegram: the send is a no-op",
+      _tg_guard._send_one("1390237537", "this must never arrive") is None
+      and _tg_guard.send_to("1390237537", "nor this") is None)
+check("photos are blocked too",
+      _tg_guard._send_photo_raw("1390237537", b"x") == (None, None))
 
 
 # --------------------------------------------------------------------------
