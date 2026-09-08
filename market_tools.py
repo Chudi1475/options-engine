@@ -958,9 +958,13 @@ def _do_read(disp, yfs, dec, kind, source):
                                            ticket.get("stop"), sdir)
                 if _stretch:
                     ticket.update(_stretch)
-                    _ct = (conf.get("ticket") or {}).get("target_liquidity")
-                    if _ct:
-                        ticket["target_structure"] = _ct
+                # the structure target is measured by the FVG, not derived from
+                # the R multiple, so it stands or falls on its own. Nesting it
+                # under the stretch map would silently drop a real level just
+                # because the 1R/2R pair failed validation.
+                _ct = (conf.get("ticket") or {}).get("target_liquidity")
+                if _ct:
+                    ticket["target_structure"] = _ct
                 conf["ticket"] = ticket
             elif plan:
                 conviction = "medium"

@@ -174,6 +174,38 @@ def _end_billing_hold():
                 "running again.")
 
 
+_PROBE_INFLIGHT = threading.Lock()
+
+
+def probe_billing_async(force: bool = False) -> bool:
+    """Start a billing probe on a BACKGROUND thread and return immediately.
+
+    The probe used to run inline in the session loop, the same loop that walks
+    open positions for stops. A probe is up to three attempts with a 15 second
+    timeout plus backoff, so a stalled API could hold the next price check for
+    roughly a minute while a trade was live. Nothing about a billing question
+    is worth delaying a stop.
+
+    The in-flight lock is the atomic claim: concurrent callers create at most
+    one probe, so a 15 second daemon tick cannot pile up workers. Returns True
+    when THIS call started one."""
+    if not enabled() or billing_hold() is None:
+        return False
+    if not _PROBE_INFLIGHT.acquire(blocking=False):
+        return False   # one is already running; do not queue another
+
+    def _run():
+        try:
+            probe_billing(force=force)
+        except Exception:
+            pass
+        finally:
+            _PROBE_INFLIGHT.release()
+
+    threading.Thread(target=_run, daemon=True, name="billing-probe").start()
+    return True
+
+
 def probe_billing(force: bool = False) -> bool:
     """Ask the API whether the balance is back, with the smallest call that
     exists: one token, cheapest model, no system prompt. True when the brain

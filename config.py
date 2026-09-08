@@ -100,9 +100,14 @@ def learn_enabled() -> bool:
 
     This is the single most expensive thing the bot does: learn.run reviews the
     day's calls AND deep-reviews up to 25 closed trades (learn.review_history),
-    so one night is ~26 API calls whether or not anyone texted the bot. Alerts,
-    exits, charts, the forward ledger and the chat brain are all unaffected —
-    this flag gates the nightly job only."""
+    so one night is ~26 API calls whether or not anyone texted the bot.
+
+    Alerts, exits, charts and the chat brain are unaffected. The FORWARD LEDGER
+    used to be affected and the old docstring wrongly said otherwise: its
+    deterministic grading sat inside learn.run, so turning this flag off also
+    stopped the free evidence collection. Grading now runs as its own job
+    (scanner.Service.maybe_grade_forward) and no longer depends on this flag or
+    on any paid-API permission."""
     return os.environ.get("LEARN_ENABLED", "").strip().lower() \
         not in ("0", "false", "no", "off")
 

@@ -175,6 +175,178 @@ ids = [r.get("event_id") for r in _rows()]
 check("P02: every row carries a unique event id",
       all(ids) and len(set(ids)) == len(ids), str(ids))
 
+# --------------------------------------------------------------------------
+# P03: deterministic grading must not depend on paid-AI permission
+# --------------------------------------------------------------------------
+# Capping spend must never cost measurement. The grader used to live inside
+# learn.run, so LEARN_ENABLED=false silently stopped the free evidence
+# collection that is supposed to settle the 0.4R question.
+import scanner
+
+_saved_learn = _bot_test_os.environ.get("LEARN_ENABLED")
+_saved_mode = _bot_test_os.environ.get("API_MODE")
+_saved_fill = forward_ledger.fill_outcomes
+try:
+    _bot_test_os.environ["LEARN_ENABLED"] = "false"
+    _bot_test_os.environ["API_MODE"] = "off"
+    check("P03: the fixture really has the paid review switched off",
+          not config.learn_enabled() and not config.api_allows("scheduled")[0])
+
+    calls = []
+    forward_ledger.fill_outcomes = lambda *a, **k: (calls.append(1), 3)[1]
+
+    svc = scanner.Service.__new__(scanner.Service)
+    svc.dry = False
+    svc.MAX_JOB_ATTEMPTS = 2
+
+    now = datetime(2026, 9, 8, 22, 30, tzinfo=ET)
+    config.state_set("forward_graded", None)
+    scanner.Service.maybe_grade_forward(svc, now)
+    check("P03: grading runs with the paid review and all AI spend disabled",
+          len(calls) == 1, f"calls={len(calls)}")
+
+    # a restart on the same session must not grade twice
+    scanner.Service.maybe_grade_forward(svc, now)
+    check("P03: a second pass on the same session does not double-grade",
+          len(calls) == 1, f"calls={len(calls)}")
+
+    # and it must be reachable independently of maybe_learn
+    calls.clear()
+    scanner.Service.maybe_learn(svc, now)
+    check("P03: maybe_learn still declines to spend when the switch is off",
+          len(calls) == 0)
+
+    check("P03: the config docstring no longer claims the ledger is unaffected",
+          "used to be affected" in (config.learn_enabled.__doc__ or ""),
+          (config.learn_enabled.__doc__ or "")[:120])
+    check("P03: the daemon calls the grading job",
+          "self.maybe_grade_forward(now)" in
+          Path(__file__).with_name("scanner.py").read_text(encoding="utf-8-sig"))
+finally:
+    forward_ledger.fill_outcomes = _saved_fill
+    for k, v in (("LEARN_ENABLED", _saved_learn), ("API_MODE", _saved_mode)):
+        if v is None:
+            _bot_test_os.environ.pop(k, None)
+        else:
+            _bot_test_os.environ[k] = v
+
+# --------------------------------------------------------------------------
+# P05: an imported review must describe a trade that really happened
+# --------------------------------------------------------------------------
+import learn
+import positions as poslib
+
+_tmp5 = Path(tempfile.mkdtemp(prefix="kelbot_p05_"))
+learn.REVIEWS_FILE = _tmp5 / "trade_reviews.jsonl"
+learn.LESSONS_LOG = _tmp5 / "lessons.jsonl"
+learn.LESSONS_DIGEST = _tmp5 / "lessons_digest.md"
+
+_pos = poslib.Position(id="REAL-1", date="2026-09-04", time_et="09:50:01",
+                       ticker="SPX", direction="call", right="C", strike=7745.0,
+                       expiry="2026-09-04", entry_mid=7.85, entry_source="quote")
+_pos.state, _pos.final_pnl_pct, _pos.paper = "closed", -90.83, False
+_book = poslib.PositionBook()
+_book.positions = [_pos]
+learn.PositionBook = lambda *a, **k: _book
+
+_BASE = dict(id="REAL-1", date="2026-09-04", ticker="SPX", direction="call",
+             strike=7745.0, paper=False, final_pnl_pct=-90.83, verdict="WRONG",
+             why="stopped out", cause="setup", cause_detail="", lesson="a lesson")
+
+
+def _imp(row):
+    f = _tmp5 / "in.json"
+    f.write_text(json.dumps({"reviews": [row]}), encoding="utf-8")
+    return learn.import_reviews(str(f))
+
+
+check("P05: a fabricated trade id is refused",
+      _imp(dict(_BASE, id="MADE-UP")) == 0)
+check("P05: a cause the bot does not use is refused",
+      _imp(dict(_BASE, cause="vibes")) == 0)
+check("P05: the string 'false' is not accepted as a boolean",
+      _imp(dict(_BASE, paper="maybe")) == 0)
+check("P05: a paper flag contradicting the tracked position is refused",
+      _imp(dict(_BASE, paper=True)) == 0)
+check("P05: nothing was written by any refused import",
+      not learn.REVIEWS_FILE.exists()
+      or not learn.REVIEWS_FILE.read_text(encoding="utf-8").strip())
+
+# a batch is all-or-nothing: one bad row must not let the good ones land
+_f = _tmp5 / "batch.json"
+_f.write_text(json.dumps({"reviews": [dict(_BASE), dict(_BASE, id="NOPE")]}),
+              encoding="utf-8")
+check("P05: one bad row refuses the whole batch",
+      learn.import_reviews(str(_f)) == 0
+      and (not learn.REVIEWS_FILE.exists()
+           or not learn.REVIEWS_FILE.read_text(encoding="utf-8").strip()))
+
+# the valid row commits, and the immutable facts come from the POSITION
+check("P05: a valid row is accepted", _imp(dict(_BASE, final_pnl_pct=999.0)) == 1)
+_rows5 = [json.loads(l) for l in
+          learn.REVIEWS_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
+check("P05: the committed P&L comes from the position, not the file",
+      len(_rows5) == 1 and _rows5[0]["final_pnl_pct"] == -90.83,
+      str(_rows5))
+check("P05: the row carries import provenance",
+      _rows5[0].get("imported_from") and _rows5[0].get("imported_at"))
+check("P05: an already-reviewed id is never overwritten", _imp(dict(_BASE)) == 0)
+check("P05: the digest is rebuilt by the import", learn.LESSONS_DIGEST.exists())
+
+_before5 = len(learn.LESSONS_LOG.read_text(encoding="utf-8").splitlines())
+learn._derive_lessons_for(learn.REVIEWS_FILE)
+_after5 = len(learn.LESSONS_LOG.read_text(encoding="utf-8").splitlines())
+check("P05: the lesson repair path is idempotent",
+      _before5 == _after5, f"{_before5} -> {_after5}")
+
+# the recovery case: a review committed but its lesson lost
+learn.LESSONS_LOG.write_text("", encoding="utf-8")
+_made = learn._derive_lessons_for(learn.REVIEWS_FILE)
+check("P05: an interrupted import repairs its missing lesson on a re-run",
+      _made == 1, f"derived {_made}")
+
+# --------------------------------------------------------------------------
+# P06: a billing probe must never hold up the loop that watches stops
+# --------------------------------------------------------------------------
+import threading
+import time as _time
+
+import assistant
+
+_saved_probe = assistant.probe_billing
+_saved_hold = assistant.billing_hold
+_saved_en = assistant.enabled
+try:
+    assistant.enabled = lambda: True
+    assistant.billing_hold = lambda: {"since": 1, "last_probe": 1,
+                                      "notified": True}
+    started = threading.Event()
+
+    def _slow_probe(force=False):
+        started.set()
+        _time.sleep(2.0)          # stands in for a stalled API
+        return False
+
+    assistant.probe_billing = _slow_probe
+
+    t0 = _time.monotonic()
+    assistant.probe_billing_async()
+    elapsed = _time.monotonic() - t0
+    check("P06: starting a probe returns immediately, it does not block",
+          elapsed < 0.5, f"took {elapsed:.2f}s")
+    check("P06: the probe really did start", started.wait(timeout=2.0))
+
+    # concurrent callers must create at most one probe
+    check("P06: a second caller does not queue another probe",
+          assistant.probe_billing_async() is False)
+    check("P06: the daemon no longer calls the blocking probe inline",
+          "assistant.probe_billing()" not in
+          Path(__file__).with_name("scanner.py").read_text(encoding="utf-8-sig"))
+finally:
+    assistant.probe_billing = _saved_probe
+    assistant.billing_hold = _saved_hold
+    assistant.enabled = _saved_en
+
 print()
 if failures:
     print(f"{len(failures)} FAILED: " + ", ".join(failures))

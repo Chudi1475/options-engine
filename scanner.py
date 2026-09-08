@@ -2147,6 +2147,41 @@ class Service:
         except Exception as e:
             print(f"{now:%H:%M:%S} learn failed (attempt {n} recorded, will retry): {e}")
 
+    def maybe_grade_forward(self, now: datetime):
+        """Grade the day's sniper candidates against the day's bars.
+
+        This is DELIBERATELY not inside maybe_learn. Grading is deterministic:
+        it walks bars and decides which level was touched first, and it costs
+        nothing. It used to live inside learn.run, so switching the paid
+        nightly review off (LEARN_ENABLED=false) silently switched off the
+        evidence collection too, and the forward ledger stopped earning the
+        record that is supposed to settle the 0.4R question. Capping spend must
+        never cost measurement.
+
+        Own dedup key and bounded attempts, same shape as the other jobs, so a
+        restart cannot double-grade and a bad day cannot retry forever."""
+        if self.dry or now.time() < WEEKLY_AT:
+            return
+        key = str(learn_session_due(now))
+        if config.state_get("forward_graded") == key:
+            return
+        n = self._job_attempt("forward_grade", key)
+        if n > self.MAX_JOB_ATTEMPTS:
+            config.state_set("forward_graded", key)
+            print(f"{now:%H:%M:%S} forward grading attempted {n - 1} times for "
+                  f"{key}; marking done")
+            return
+        try:
+            import forward_ledger
+            graded = forward_ledger.fill_outcomes()
+            config.state_set("forward_graded", key)
+            if graded:
+                print(f"{now:%H:%M:%S} graded {graded} sniper candidate(s) "
+                      f"forward for {key}")
+        except Exception as e:
+            print(f"{now:%H:%M:%S} forward grading failed (attempt {n} "
+                  f"recorded, will retry): {e}")
+
     def maybe_holiday_notice(self, now: datetime):
         """Text everyone the evening before the market is shut, so the silence
         the next morning reads as expected rather than broken.
@@ -2298,8 +2333,9 @@ class Service:
                     try:  # announce "brain is back" when the 5h05m wait ends
                         import assistant
                         assistant.check_cooldown_recovery()
-                        assistant.probe_billing()  # self-limits to one real
-                        # call per BILLING_PROBE_S; see probe_billing
+                        # OFF-THREAD: a probe is up to 3 attempts at a 15s
+                        # timeout, and this loop walks live stops
+                        assistant.probe_billing_async()
                     except Exception:
                         pass
                     self.maybe_recap(now)
@@ -2348,9 +2384,9 @@ class Service:
                     import assistant
                     assistant.check_cooldown_recovery()
                     # and check whether a billing hold has been topped up. One
-                    # token, and it self-limits to one real call per probe
+                    # token, off-thread, self-limited to one real call per probe
                     # interval, so an empty balance costs nothing to watch.
-                    assistant.probe_billing()
+                    assistant.probe_billing_async()
                 except Exception:
                     pass
                 self.maybe_recap(now)   # catch-up: a recap missed/STALE during
@@ -2359,6 +2395,9 @@ class Service:
                 self.maybe_weekly(now)  # weekend catch-up
                 self.health_eod(now)    # close ping even if a restart ended the
                                         # session early (self-guards once/day)
+                self.maybe_grade_forward(now)  # deterministic, free, and
+                                        # deliberately NOT behind the paid
+                                        # nightly switch
                 self.maybe_learn(now)   # nightly self-review at a random late
                                         # evening time (self-guards once per
                                         # session; catches up the most recent

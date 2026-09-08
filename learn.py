@@ -33,6 +33,7 @@ Usage:
 """
 
 import json
+import os
 import re
 import sys
 
@@ -1102,62 +1103,206 @@ def export_backlog(path: str) -> int:
     return len(out)
 
 
-def import_reviews(path: str, reviewer: str = "offline") -> int:
-    """Append offline-written reviews to trade_reviews.jsonl.
+def _closed_positions_by_id() -> dict:
+    """Every closed, priced position the bot actually tracked, keyed by id.
+    This is the authority an imported review has to resolve against."""
+    out = {}
+    try:
+        for p in PositionBook().positions:
+            if getattr(p, "state", "") == "closed" \
+                    and getattr(p, "final_pnl_pct", None) is not None:
+                out[p.id] = p
+    except Exception as e:
+        print(f"import: could not read positions ({e})")
+    return out
 
-    Refuses a row whose id is already reviewed (the ledger is append-only and
-    a trade is reviewed once, ever) and refuses a cause the bot does not use,
-    because an unknown cause would silently drop out of every cause rollup.
-    Each row is stamped with the reviewer so provenance survives: a number in
-    this bot always has to say where it came from."""
+
+def _as_bool(v):
+    """Strict-ish boolean. bool("false") is True in python, which is how a
+    JSON string "false" silently became a live trade flagged as practice."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "yes", "1"):
+            return True
+        if s in ("false", "no", "0", ""):
+            return False
+    return None
+
+
+def _lesson_already_recorded(review_id: str) -> bool:
+    """Whether this review's lesson is already in the lessons log. Lets an
+    interrupted import repair its derived work without duplicating it."""
+    try:
+        for e in _all_lessons():
+            if e.get("source_review_id") == review_id:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _validate_rows(rows, closed, seen):
+    """Check EVERY row before anything is committed. Returns (ok, problems).
+
+    Nothing is written when a single row fails. A half-applied import is worse
+    than a refused one: the ledger dedups on id, so a bad row that lands is
+    never revisited."""
     causes = {"setup", "news", "geopolitics", "macro_event", "volatility",
               "time_decay", "execution", "unknown"}
-    with open(path, encoding="utf-8-sig") as f:
-        data = json.load(f)
+    ok, problems = [], []
+    ids_in_file = set()
+    for i, r in enumerate(rows):
+        where = f"row {i}"
+        if not isinstance(r, dict):
+            problems.append(f"{where}: not an object")
+            continue
+        rid = r.get("id")
+        where = f"row {i} (id={rid!r})"
+        if not rid or not isinstance(rid, str):
+            problems.append(f"{where}: missing or non-string id")
+            continue
+        if rid in ids_in_file:
+            problems.append(f"{where}: duplicated inside the file")
+            continue
+        ids_in_file.add(rid)
+        if rid in seen:
+            problems.append(f"{where}: already reviewed; imports never "
+                            "overwrite a canonical review")
+            continue
+        pos = closed.get(rid)
+        if pos is None:
+            problems.append(f"{where}: no closed position with this id. A "
+                            "review must describe a trade the bot really took")
+            continue
+        cause = (r.get("cause") or "unknown")
+        if not isinstance(cause, str) or cause.strip() not in causes:
+            problems.append(f"{where}: cause {cause!r} is not one of "
+                            f"{sorted(causes)}")
+            continue
+        paper = _as_bool(r.get("paper", getattr(pos, "paper", False)))
+        if paper is None:
+            problems.append(f"{where}: paper={r.get('paper')!r} is not a "
+                            "boolean. A string 'false' is not False")
+            continue
+        if paper != bool(getattr(pos, "paper", False)):
+            problems.append(f"{where}: paper={paper} contradicts the tracked "
+                            f"position ({bool(getattr(pos, 'paper', False))})")
+            continue
+        for field in ("why", "cause_detail", "lesson"):
+            if r.get(field) is not None and not isinstance(r.get(field), str):
+                problems.append(f"{where}: {field} must be text")
+                break
+        else:
+            ok.append((r, pos, cause.strip()))
+    return ok, problems
+
+
+def import_reviews(path: str, reviewer: str = "offline") -> int:
+    """Commit offline-written reviews into trade_reviews.jsonl.
+
+    Every row must resolve to a real closed position, and the immutable trade
+    facts (date, ticker, direction, strike, paper, final P&L, verdict) are
+    copied FROM that position rather than trusted from the file, so an import
+    can supply judgement but never rewrite what happened. Validation runs over
+    the whole file first: one bad row refuses the batch, because the ledger
+    dedups on id and a bad row that lands is never revisited.
+
+    Lessons are derived idempotently and the digest is rebuilt once at the end,
+    so an import interrupted between the review write and the lesson write can
+    be repaired by running it again (or with --repair-lessons) instead of
+    leaving a review whose lesson never reached the brain.
+    """
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"import: cannot read {path}: {e}")
+        return 0
     rows = data.get("reviews") if isinstance(data, dict) else data
     if not isinstance(rows, list):
         print("import: expected a JSON list, or an object with a 'reviews' list")
         return 0
+
+    closed = _closed_positions_by_id()
     seen = _reviewed_ids()
-    written = skipped = 0
-    for r in rows:
-        if not isinstance(r, dict) or not r.get("id"):
-            skipped += 1
-            continue
-        if r["id"] in seen:
-            print(f"import: {r['id']} is already reviewed, skipping")
-            skipped += 1
-            continue
-        cause = (r.get("cause") or "unknown").strip()
-        if cause not in causes:
-            print(f"import: {r['id']} has unknown cause {cause!r}, skipping")
-            skipped += 1
-            continue
-        entry = {"id": r["id"], "date": r.get("date", ""),
-                 "ticker": r.get("ticker", ""),
-                 "direction": r.get("direction", ""),
-                 "strike": r.get("strike"), "paper": bool(r.get("paper")),
-                 "final_pnl_pct": r.get("final_pnl_pct"),
-                 "verdict": r.get("verdict", ""), "why": r.get("why", ""),
-                 "cause": cause, "cause_detail": r.get("cause_detail", ""),
-                 "lesson": (r.get("lesson") or "").strip(),
-                 "reviewed_at": (r.get("reviewed_at")
-                                 or et_now().strftime("%Y-%m-%d %H:%M:%S %Z")),
-                 "reviewer": r.get("reviewer") or reviewer}
+    ok, problems = _validate_rows(rows, closed, seen)
+    if problems:
+        print(f"import: REFUSED. {len(problems)} problem(s), nothing written:")
+        for p in problems[:20]:
+            print(f"  - {p}")
+        if len(problems) > 20:
+            print(f"  ... and {len(problems) - 20} more")
+        return 0
+
+    stamp = et_now().strftime("%Y-%m-%d %H:%M:%S %Z")
+    src = os.path.basename(str(path))
+    written = 0
+    for r, pos, cause in ok:
+        entry = {
+            # immutable facts come from the tracked position, not the file
+            "id": pos.id, "date": pos.date, "ticker": pos.ticker,
+            "direction": pos.direction, "strike": pos.strike,
+            "paper": bool(getattr(pos, "paper", False)),
+            "final_pnl_pct": pos.final_pnl_pct,
+            "verdict": r.get("verdict", ""),
+            # judgement comes from the file
+            "why": r.get("why", ""), "cause": cause,
+            "cause_detail": r.get("cause_detail", ""),
+            "lesson": (r.get("lesson") or "").strip(),
+            "reviewed_at": r.get("reviewed_at") or stamp,
+            "reviewer": r.get("reviewer") or reviewer,
+            "imported_from": src, "imported_at": stamp,
+        }
         with REVIEWS_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
-        if entry["lesson"]:
-            _append_lesson({"session": entry["date"],
-                            "graded_at": entry["reviewed_at"],
-                            "wins": 0, "losses": 0, "trades": [],
-                            "review": f"deep review {entry['ticker']} "
-                                      f"{entry['date']}: {entry['why']}",
-                            "lessons": [entry["lesson"]],
-                            "watch_tomorrow": "", "proposed_change": None})
-        seen.add(entry["id"])
         written += 1
-    print(f"imported {written} review(s), skipped {skipped}")
+
+    repaired = _derive_lessons_for(REVIEWS_FILE)
+    print(f"imported {written} review(s); {repaired} lesson(s) derived; "
+          "digest rebuilt")
     return written
+
+
+def _derive_lessons_for(reviews_file) -> int:
+    """Append a lesson for every reviewed trade that carries one and does not
+    already have it recorded, then rebuild the digest once.
+
+    Idempotent on purpose: this is the repair path. Running it twice adds
+    nothing the second time, so an import that died between writing a review
+    and writing its lesson heals by being run again."""
+    made = 0
+    try:
+        rows = []
+        if reviews_file.exists():
+            for line in reviews_file.read_text(encoding="utf-8-sig").splitlines():
+                if line.strip():
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        for r in rows:
+            lesson = (r.get("lesson") or "").strip()
+            if not lesson or _lesson_already_recorded(r.get("id")):
+                continue
+            _append_lesson({
+                "session": r.get("date", ""),
+                "graded_at": r.get("reviewed_at", ""),
+                "wins": 0, "losses": 0, "trades": [],
+                "review": f"deep review {r.get('ticker','')} {r.get('date','')}: "
+                          f"{r.get('why','')}",
+                "lessons": [lesson], "watch_tomorrow": "",
+                "proposed_change": None,
+                "source_review_id": r.get("id"),
+            })
+            made += 1
+        _rebuild_digest()
+    except Exception as e:
+        print(f"import: lesson derivation incomplete ({e})")
+    return made
 
 
 def main():
@@ -1165,6 +1310,10 @@ def main():
         i = sys.argv.index("--export-backlog")
         return export_backlog(sys.argv[i + 1] if i + 1 < len(sys.argv)
                               else "review_backlog.json")
+    if "--repair-lessons" in sys.argv:
+        # recovery path for an import that died between writing a review and
+        # writing its lesson: idempotent, so it is always safe to run
+        return _derive_lessons_for(REVIEWS_FILE)
     if "--import-reviews" in sys.argv:
         i = sys.argv.index("--import-reviews")
         if i + 1 >= len(sys.argv):
