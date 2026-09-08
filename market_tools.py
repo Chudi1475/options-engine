@@ -502,6 +502,45 @@ def _signal_symbol(disp, kind):
     return disp
 
 
+def stretch_targets(entry, stop, direction):
+    """The 1R and 2R stretch levels for a sniper ticket, or None.
+
+    Pure and self-validating on purpose. These levels are printed on a card a
+    human may act on, so they must never land on the wrong side of entry. The
+    bug this replaces took its sign from a direction variable that had already
+    been superseded by the sniper plan, so a BUY at 100 with a stop at 99 was
+    shown 1R at 99 and 2R at 98: levels that are losses the moment they print.
+
+    Returns None rather than guessing whenever the inputs are unusable (bad
+    numbers, a zero-distance stop, a stop on the wrong side of entry for the
+    stated direction, or a direction that is not BUY/SELL). A card with no
+    stretch map is honest; a card with inverted one is not.
+    """
+    try:
+        entry = float(entry)
+        stop = float(stop)
+    except (TypeError, ValueError):
+        return None
+    side = str(direction or "").strip().upper()
+    if side not in ("BUY", "SELL"):
+        return None
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    # a BUY stops BELOW entry and a SELL stops ABOVE it; anything else means
+    # the ticket and the direction disagree, which is the very confusion that
+    # produced the defect, so refuse instead of printing something plausible
+    if (side == "BUY" and stop >= entry) or (side == "SELL" and stop <= entry):
+        return None
+    sign = 1 if side == "BUY" else -1
+    t1 = round(entry + sign * risk, 6)
+    t2 = round(entry + sign * 2 * risk, 6)
+    if (side == "BUY" and not (t1 > entry and t2 > t1)) or \
+            (side == "SELL" and not (t1 < entry and t2 < t1)):
+        return None
+    return {"target_1r": t1, "target_2r": t2}
+
+
 def plan_levels(price, bias, atr, hi, lo, dec, kind):
     """A concrete trade plan built ONLY from real numbers: ATR sizes the risk,
     recent structure (session high/low) anchors the stop when it sits a sane
@@ -907,17 +946,21 @@ def _do_read(disp, yfs, dec, kind, source):
                 ticket["measured"] = _spec.sniper_measured_dict()
                 # stretch map: same entry/stop, bigger paydays. These carry NO
                 # measured win rate yet; the forward ledger is earning them one.
-                try:
-                    _entry, _stop = float(ticket["entry"]), float(ticket["stop"])
-                    _risk = abs(_entry - _stop)
-                    _sign = 1 if direction == "BUY" else -1
-                    ticket["target_1r"] = round(_entry + _sign * _risk, 6)
-                    ticket["target_2r"] = round(_entry + _sign * 2 * _risk, 6)
+                #
+                # sdir, NOT the outer `direction`: four lines above, `plan` was
+                # reassigned to the sniper plan, whose side is sdir. The two
+                # disagree whenever the earlier read leaned one way and the
+                # sniper gate fired the other, and the old code then printed
+                # both stretch targets on the LOSING side of entry, e.g. a BUY
+                # at 100 stop 99 showing 1R at 99 and 2R at 98.
+                ticket["direction"] = sdir
+                _stretch = stretch_targets(ticket.get("entry"),
+                                           ticket.get("stop"), sdir)
+                if _stretch:
+                    ticket.update(_stretch)
                     _ct = (conf.get("ticket") or {}).get("target_liquidity")
                     if _ct:
                         ticket["target_structure"] = _ct
-                except (KeyError, TypeError, ValueError):
-                    pass
                 conf["ticket"] = ticket
             elif plan:
                 conviction = "medium"

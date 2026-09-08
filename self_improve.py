@@ -178,7 +178,8 @@ def run_checks(files: list) -> bool:
                 return False
         for test in ("test_pipeline.py", "test_adduser.py",
                      "test_no_hardcoded_stats.py", "test_session_fixes.py",
-                     "test_market_calendar.py", "test_no_em_dash.py"):
+                     "test_market_calendar.py", "test_review_regressions.py",
+                     "test_no_em_dash.py"):
             r = subprocess.run([PYEXE, test], cwd=REPO, timeout=600,
                                capture_output=True, text=True, errors="replace")
             if r.returncode != 0:

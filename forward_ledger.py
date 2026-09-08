@@ -70,20 +70,51 @@ def _write_all(records: list):
         pass
 
 
+def event_id(day, symbol, direction, time_et, entry, stop) -> str:
+    """A stable identity for one candidate observation.
+
+    Derived from the event's own facts so that a retry after a crash or a
+    duplicated read produces the SAME id and collapses, while a genuinely
+    different look later the same morning produces a different one. This is
+    what lets an alert, its forward observation and its graded outcome be
+    linked to each other instead of being matched by guesswork on the day."""
+    import hashlib
+    raw = f"{day}|{symbol}|{direction}|{time_et}|{entry}|{stop}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
 def record_candidate(symbol: str, direction: str, price: float, atr: float,
                      ticket: dict, conf: dict, passes: bool, reasons: list,
                      gap_atr=None, hour_et=None, now_et: datetime = None):
-    """Log one live sniper candidate (deduped per symbol+direction+day).
-    Called from the read path; must be fast and can never raise."""
+    """Log one live sniper candidate. Called from the read path; must be fast
+    and can never raise.
+
+    Deduplication is on the EVENT, not on the day. The old rule returned on any
+    existing row for (date, symbol, direction), so the first candidate of the
+    day won forever: a 09:35 near miss permanently suppressed the 09:50 alert
+    that actually fired, and that real entry then had no forward observation to
+    reconcile against. Retries of one event still collapse, because the id is
+    derived from the event's own facts."""
     try:
         if not ticket or not direction:
             return
         now = now_et or datetime.now(ET)
         day = f"{now:%Y-%m-%d}"
-        for r in _read_all():
-            if (r.get("date") == day and r.get("symbol") == symbol
-                    and r.get("direction") == direction):
-                return  # one candidate per symbol+direction per day
+        stamp = f"{now:%H:%M:%S}"
+        eid = event_id(day, symbol, direction, stamp,
+                       ticket.get("entry", price), ticket.get("stop"))
+        existing = _read_all()
+        for r in existing:
+            if r.get("event_id") == eid:
+                return  # a retry of THIS event, not a new one
+        if passes:
+            # At most one ACCEPTED entry per symbol+direction+day, which is the
+            # validated one-trade-per-symbol-per-day shape. Rejects are never
+            # suppressed: they are the opportunity denominator.
+            for r in existing:
+                if (r.get("date") == day and r.get("symbol") == symbol
+                        and r.get("direction") == direction and r.get("passes")):
+                    return
         entry = float(ticket.get("entry", price))
         stop = float(ticket.get("stop", 0))
         risk = abs(entry - stop)
@@ -93,7 +124,8 @@ def record_candidate(symbol: str, direction: str, price: float, atr: float,
         liq = ticket.get("target_liquidity") or (conf or {}).get(
             "target_liquidity")
         rec = {
-            "date": day, "time_et": f"{now:%H:%M:%S}",
+            "event_id": eid,          # stable identity, links alert -> outcome
+            "date": day, "time_et": stamp,
             "symbol": symbol, "direction": direction,
             "entry": round(entry, 6), "stop": round(stop, 6),
             "risk": round(risk, 6), "atr": round(float(atr or 0), 6),
