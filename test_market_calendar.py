@@ -452,21 +452,34 @@ try:
     tmpdir = tempfile.mkdtemp()
     config.STATE_FILE = __import__("pathlib").Path(tmpdir) / "state.json"
     try:
-        _set(mode="full", cap="3")
+        _set(mode="full", cap="2")
         config.api_note_call("chat")
         config.api_note_call("scheduled")
         c = config.api_counts()
         check("calls are counted per purpose",
               c["chat"] == 1 and c["scheduled"] == 1, str(c))
-        check("under the cap it still allows", config.api_allows("chat")[0])
-        config.api_note_call("chat")
-        check("the daily cap stops the next call",
-              not config.api_allows("chat")[0],
-              config.api_allows("chat")[1])
+        check("under the cap scheduled work still runs",
+              config.api_allows("scheduled")[0])
+        config.api_note_call("scheduled")
+        check("the daily cap stops the next scheduled call",
+              not config.api_allows("scheduled")[0],
+              config.api_allows("scheduled")[1])
         check("the cap message says when it resets",
-              "midnight ET" in config.api_allows("chat")[1])
+              "midnight ET" in config.api_allows("scheduled")[1])
+        # The cap exists to stop an unattended loop draining the balance. A
+        # person who texted the bot is not that loop, and one chat turn is
+        # several tool round-trips, so a shared ceiling would have gone silent
+        # on the owner after about nine messages and blamed a spending limit.
+        for _ in range(50):
+            config.api_note_call("chat")
+        check("a human is never refused by the cap",
+              config.api_allows("chat")[0], config.api_allows("chat")[1])
+        check("a probe is never refused by the cap",
+              config.api_allows("probe")[0])
         check("the usage line reports the tally",
-              "3/3" in config.api_usage_line(), config.api_usage_line())
+              "chat" in config.api_usage_line()
+              and "scheduled" in config.api_usage_line(),
+              config.api_usage_line())
         # a stale day's tally must not carry over
         config.state_set(config.API_CALLS_KEY,
                          {"date": "1999-01-01", "chat": 99, "scheduled": 99})
@@ -521,6 +534,14 @@ try:
     config.STATE_FILE = __import__("pathlib").Path(tmpdir2) / "state.json"
     _saved_post = assistant._post_anthropic
     _saved_key2 = os.environ.get("ANTHROPIC_API_KEY")
+    # _end_billing_hold DMs the owner "brain back online". Without stubbing the
+    # transport this suite texts a real person every time it runs, which it did
+    # until this was caught. Nothing in this file may touch the network.
+    import telegram as _tg
+    _saved_send, _saved_owner = _tg.send_to, _tg.primary_owner_id
+    _sent_dms = []
+    _tg.send_to = lambda cid, txt, **k: _sent_dms.append((cid, txt)) or None
+    _tg.primary_owner_id = lambda: "test-owner"
     try:
         os.environ["ANTHROPIC_API_KEY"] = "test-key"
         check("probe_billing is a no-op when there is no hold",
@@ -529,8 +550,8 @@ try:
         # arm a hold, then let the probe find the balance restored
         posted = []
 
-        def _ok_post(payload, timeout, purpose="chat"):
-            posted.append((payload, purpose))
+        def _ok_post(payload, timeout, purpose="chat", force=False):
+            posted.append((payload, purpose, force))
             assistant._end_billing_hold()
             return {"content": [{"type": "text", "text": "hi"}]}, None
 
@@ -547,6 +568,68 @@ try:
               posted and posted[0][1] == "probe")
         check("the probe sends no system prompt to pay for",
               posted and "system" not in posted[0][0])
+        # /brain has to be a REAL check. Without force it would replay the last
+        # verdict from inside the 6-hour interval and report "still refused"
+        # without having asked anything, which is the exact failure this whole
+        # billing fix exists to stop. The gate lives INSIDE _post_anthropic, so
+        # this has to run the real one and stub only the socket underneath it.
+        assistant._post_anthropic = _saved_post
+        _hits = []
+
+        class _Resp:
+            status_code = 200
+            headers = {}
+
+            @staticmethod
+            def json():
+                return {"content": [{"type": "text", "text": "hi"}]}
+
+        _saved_sess = assistant._api_session.post
+        assistant._api_session.post = (
+            lambda *a, **k: _hits.append(1) or _Resp())
+        try:
+            config.state_set(assistant._BILLING_KEY,
+                             {"since": 1, "last_probe": assistant._now_s(),
+                              "notified": True})
+            assistant.probe_billing()
+            check("an unforced probe inside the interval never opens a socket",
+                  not _hits, str(_hits))
+            check("and the hold is still standing after it",
+                  assistant.billing_hold() is not None)
+            assistant.probe_billing(force=True)
+            check("/brain's forced probe ignores the interval and really asks",
+                  len(_hits) == 1, str(_hits))
+            check("a forced probe that succeeds clears the hold",
+                  assistant.billing_hold() is None)
+
+            # the runaway this caused: last_probe was only stamped when the API
+            # refused for MONEY, so a timeout or a 500 left the gate open and
+            # the daemon re-probed every cycle, inside the loop that watches
+            # live stops
+            _hits.clear()
+            config.state_set(assistant._BILLING_KEY,
+                             {"since": 1, "last_probe": 1, "notified": True})
+
+            class _Boom:
+                status_code = 500
+                headers = {}
+                text = "server error"
+
+                @staticmethod
+                def json():
+                    return {"error": {"type": "server", "message": "boom"}}
+
+            assistant._api_session.post = (
+                lambda *a, **k: _hits.append(1) or _Boom())
+            assistant.probe_billing()
+            first = len(_hits)
+            assistant.probe_billing()
+            check("a probe that fails for a non-billing reason still burns "
+                  "its slot, so the next cycle does not re-probe",
+                  len(_hits) == first, f"{first} then {len(_hits)}")
+        finally:
+            assistant._api_session.post = _saved_sess
+            assistant._post_anthropic = _ok_post
 
         # the status line must say WHEN it last checked, not just when it broke
         config.state_set(assistant._BILLING_KEY,
@@ -558,8 +641,11 @@ try:
               "credits empty" not in line, line)
         check("the status line says how to force a check",
               "/brain" in line, line)
+        check("the suite never texted a real person",
+              all(cid == "test-owner" for cid, _ in _sent_dms), str(_sent_dms))
     finally:
         assistant._post_anthropic = _saved_post
+        _tg.send_to, _tg.primary_owner_id = _saved_send, _saved_owner
         config.STATE_FILE = _saved_state2
         if _saved_key2 is None:
             os.environ.pop("ANTHROPIC_API_KEY", None)

@@ -174,7 +174,7 @@ def _end_billing_hold():
                 "running again.")
 
 
-def probe_billing() -> bool:
+def probe_billing(force: bool = False) -> bool:
     """Ask the API whether the balance is back, with the smallest call that
     exists: one token, cheapest model, no system prompt. True when the brain
     is live again.
@@ -186,12 +186,14 @@ def probe_billing() -> bool:
     daemon now runs this on the probe interval instead."""
     if not enabled() or billing_hold() is None:
         return billing_hold() is None
+    # force is for an operator typing /brain: it skips the 6-hour interval so
+    # the answer is a real check, not a replay of the last verdict.
     body, err = _post_anthropic(
         {"model": os.environ.get("BILLING_PROBE_MODEL",
                                  "claude-haiku-4-5-20251001").strip(),
          "max_tokens": 1,
          "messages": [{"role": "user", "content": "hi"}]},
-        timeout=30, purpose="probe")
+        timeout=15, purpose="probe", force=force)
     # _post_anthropic clears the hold itself on a 200 and re-arms it on
     # another billing refusal, so there is nothing to do with the result here
     # beyond reporting it.
@@ -256,7 +258,8 @@ def _looks_like_usage_limit(status: int, err_type: str, err_msg: str,
     return False
 
 
-def _post_anthropic(payload: dict, timeout: int, purpose: str = "chat"):
+def _post_anthropic(payload: dict, timeout: int, purpose: str = "chat",
+                    force: bool = False):
     """Single choke point for every Claude call. Returns (body_dict, None) on
     success or (None, honest_error_text) on failure. Handles:
     - the SPENDING POLICY (config.api_allows): the metered key is a last
@@ -284,8 +287,22 @@ def _post_anthropic(payload: dict, timeout: int, purpose: str = "chat"):
             since_probe = _now_s() - float(hold.get("last_probe") or 0)
         except (TypeError, ValueError):
             since_probe = BILLING_PROBE_S
-        if since_probe < BILLING_PROBE_S:
+        if since_probe < BILLING_PROBE_S and not force:
             return None, OFFLINE_TEXT
+        # Claim the probe slot BEFORE the request, not only when the API
+        # refuses for money again. Otherwise any other outcome (a timeout, a
+        # 500, a 200 with an unreadable body) leaves last_probe untouched and
+        # the gate reopens on the very next cycle: the daemon would then spend
+        # up to three attempts with backoff every 15 seconds, inside the loop
+        # that watches live stops.
+        try:
+            with _BRAIN_LOCK:
+                cur = billing_hold()
+                if cur:
+                    cur["last_probe"] = _now_s()
+                    config.state_set(_BILLING_KEY, cur)
+        except Exception:
+            pass
     import time as _t
     last_err = "unknown error"
     for attempt in range(3):
@@ -1096,11 +1113,16 @@ def _file_blocks(item: dict):
 
 
 def respond(item: dict, context_text: str, tools_enabled: bool = True,
-            attachments: list = None) -> str:
+            attachments: list = None, purpose: str = "chat") -> str:
     """Answer one message (text/photo/document) from an authorized chat. If
     `attachments` (a list) is passed, any high-conviction macro read the brain
     pulls is appended to it so the caller can text the marked-up FVG chart right
-    after the reply."""
+    after the reply.
+
+    purpose is "chat" because the normal caller is a person waiting on a
+    reply. The breaking-news desk calls this with purpose="scheduled": nobody
+    asked for that read, it fires on whatever the wires print, and it must not
+    quietly spend the metered balance under the default policy."""
     from datetime import datetime as _dt
     from zoneinfo import ZoneInfo as _zi
     now_ct = _dt.now(_zi("America/Chicago"))
@@ -1156,7 +1178,7 @@ def respond(item: dict, context_text: str, tools_enabled: bool = True,
             payload["tools"] = TOOLS
             if force_text:
                 payload["tool_choice"] = {"type": "none"}
-        body, err = _post_anthropic(payload, timeout=120)
+        body, err = _post_anthropic(payload, timeout=120, purpose=purpose)
         if body is None:
             if deep_answer:  # the deep brain already answered; hand it over
                 reply = deep_answer

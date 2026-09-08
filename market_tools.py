@@ -16,6 +16,7 @@ import yfinance as yf
 import cards
 import config
 import live_params
+import market_calendar
 import scoreboard
 import strategy_spec
 from backtest import (CONTRACTS, SLIPPAGE, bs_price, expiry_for, realized_vol,
@@ -316,7 +317,13 @@ def market_now(ticker="SPX", cfg=None, allowed=None):
         return {"error": f"{ticker} isn't on the watchlist."}
     yfs = cfg.watchlist[ticker]
     now = datetime.now(ET)
-    if now.weekday() >= 5 or not (time(9, 30) <= now.time() <= time(16, 0)):
+    if (not market_calendar.is_trading_day(now.date())
+            or not (time(9, 30) <= now.time()
+                    <= market_calendar.session_close(now.date()))):
+        # Closed, so keep tracking but SAY it is closed. The old weekday/16:00
+        # test called a market holiday a live regular session, which meant the
+        # brain would quote a strike, a win rate and an "in entry window" on a
+        # day nothing could trade. It also missed the 13:00 half-day bell.
         # extended hours: keep tracking. Stocks/ETFs get pre/post-market bars;
         # SPX has no after-hours tape so it rides the ES futures.
         r = read_any("es" if ticker == "SPX" else ticker)
@@ -343,7 +350,10 @@ def market_now(ticker="SPX", cfg=None, allowed=None):
         "day_open": round(o, 2),
         "move_from_open_pct": round(((price or float(bars["Close"].iloc[-1])) / o - 1) * 100, 2),
         "momentum_15min_pct": round(mom, 2) if mom is not None else None,
-        "in_entry_window": cfg.entry_start <= now.time() <= cfg.entry_end,
+        # the clock alone is not enough: on a closure there is no entry
+        # window at all, however cooperative the hands on the clock look
+        "in_entry_window": (market_calendar.is_trading_day(now.date())
+                            and cfg.entry_start <= now.time() <= cfg.entry_end),
         "entry_window_ct": window_ct,
         "data": _feed.backend_for(yfs),
     }

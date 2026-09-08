@@ -1205,7 +1205,8 @@ class Service:
         if hold is None:
             return "\n".join(["Brain: " + assistant.brain_status_line(),
                               config.api_usage_line()])
-        ok = assistant.probe_billing()
+        ok = assistant.probe_billing(force=True)  # an operator asked, so
+        # skip the 6-hour interval and actually hit the API
         if ok:
             return "\n".join(["Checked just now: the API answered, so the "
                               "brain is back online.",
@@ -1546,7 +1547,13 @@ class Service:
         if spot is None:
             return
         sigma = self.sigma(pos.ticker)
-        expiry_dt = datetime.combine(pos.expires_on(), time(16, 0), tzinfo=ET)
+        # the contract dies when the MARKET shuts, not at a fixed 16:00. On a
+        # 13:00 half day the old literal carried three hours of time value
+        # that does not exist, and because this estimate becomes the mark
+        # whenever the 0DTE chain goes bid-less, that inflated number was
+        # what got written into final_pnl_pct and quoted as the win rate.
+        expiry_dt = datetime.combine(pos.expires_on(),
+                                     poslib.close_t(pos.expires_on()), tzinfo=ET)
         # sigma==0 means the vol download was throttled; a BS price with no vol
         # collapses to pure intrinsic (all time value stripped) and reads as a
         # huge phantom loss vs the entry estimate -> a FALSE stop. Treat it as
@@ -1607,7 +1614,7 @@ class Service:
         comparable = usable and (mark_is_est == entry_is_est)
 
         near_expiry = (pos.expires_on() == now.date()
-                       and now.time() >= poslib.WARN_T)
+                       and now.time() >= poslib.warn_t(now.date()))
         # nothing trustworthy to act on (no comparable mark AND no model signal)
         # and not at the bell -> skip the cycle rather than act on a biased number
         if not comparable and est_pct is None and not near_expiry:
@@ -1667,9 +1674,16 @@ class Service:
         import fvg as fvg_mod
         if fvg_mod.sniper_window_open(now):
             return "entries"
-        if (has_open and now.weekday() < 5
-                and time(16, 0) <= now.time() < time(16, 15)):
-            return "step"
+        # the settle window rides the day's real close: on a half day the
+        # tape stops at 13:00, so waiting for 16:00 left an open sniper
+        # unwatched for three hours and then graded it on forex bars that
+        # printed after the equity session was already over.
+        if has_open and market_calendar.is_trading_day(now.date()):
+            close = market_calendar.session_close(now.date())
+            end = (datetime.combine(date(2000, 1, 3), close)
+                   + timedelta(minutes=15)).time()
+            if close <= now.time() < end:
+                return "step"
         return "off"
 
     def _settle_open_snipers(self, now: datetime):
@@ -1967,7 +1981,10 @@ class Service:
                           "this headline mean for "
                           f"{'/'.join(self.cfg.watchlist)} trades today? "
                           f"Headline: {title}")},
-                self.status_text(), tools_enabled=False)
+                self.status_text(), tools_enabled=False,
+                purpose="scheduled")  # nobody asked for this read; it fires on
+                                      # whatever the wires print, so it only
+                                      # spends under API_MODE=full
             # only forward a genuine model answer. assistant.respond returns
             # several failure strings that DON'T contain 'error' ("My brain
             # couldn't connect…", "came back empty…") — those must never reach
@@ -2145,25 +2162,38 @@ class Service:
         recorded BEFORE the send so a crash between the broadcast and the mark
         cannot re-text everyone, and bounded attempts so an unreachable member
         cannot make it retry all night."""
-        if self.dry or now.time() < HOLIDAY_NOTICE_AT:
+        if self.dry:
             return
         today = now.date()
-        if not is_session_day(today):
-            # Only a real session's evening announces the next closure. Without
-            # this the bot would re-announce Christmas from inside the
-            # Christmas Eve holiday, and on a weekend it would announce a
-            # Monday holiday twice.
+        closures, half = [], None
+        if not is_session_day(today) and today.weekday() < 5:
+            # The closure is ALREADY HERE and was never announced: the bot was
+            # down through the evening before, or the owner declared it that
+            # morning with /closed. Say so today rather than stay silent on the
+            # one day the silence is the whole question. day_reference renders
+            # this as "today", so the card reads correctly either way.
+            name = market_calendar.holiday_name(today)
+            if not name:
+                return
+            closures = [(today, name)]
+        elif is_session_day(today) and now.time() >= HOLIDAY_NOTICE_AT:
+            closures = market_calendar.upcoming_closures(today)
+            if not closures:
+                nxt = market_calendar.next_trading_day(today)
+                reason = market_calendar.early_close_reason(nxt)
+                if reason:
+                    half = (nxt, reason)
+        else:
             return
-        closures = market_calendar.upcoming_closures(today)
-        half = None
-        if not closures:
-            nxt = market_calendar.next_trading_day(today)
-            reason = market_calendar.early_close_reason(nxt)
-            if reason:
-                half = (nxt, reason)
         if not closures and not half:
             return
-        key = (f"closed:{closures[0][0]}" if closures else f"half:{half[0]}")
+        # The key names the WHOLE announced set and the return day, not just
+        # the first date. An extended closure (a two-day storm declared one day
+        # at a time) then reads as new news instead of being swallowed as a
+        # repeat of the announcement that only mentioned day one.
+        key = (("closed:" + ",".join(str(d) for d, _ in closures)
+                + f"|back:{market_calendar.next_trading_day(closures[-1][0])}")
+               if closures else f"half:{half[0]}")
         if config.state_get("holiday_notice_sent") == key:
             return
         n = self._job_attempt("holiday_notice", key)

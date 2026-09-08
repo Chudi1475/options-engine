@@ -183,14 +183,17 @@ def api_allows(purpose: str = "chat"):
         return False, (f"{purpose} work does not spend the metered API "
                        f"(API_MODE={mode}); run it on the desktop instead")
     cap = api_daily_cap()
-    if cap:
+    if cap and purpose != "chat":
+        # The cap exists to backstop an UNATTENDED retry loop draining the
+        # balance overnight. It deliberately does not apply to a person who
+        # texted the bot: one chat turn can be several tool round-trips, so a
+        # shared ceiling would have gone quiet on Chudi after about nine
+        # messages and called it a spending limit. Probes are exempt too;
+        # capping them would strand the brain offline for a whole day.
         c = api_counts()
-        used = c["chat"] + c["scheduled"]  # probes are a rounding error, and
-                                           # capping them would strand the
-                                           # brain offline for a whole day
-        if used >= cap:
-            return False, (f"daily paid-call cap reached ({used}/{cap}); "
-                           "resets at midnight ET")
+        if c["scheduled"] >= cap:
+            return False, (f"daily scheduled-call cap reached "
+                           f"({c['scheduled']}/{cap}); resets at midnight ET")
     return True, ""
 
 

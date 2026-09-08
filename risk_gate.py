@@ -219,6 +219,12 @@ def anthropic_news_check(today: date):
     if not allowed:
         print(f"risk gate: skipping the paid news check, {why}")
         return None
+    try:  # a brain already dark on billing or resting on a rate limit has
+        import assistant   # nothing to offer, and the call would just bill
+        if assistant.billing_hold() or assistant.cooldown_left_s():
+            return None
+    except Exception:
+        pass
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -236,6 +242,8 @@ def anthropic_news_check(today: date):
                     "colon, then a reason of at most 12 words."}],
             },
             timeout=90)
+        if r.status_code != 200:
+            return None      # a refusal is not a billable call
         config.api_note_call("scheduled")
         text = "".join(b.get("text", "") for b in r.json().get("content", [])
                        if b.get("type") == "text")
@@ -269,6 +277,11 @@ def risk_mode(include_gap: bool = True):
         reasons.append(f"event list: {manual_event}")
 
     news = anthropic_news_check(today)
+    if news is None and os.environ.get("ANTHROPIC_API_KEY"):
+        # the key exists but the check did not run (spending policy, billing
+        # hold, or a refusal). A day with an unchecked blind spot is not "all
+        # clear", and this bot does not get to imply a check it never made.
+        reasons.append("the news check did not run today")
     if news:
         n_mode, n_reason = news
         if n_mode != "green":

@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import yfinance as yf
 
+import market_calendar
 from strategy import StrategyConfig, detect_setup
 
 ET = ZoneInfo("America/New_York")
@@ -92,7 +93,10 @@ def expiry_for(ticker: str, day: datetime) -> datetime:
         exp_day = day  # 0DTE (both have daily expirations)
     else:
         exp_day = day + timedelta(days=(4 - day.weekday()) % 7)  # this week's Friday
-    return exp_day.replace(hour=16, minute=0, second=0)
+    # 16:00 unless that session closes early (Jul 3, the day after
+    # Thanksgiving, Christmas Eve), where the option really dies at 13:00.
+    close = market_calendar.session_close(exp_day.date())
+    return exp_day.replace(hour=close.hour, minute=close.minute, second=0)
 
 
 def years_to_expiry(now: datetime, expiry: datetime) -> float:
