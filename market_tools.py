@@ -989,17 +989,24 @@ def _do_read(disp, yfs, dec, kind, source):
                         _gap_atr = (float(_lconf["top"]) - float(_lconf["bottom"])) / satr
                     except (KeyError, TypeError, ZeroDivisionError):
                         pass
-                    # keep the id the recorder allocates. It rides out on the
-                    # read as part of the fvg payload the alert path already
-                    # carries, so the card, the tracked position and this
-                    # observation all name the same candidate instead of being
-                    # matched afterwards by guessing on the day.
-                    _cid = _fl.record_candidate(
-                        yfs, _ldir, price, satr, _tk, _lconf,
-                        bool(is_sniper), sniper.get("reasons"),
-                        gap_atr=_gap_atr, hour_et=_now.hour, now_et=_now)
+                    # mint the id HERE, in the read, and hand the SAME one down
+                    # to the recorder. It used to be kept only when
+                    # record_candidate returned one, so a refused ledger write
+                    # produced a ticket carrying no candidate id at all: the
+                    # card still fired and was born unlinkable, with no way
+                    # afterwards to say which observation it came from. An
+                    # observation's identity is a property of the read, not of
+                    # whether a file write happened to land. It rides out on
+                    # the fvg payload the alert path already carries.
+                    _cid = _fl.candidate_id_for_ticket(
+                        yfs, _ldir, _tk, price, _now)
                     if _cid:
                         fvg_info["candidate_id"] = _cid
+                    _fl.record_candidate(
+                        yfs, _ldir, price, satr, _tk, _lconf,
+                        bool(is_sniper), sniper.get("reasons"),
+                        gap_atr=_gap_atr, hour_et=_now.hour, now_et=_now,
+                        candidate_id=_cid or None)
             except Exception:
                 pass
     except Exception:

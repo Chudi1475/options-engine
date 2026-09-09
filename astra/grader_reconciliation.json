@@ -1,0 +1,78 @@
+{
+  "kind": "measurement",
+  "label": "reconciliation of reports/chart_backtest_round6_session.json out of sample average R, and of the win-rate convention used for the live book. Closes Astra M08.",
+  "source_report": "reports\\chart_backtest_round6_session.json",
+  "split_date": "2026-06-01",
+  "out_of_sample": {
+    "n": 53,
+    "by_exit": {
+      "eod": {
+        "n": 2,
+        "sum_r": -1.032,
+        "mean_r": -0.516,
+        "min_r": -0.528,
+        "max_r": -0.504,
+        "all_identical": false
+      },
+      "stop": {
+        "n": 8,
+        "sum_r": -8.0,
+        "mean_r": -1.0,
+        "min_r": -1.0,
+        "max_r": -1.0,
+        "all_identical": true
+      },
+      "tp": {
+        "n": 43,
+        "sum_r": 17.2,
+        "mean_r": 0.4,
+        "min_r": 0.4,
+        "max_r": 0.4,
+        "all_identical": true
+      }
+    }
+  },
+  "reconciliation": {
+    "reproduces": {
+      "n": true,
+      "total_r": true,
+      "avg_r": true
+    },
+    "computed_total_r": 8.168,
+    "computed_avg_r": 0.1541,
+    "reported_total_r": 8.168,
+    "reported_avg_r": 0.154,
+    "astra_assumed_avg_r": 0.13585,
+    "why_astra_could_not_reconcile": "the assumption was ten full 1R losses. There are EIGHT full stops at exactly -1.000R and TWO end of day exits averaging -0.516R, so the loss side totals -9.032R rather than -10R.",
+    "stop_overshoot_hypothesis": {
+      "guess": "a gap through the stop makes a loss worse than -1R",
+      "verdict": "REFUTED for this report. Every out of sample stop is exactly -1.000R, so the simulator books the stop at the threshold. That is an idealisation, not a conservatism: Astra A18 says stops filled at the threshold are idealised, and a real gap can fill worse."
+    }
+  },
+  "live_book_convention": {
+    "available": true,
+    "n": 53,
+    "targets": 32,
+    "stops": 17,
+    "session_end": 4,
+    "as_i_reported_it": {
+      "formula": "targets / (targets + stops), session end EXCLUDED",
+      "pct": 65.306
+    },
+    "on_the_backtest_convention": {
+      "formula": "targets / all rows, session end IN the denominator",
+      "pct": 60.377
+    },
+    "gap_to_backtest": {
+      "as_i_reported_it_points": 15.794,
+      "like_for_like_points": 20.723,
+      "reading": "the gap I published used two different conventions. On the backtest's own convention the live shortfall is larger, not smaller."
+    }
+  },
+  "conclusions": [
+    "The report reconciles exactly. M08 closes.",
+    "Session-end exits are NOT flat in the backtest: they average -0.516R. Treating them as 0R is wrong in both directions.",
+    "The live book's win rate and the backtest's win rate were computed on different denominators. Every future table states its convention.",
+    "Stops book at exactly the threshold, which is an idealisation. A real gap through the stop can fill worse and this report cannot show it."
+  ]
+}

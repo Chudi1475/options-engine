@@ -32,6 +32,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import threading
 import time as time_mod
+from dataclasses import asdict
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -39,6 +40,8 @@ import yfinance as yf
 
 import cards
 import config
+import event_journal
+import forward_ledger
 import instance_lock
 import live_params
 import market_calendar
@@ -48,6 +51,7 @@ import quotes
 import risk_gate
 import scoreboard
 import sniper_book
+import storage_io
 import strategy_spec
 import telegram
 from backtest import expiry_for, realized_vol
@@ -226,6 +230,13 @@ def record_alert(setup, now: datetime, stats):
 class Service:
     def __init__(self, dry_run: bool = False):
         self.dry = dry_run
+        # Declared at the WIRE, on both branches, because self.dry is a call
+        # site check and the sniper entry path was rewritten to reach
+        # telegram through _deliver, which has no call site check. One
+        # forgotten branch there put real tickets on three real phones from
+        # `scanner.py --dry-run`. Set on the False branch too, so a live
+        # Service built after a dry one in the same process is live.
+        telegram.set_dry_run(bool(dry_run))
         self.cfg = StrategyConfig()
         self.feed = DataFeed()
         book_path = (config.DATA_DIR / "positions_dryrun.json") if dry_run else None
@@ -247,22 +258,36 @@ class Service:
         self._health_last_stamp = 0.0   # monotonic; throttles the alive-stamp
         self._feed_warned = False       # in-memory: feed-stale DM already sent
         self._feed_none_warned = False  # in-memory: no-data-yet DM already sent
-        # single-instance lease (see ensure_active). all in-memory dampers, so
-        # a crash-looping loser DMs at most once per boot on top of the
+        # ownership state machine (see ensure_active). all in-memory dampers,
+        # so a crash-looping copy DMs at most once per boot on top of the
         # persisted once-a-day flag.
         self._standby_warned = False    # stand-down DM already sent this boot
         self._wedge_warned = False      # "winner stopped renewing" DM sent
-        self._degraded_warned = False   # "no lock primitive here" DM sent
         self._stood_down = False        # this copy has SEEN a live holder, so
-                                        # an unreadable lock is no longer proof
-                                        # it is alone (see ensure_active)
-        self._blind_warned = False      # "cannot read the lock" DM sent
+                                        # a later acquisition is a PROMOTION
+                                        # and runs the ceremony
+        self._blind_warned = False      # "ownership unknown" DM sent
+        self._recovery_warned = False   # "cannot read my own state" DM sent
+        self._blocked_cause = None      # which cause the BLOCKED DM covered
         self._standby_print = 0.0       # monotonic; throttles the standby log
-        self._held_lock = False         # this copy currently owns the OS lock.
-                                        # a DEGRADED copy is active WITHOUT it,
-                                        # so "am I gagged" is not the same
-                                        # question as "did I just take it"
+        self._held_lock = False         # this copy currently owns the OS lock
+        self._reconciled = False        # ...AND has validated every mandatory
+                                        # store. Holding the lock is necessary
+                                        # and not sufficient: promotion is all
+                                        # or nothing (see _reconcile_all)
+        self._recovery_tries = 0        # consecutive failed reconciles
+        self._reconcile_report = {}     # store name -> ok/absent/unreadable,
+                                        # what the last reconcile actually
+                                        # looked at, for /status and the tests
         self._seqwatch = instance_lock.SeqWatch()
+        self._last_replay = 0.0         # monotonic; throttles the ACTIVE replay
+        self._warned_memo = set()       # (day, key) warnings this PROCESS has
+                                        # already emitted. The persisted dedup
+                                        # flag lives in state.json, on the very
+                                        # volume whose failure is usually what
+                                        # raised the warning, so on a full or
+                                        # read-only disk it can never land and
+                                        # one condition became one DM per cycle
 
     # ---------- plumbing ----------
 
@@ -298,6 +323,369 @@ class Service:
                 default=[])
             print(f"send failed, queued for retry: {errors}")
         return errors
+
+    # ---------- durable events (W02) ----------
+
+    def notify_intent(self, text: str, intent) -> list:
+        """Send a text that already has a durable intent behind it, and record
+        what each recipient's wire actually did.
+
+        The difference from notify(): a failure here is NOT appended to
+        pending_sends. pending_sends re-broadcasts the whole text to every
+        chat, so one recipient with a permanent 403 cost the other two a
+        duplicate on every retry pass. A journaled send has per recipient
+        records instead, and replay retries exactly the recipients that are
+        still unresolved.
+
+        Every attempt is written BEFORE the request goes out, so a process that
+        dies inside the HTTP call still leaves the attempt on disk. That is the
+        whole difference between an unknown delivery and an invisible one."""
+        if self.dry:
+            print(f"\n{text}\n")
+            log_alert(text, ["dry-run, not sent"])
+            return []
+        if telegram.standby()[0]:
+            # same rule as notify: a losing copy broadcasts nothing and queues
+            # nothing. the intent stays unresolved and the WINNER replays it.
+            print(f"[standby, not broadcast] {text[:80]}")
+            return []
+        return self._deliver(intent, None, text=text)
+
+    def _deliver(self, intent, indices, text=None) -> list:
+        """One delivery pass over some or all recipients of one intent.
+
+        indices=None means every recipient; a list means exactly those and
+        nobody else, which is what makes a retry stop bothering the people who
+        already got the card."""
+        body = text if text is not None else intent.text
+        wanted = indices
+        if wanted is None:
+            wanted = [d.recipient_index for d in intent.deliveries()]
+        # Resume a multi part card at the first part that was NOT confirmed.
+        # send_to_detailed has always been able to do this and nothing on the
+        # production path ever asked it to, so a replay of a three part card
+        # whose second part failed re-sent part one to a chat that already had
+        # it. Two conditions, both load bearing: the body has to be byte for
+        # byte the text the intent recorded (a different card is a different
+        # message, and resuming into it would SKIP real content), and the
+        # recorded part count has to still match this split.
+        start_parts = {}
+        if body == (intent.text or ""):
+            total_now = len(telegram.split_message(body))
+            for d in intent.deliveries():
+                done = int(d.parts_confirmed or 0)
+                if (d.status == event_journal.FAILED
+                        and int(d.parts_total or 1) == total_now
+                        and 0 < done < total_now):
+                    start_parts[d.recipient_index] = done
+        for i in wanted:
+            try:
+                event_journal.record_attempt(intent.journal_id, i)
+            except event_journal.JournalUnavailable as e:
+                # the card matters more than the bookkeeping line about it, but
+                # an unrecorded attempt is an evidence gap and is said out loud
+                self._journal_down(f"attempt line refused: {e}")
+        try:
+            results = telegram.send_detailed(body, only_indices=wanted,
+                                             start_parts=start_parts)
+        except RuntimeError as e:      # e.g. no chat IDs configured
+            print(f"journaled send failed ({e})")
+            results = []
+        errors = [r["error"] for r in results if r.get("error")]
+        log_alert(body, errors)
+        for r in results:
+            try:
+                event_journal.record_result(
+                    intent.journal_id, r["recipient_index"], r["status"],
+                    provider_message_id=r.get("message_id"),
+                    error_class=r.get("error_class") or None,
+                    parts_total=r.get("parts_total"),
+                    parts_confirmed=r.get("parts_confirmed"))
+            except event_journal.JournalUnavailable as e:
+                self._journal_down(f"delivery line refused: {e}")
+        return results
+
+    def _journal_down(self, why: str):
+        """Raise the explicit health condition Astra asks for when durable
+        intent creation fails, and DM the owner once a day.
+
+        It never touches the book. Astra is explicit that this failure "must
+        never discard known open positions or silently stop their monitoring",
+        so the exit path keeps running under the old ordering and records the
+        degradation as an evidence gap rather than a silent one."""
+        now = et_now()
+        config.state_set("journal_health", {
+            "ok": False, "why": str(why)[:300], "at": f"{now:%Y-%m-%d %H:%M:%S}",
+            # named, not implied: with no durable record the exit path falls
+            # back to send-then-save, so a crash in that window can still
+            # duplicate an exit card. that is a known gap, not a repair.
+            "evidence_gap": "durable event journal unavailable, exit alerts "
+                            "fall back to the legacy send then save order",
+        })
+        print(f"{now:%H:%M:%S} durable event journal UNAVAILABLE: {why}. "
+              "no new entry alerts until it is writable again. open positions "
+              "are still monitored and their exits still send.")
+        if self._hb_warned_once("journal_unavailable", str(now.date())):
+            return
+        self._hb_owner(
+            "Heartbeat: I cannot write my durable event record, so I am NOT "
+            "sending new entry alerts. An alert I cannot record is one I "
+            "cannot recover if I restart, and an unrecorded alert is worse "
+            f"than a missed one. Reason: {str(why)[:200]}. Everything already "
+            "open is still being watched and its exits still send. Check the "
+            "volume. The Railway logs carry this on every cycle.")
+
+    def _journal_ok(self):
+        """Clear the condition once a durable write lands again."""
+        if (config.state_get("journal_health") or {}).get("ok") is False:
+            config.state_set("journal_health", {
+                "ok": True, "at": f"{et_now():%Y-%m-%d %H:%M:%S}"})
+
+    def _commit_intent(self, kind, **kw):
+        """Every durable intent this service commits goes through here.
+
+        A dry run gets None instead of a record. The journal lives on the
+        SHARED volume, so once the wire correctly refuses to send from a dry
+        run, a dry copy that still committed an intent left a
+        committed-but-undelivered card behind for the LIVE daemon to replay and
+        broadcast. A dry run that texts nobody today but makes the real bot
+        text three people tomorrow is the same defect one restart later.
+
+        None is not a new condition for any caller: it is exactly the shape
+        they already handle when the journal is unavailable, which falls back
+        to the old send-then-save order, and in a dry run "send" is a print."""
+        # getattr, not self.dry: several suites build a Service with __new__
+        # and stub only the plumbing a case needs, so an attribute that is not
+        # there means "not a dry run", exactly as it did before this existed.
+        if getattr(self, "dry", False):
+            return None
+        return event_journal.commit_intent(kind, **kw)
+
+    def _position_unpersisted(self, kind: str, what: str, why: str):
+        """The card went out and the position reached no store. Astra A05 says
+        never infer delivery from position existence; the converse holds too,
+        and this is the converse. A delivered alert for a trade that is tracked
+        nowhere is a health condition, not a success.
+
+        The intent is left UNRESOLVED and flagged position_missing by the
+        caller, so replay retries the publish and orphans() reports it either
+        way. This is the part a person can see without reading /health."""
+        now = et_now()
+        config.state_set("position_health", {
+            "ok": False, "kind": kind, "what": what, "why": str(why)[:200],
+            "at": f"{now:%Y-%m-%d %H:%M:%S}",
+            "evidence_gap": "an alert was delivered for a modeled position "
+                            "that no store holds; it is retried on every "
+                            "replay pass and reported as an orphan until it "
+                            "lands or a person looks",
+        })
+        print(f"{now:%H:%M:%S} {kind} card sent for {what} but the position "
+              f"could NOT be persisted ({why}). it is NOT tracked, its stop is "
+              "NOT being watched, and the durable intent stays open so replay "
+              "keeps retrying.")
+        if self._hb_warned_once("position_unpersisted", str(now.date())):
+            return
+        self._hb_owner(
+            "Heartbeat: I sent an alert and then could not save the position "
+            f"behind it ({kind} {what}: {str(why)[:120]}). That trade is on "
+            "your phone and in none of my books, so I am not watching its stop "
+            "until the write lands. I retry it every replay pass and it shows "
+            "in /health as an orphan. Check the volume.")
+
+    def _position_ok(self):
+        """Clear the condition once a retried publish lands."""
+        if (config.state_get("position_health") or {}).get("ok") is False:
+            config.state_set("position_health", {
+                "ok": True, "at": f"{et_now():%Y-%m-%d %H:%M:%S}"})
+
+    def replay_journal(self, now: datetime):
+        """Finish every intent a crash left half done. Runs on the way into
+        ACTIVE, once ownership is established and every store has reconciled.
+
+        Deliberately NOT run in RECOVERING: the wire is gagged there, so a
+        resend would be dropped and then recorded as a failure. This is the
+        first thing the new owner does with a working wire, which is what
+        Astra's "replay local durable intents under ownership" buys once the
+        gag is accounted for."""
+        try:
+            stats = event_journal.replay(send=self._replay_send,
+                                         relink=self._replay_link, now=now)
+        except event_journal.JournalUnavailable as e:
+            self._journal_down(f"replay could not read the journal: {e}")
+            return {}
+        except Exception as e:                                  # noqa: BLE001
+            print(f"{now:%H:%M:%S} journal replay error (continuing): {e}")
+            return {}
+        if stats.get("intents"):
+            print(f"{now:%H:%M:%S} journal replay: {stats['intents']} "
+                  f"unresolved, {stats['relinked']} re-linked, "
+                  f"{stats['resent']} recipient sends, {stats['unknown']} "
+                  f"unknown left alone, {stats['orphans']} orphans")
+        return stats
+
+    def _replay_send(self, intent, indices):
+        if telegram.standby()[0]:
+            return []
+        # The bound, enforced at the one place that actually puts a retry on
+        # the wire. replay used to run once per promotion, so nothing was
+        # scheduled and nothing could spin; it is now driven every
+        # REPLAY_EVERY_S while this copy is ACTIVE, and a recipient the journal
+        # cannot resolve (a result line it could not write leaves one pinned in
+        # ATTEMPTED) would otherwise become a card every minute for the life of
+        # the process. MAX_DELIVERY_RETRIES is the number that already means
+        # "stop"; honor it here rather than inventing a second one.
+        capped = {d.recipient_index for d in intent.deliveries()
+                  if int(d.attempts or 0) >= event_journal.MAX_DELIVERY_RETRIES}
+        todo = [i for i in indices if i not in capped]
+        if not todo:
+            return []
+        return self._deliver(intent, todo)
+
+    def _replay_link(self, intent):
+        """Re-apply an intent's linkage, idempotently, and say what was found.
+
+        Never opens anything a second time: the position is looked up by
+        decision_id and the sniper row by the same, so a replay that runs twice
+        repairs the same trade twice and creates nothing. Astra A05: never
+        infer delivery from position existence, so nothing here touches a
+        delivery status."""
+        found = {}
+        kind = intent.kind or ""
+        retry = False
+        if kind == "entry":
+            pos = self.book.find_by_decision(intent.decision_id)
+            # A position the BOOK holds is not the same as a position the
+            # STORE holds: add() appends to memory and then publishes, so a
+            # refused publish leaves a row this process can see and the next
+            # boot cannot. The link is therefore judged on the publish, never
+            # on the object existing, which is Astra A05 pointing the other
+            # way: never infer a tracked position from a delivered card.
+            landed = pos is not None
+            if pos is None and intent.payload.get("position"):
+                pos, landed = self._reopen_from_intent(intent)
+            elif pos is not None and intent.linked.get("retry_link"):
+                landed = self.book.save()
+            found["position_id"] = pos.id if pos is not None else None
+            found["position_missing"] = not landed
+            retry = retry or (pos is not None and not landed)
+        elif kind == "sniper_entry":
+            row = None
+            for r in sniper_book.all_rows():
+                if r.get("decision_id") == intent.decision_id:
+                    row = r
+                    break
+            # "the position is missing" is only a claim an intent that
+            # DESCRIBES one can make. A real sniper_entry payload carries every
+            # level of the ticket, which is both what makes the repair possible
+            # and what makes the absence meaningful.
+            p = intent.payload or {}
+            describes = all(p.get(k) not in (None, "")
+                            for k in ("symbol", "direction", "entry", "stop",
+                                      "target"))
+            if row is None and describes:
+                # open_trade returns None on a busy ledger lock, an unreadable
+                # book or a refused write, and the ticket still went out. This
+                # branch had no equivalent of _reopen_from_intent and never set
+                # position_missing, so orphans() could not classify a broadcast
+                # sniper ticket that is tracked nowhere and replay closed it
+                # for good: a live stop nobody is watching, reported as zero
+                # orphans.
+                row = self._reopen_sniper_from_intent(intent)
+            if row is not None:
+                found["position_id"] = row.get("id")
+            if describes:
+                found["position_missing"] = row is None
+                retry = retry or row is None
+            if intent.candidate_id:
+                res = forward_ledger.mark_selected(
+                    intent.candidate_id, fired_at_et=intent.payload.get("fired_at"),
+                    position_id=(row or {}).get("id"),
+                    decision_id=intent.decision_id,
+                    intent_id=intent.journal_id,
+                    delivery_confirmed=intent.delivery_confirmed)
+                status = getattr(res, "status", "applied" if res else "row_missing")
+                if status == forward_ledger.MarkResult.ROW_MISSING:
+                    found["ledger_row_missing"] = True
+                elif status == forward_ledger.MarkResult.WRITE_REFUSED:
+                    found["ledger_write_refused"] = True
+                    retry = True
+                else:
+                    found["ledger_linked"] = True
+        if not found:
+            return found
+        # one answer for the whole intent: a repaired ledger row must not clear
+        # a retry the missing position still needs, and vice versa
+        found["retry_link"] = retry
+        if intent.linked.get("position_missing") and found.get(
+                "position_missing") is False:
+            self._position_ok()      # a retried publish landed
+        # Do not re-write a link line that says exactly what the intent already
+        # says. replay is driven every REPLAY_EVERY_S now instead of once per
+        # promotion, so an unchanged relink would append a journal line and
+        # republish the index every minute for as long as one recipient is
+        # still owed a card.
+        cur = dict(intent.linked or {})
+        if all(cur.get(k) == v for k, v in found.items()):
+            return {}
+        return found
+
+    def _reopen_from_intent(self, intent):
+        """Rebuild the modeled position an intent described, when the crash
+        landed between the journal line and the book write.
+
+        Returns (position or None, whether the book actually PUBLISHED). The
+        second half used to be dropped: add()'s return was ignored and the
+        caller then read the row straight back out of memory, so a replay that
+        could not persist the reopened position reported it as repaired and
+        resolved the intent, losing the trade for good on the next boot.
+
+        The intent carries the whole row, so this is a replay of a decision
+        already made, never a new one: no quote is fetched, no gate is
+        re-evaluated and no threshold is consulted."""
+        try:
+            allowed = {f.name for f in poslib.fields(Position)}
+            row = {k: v for k, v in (intent.payload.get("position") or {}).items()
+                   if k in allowed}
+            if not row.get("id"):
+                return None, False
+            pos = Position(**row)
+        except (TypeError, ValueError, AttributeError) as e:
+            print(f"replay could not rebuild the position for "
+                  f"{intent.journal_id}: {e}")
+            return None, False
+        landed = self.book.add(pos)
+        return self.book.find_by_decision(intent.decision_id), bool(landed)
+
+    def _reopen_sniper_from_intent(self, intent):
+        """Re-open the sniper row an intent already described, or None.
+
+        Same contract as _reopen_from_intent and for the same reason: the
+        ticket on three phones is a decision that was already made, and the
+        payload carries every level it named, so nothing here re-reads a bar or
+        re-evaluates the pattern. open_trade is idempotent on decision_id and
+        refuses a second row on a symbol that already has one, so running this
+        every replay pass repairs one trade and can never open a second."""
+        p = intent.payload or {}
+        need = ("symbol", "direction", "entry", "stop", "target")
+        if any(p.get(k) in (None, "") for k in need):
+            return None
+        try:
+            fired = str(p.get("fired_at") or "")
+            day, _, hms = fired.partition(" ")
+            return sniper_book.open_trade(
+                symbol=str(p["symbol"]), display=str(p["symbol"]),
+                direction=str(p["direction"]), entry=float(p["entry"]),
+                stop=float(p["stop"]), target=float(p["target"]),
+                day=day or str(intent.session_date or ""),
+                time_et=hms or "00:00:00", entry_ts=fired or None,
+                candidate_id=intent.candidate_id or None,
+                decision_id=intent.decision_id or None,
+                intent_id=intent.journal_id,
+                position_id=intent.position_id or None)
+        except (TypeError, ValueError, KeyError) as e:
+            print(f"replay could not rebuild the sniper row for "
+                  f"{intent.journal_id}: {e}")
+            return None
 
     MAX_SEND_RETRIES = 6
 
@@ -554,11 +942,35 @@ class Service:
         is a much worse trade than the thing this dedup buys. The stand-down
         DMs are already deduped for the life of the boot by _standby_warned,
         _blind_warned and _wedge_warned, and a mute copy restarting often
-        enough to repeat itself is a signal worth seeing anyway."""
-        if key in (config.state_get("hb_warned", {}) or {}).get(day, []):
+        enough to repeat itself is a signal worth seeing anyway.
+
+        The flag lives in state.json, on the same volume whose failure raises
+        most of these warnings. On a full or read-only disk the write never
+        lands and the read never sees it, so "once a day" became once a POLL
+        CYCLE: _journal_down alone is called once per candidate ticker and once
+        per delivery line, so one outage was a phone full of the same message.
+        A process-local memo is the fallback. It cannot survive a restart,
+        which is exactly the property the persisted flag has and this one does
+        not claim to.
+        """
+        # setdefault, not self._warned_memo: several suites build a Service
+        # with __new__ and stub only the plumbing a case needs
+        memo = self.__dict__.setdefault("_warned_memo", set())
+        if (day, key) in memo:
+            return True
+        # asked read only, and asked FIRST: load_state QUARANTINES a corrupt
+        # state.json the moment it reads one, which resets morning_sent,
+        # recap_sent and every other once-a-day guard in the same motion. A
+        # warning ABOUT a broken volume must not be the thing that wipes the
+        # day's dedup keys.
+        healthy = config.state_health() == "ok"
+        if healthy and key in (config.state_get("hb_warned", {}) or {}).get(day, []):
             return True
         if telegram.standby()[0]:
             return False  # say it, but do not touch the shared file
+        if not healthy:
+            memo.add((day, key))
+            return False
 
         def upd(w):
             w = w if isinstance(w, dict) else {}
@@ -567,123 +979,569 @@ class Service:
                 fired.append(key)
             return {day: fired}  # keep only today's flags
         config.state_update("hb_warned", upd, default={})
+        if key not in (config.state_get("hb_warned", {}) or {}).get(day, []):
+            # the write did not stick (a full volume, a lock this copy could
+            # not take). Remember it here, so an outage does not repeat itself
+            # onto the owner's phone every cycle until the disk is fixed.
+            memo.add((day, key))
         return False
 
     def _warn_conflict(self, description: str):
         """Telegram answered getUpdates with 409 Conflict: another process is
         polling the same bot token, so commands are being split between the
         two instances and alerts can go out twice. This used to be swallowed
-        as an empty poll; now the owner hears about it, once per day."""
+        as an empty poll; now the owner hears about it, once per day.
+
+        The text names an INVENTORY, not a location. A 409 proves competing
+        requests and nothing else: not where the other consumer runs, not that
+        it shares this volume, not that it is even a copy of this program. The
+        old wording said "an old deploy still up, or a local run alongside the
+        cloud one", which asserted both. The token never appears in any of
+        this."""
         if self._hb_warned_once("tg_conflict", str(et_now().date())):
             return
         print(f"telegram getUpdates conflict: {description}")
         self._hb_owner(
-            "⚠️ Heartbeat: Telegram reports another copy of this bot is "
-            "polling with the same token (409 Conflict). Two running "
-            "instances split commands between them and can send every alert "
-            "twice. Check for a stray instance: an old deploy still up, or a "
-            "local run alongside the cloud one. Telegram said: " + description)
+            "⚠️ Heartbeat: Telegram reports another consumer is polling with "
+            "the same bot token (409 Conflict). Two consumers split commands "
+            "between them and can send every alert twice. This proves there "
+            "are competing requests; it does NOT say where from, and the "
+            "instance lock cannot see most of the places it could be. Check "
+            "the whole inventory: the Railway service, every deployment on it, "
+            "the replica count, any desktop Task Scheduler entry, ad hoc "
+            "scripts, getUpdates utilities and the webhook configuration. "
+            "Telegram said: " + description)
 
-    # ---------- single-instance lease ----------
-    # One directional state machine, three states, no demotion path:
-    #   ACTIVE            holds the OS lock, behaves exactly as before
-    #   ACTIVE (DEGRADED) no lock primitive on this platform, runs anyway
-    #   STANDBY           another live copy holds the lock, so this one is mute
-    # There is no ACTIVE -> STANDBY edge: a lock cannot be lost while the
-    # holder is alive. STANDBY -> ACTIVE happens the moment the lock frees,
-    # and every one of those edges goes through _promote, which re-reads what
-    # an arbitrarily long stand-down made stale.
+    # ---------- ownership: the five-state contract ----------
+    # Astra section 3, implemented literally:
+    #   STARTING    booted, ownership not established. local checks only.
+    #   STANDBY     another cooperating process holds the lock. retries only.
+    #   RECOVERING  lock held, durable state not reconciled yet. no new entries
+    #               and no fresh strategy notifications.
+    #   ACTIVE      ownership held AND every mandatory store reconciled.
+    #   BLOCKED     lock unsupported, storage unhealthy, recovery incomplete or
+    #               ownership uncertain. local reporting and bounded
+    #               acquisition retries, never activation on a timer.
+    #
+    # What changed and why. There used to be a third "ACTIVE (DEGRADED)" state
+    # that alerted with no lock at all, on the argument that a silent bot is
+    # worse than a duplicate card. That is the fail open Astra A03 overturned:
+    # unknown ownership is not exclusive ownership, and the same code rejected
+    # blind resume one branch further down for exactly the reason it accepted
+    # this one. Both are gone; "I could not tell" now lands in BLOCKED whether
+    # or not this copy has ever seen a holder.
+    #
+    # The other half is that taking the lock is no longer the end of the story.
+    # A promotion is all or nothing across every durable store, and any
+    # mandatory reload failure holds the process in RECOVERING or BLOCKED even
+    # though a perfectly good in-memory book is sitting right there. Preserving
+    # stale memory is not permission to resume.
+    #
+    # There is still no ACTIVE -> STANDBY edge: a lock cannot be lost while its
+    # holder lives. The lock handle is retained for the whole active lifetime
+    # and the lock file is never unlinked or replaced while an owner exists.
+    #
+    # There IS an ACTIVE -> RECOVERING -> BLOCKED edge now, and there was not.
+    # "Storage unhealthy" is in BLOCKED's entry condition above, but the health
+    # question was only ever asked on the way in, so a state.json torn after
+    # promotion left the copy sending and saving off a file it could no longer
+    # read. It is asked on every ACTIVE pass now, read only, before anything
+    # touches the file.
+
+    # how many consecutive failed reconciles before the state is reported as
+    # BLOCKED rather than RECOVERING. It keeps retrying either way: stopping
+    # would brick the bot, which is the one outcome worse than going quiet.
+    RECOVERY_ATTEMPTS_BEFORE_BLOCKED = 3
+
+    def _set_ownership(self, state: str, reason: str = ""):
+        """One place sets the state, and it sets it in both modules. telegram
+        drives the wire gag off it; instance_lock renders /status from it."""
+        instance_lock.set_state(state, reason)
+        telegram.set_ownership_state(state, reason)
+
+    def _enter_starting(self):
+        """Gag the wire for the window between process start and the first
+        ownership answer.
+
+        Nothing established ownership in that window before, so a boot could
+        poll getUpdates and send from a copy that turned out to be the loser
+        one tick later. Placed at the top of daemon() and run_session() rather
+        than in __init__ on purpose: --setup, --test and --weekly build a
+        Service too, and none of them runs this machine."""
+        if self.dry:
+            return
+        self._set_ownership(instance_lock.STARTING,
+                            "ownership not established yet")
 
     def ensure_active(self, now: datetime) -> bool:
-        """True when this process may send, scan and monitor.
+        """True only when this process owns the token AND has reconciled every
+        mandatory store. Anything else is False and gagged.
 
-        Fails OPEN on purpose. If the platform has no lock primitive at all,
-        the bot keeps running and the owner is told once, because a bot that
-        silenced itself by mistake is far worse than the duplicate card the
-        lease exists to prevent. That default is right at BOOT, where nothing
-        has been observed yet, and wrong after a stand-down, where a live
-        holder HAS been observed: see the unavailable branch."""
+        Fails CLOSED, which is the reversal at the heart of this package. A
+        copy that cannot establish ownership does not get to alert on the
+        grounds that silence is worse: silence is a known, reported, once a day
+        condition, while two copies on one token is a split brain that marks
+        positions closed in a file the other one never alerts on."""
         if self.dry:
-            return True  # dry-run sends nothing and writes its own book
-        res = instance_lock.try_acquire()
-        if res in ("acquired", "held"):
-            if telegram.standby()[0]:  # we were standing by and just won
-                self._promote(now, "the other copy is gone")
-            elif not self._held_lock:
-                # DEGRADED -> holding the real lock. This copy was never gagged
-                # (a degraded copy keeps alerting on purpose), so keying the
-                # re-read on "was I standing by" skipped it entirely and the
-                # boot snapshot of positions.json survived into the locked
-                # state, where the first save erases the other copy's open
-                # rows. That is the same money bug _promote exists to stop,
-                # reached by the one edge that did not go through it. No
-                # promotion ceremony here: this copy was never down, so it gets
-                # no stand-down DM and no downtime report, only the re-read.
-                self._resync_after_gap(now, "took the instance lock after running "
-                                       "without it")
-            self._held_lock = True
-            telegram.set_standby(False)
-            instance_lock.renew(force=(res == "acquired"))
-            return True
-        self._held_lock = False
-        if res == "unavailable":
-            # "I could not tell" is not "I am alone". try_acquire says
-            # unavailable for a missing lock primitive AND for an os.open that
-            # raised, which is what a read-only remount, an EIO/ESTALE mount
-            # fault or fd exhaustion does. Resuming on that un-gags a copy that
-            # watched a live holder one tick earlier, with no re-verification
-            # at all, and puts two copies on the wire. Hold the stand-down
-            # until there is positive evidence, and the ONLY positive evidence
-            # is the lock itself.
+            # dry-run stays OUTSIDE the ownership machine: it prints its cards
+            # and still answers commands, which is what it is for. Said out
+            # loud here rather than left to the module default, because the
+            # default is STARTING and that would have quietly stopped a dry run
+            # answering /status, which nobody asked for.
             #
-            # There used to be a second, "blind resume" path here: after
-            # BLIND_RESUME_S of the holder's published seq standing still, this
-            # copy resumed anyway, so a volume that permanently lost locking
-            # could not mute the bot forever. That premise does not hold. The
-            # lease record lives on the SAME volume whose failure sent us down
-            # this branch, so the fault that stops us reading the lock also
-            # stops the live holder's renew from landing. A frozen seq is then
-            # a symptom of our own broken volume, not proof the holder died,
-            # and both copies go active on exactly the fault the lease exists
-            # to survive. There is no local evidence that separates "the holder
-            # died" from "my volume broke", so the honest move is to stay mute
-            # and say so daily. A copy that cannot read the shared volume also
-            # cannot read positions.json coherently, so it has no business
-            # trading on it.
-            if self._stood_down:
-                self._hold_standby(now)
-                return False
-            telegram.set_standby(False)
-            if not self._degraded_warned:
-                self._degraded_warned = True
-                print("instance lease: no file lock available here, running "
-                      "anyway. a second copy would not be caught.")
-                self._hb_owner(
-                    "Heartbeat: I could not take the single-instance lock on "
-                    "this filesystem, so I am running WITHOUT that guard. "
-                    "Alerts keep flowing normally. If a second copy is ever "
-                    "up, both will text. Instance "
-                    f"{instance_lock.instance_id()}, pid {os.getpid()}.")
-            instance_lock.renew()
+            # What this line does NOT buy any more, and used to. Declaring the
+            # dry run ACTIVE leaves the standby flag False, and BOTH the wire
+            # gag and the shared-write gate hung off that one flag, so this
+            # line was the thing that made a dry run a real sender and an
+            # authorized writer of positions.json, the sniper ledger, the
+            # forward ledger, the sniper day keys and the durable event
+            # journal. telegram now carries a separate dry-run flag that
+            # answers both questions independently of ownership
+            # (telegram.set_dry_run, called from __init__), so a dry run prints
+            # its cards, keeps its book in memory for the life of the process,
+            # and touches nothing the live copy reads.
+            #
+            # The residual hazard is real and unchanged by this release: a dry
+            # run uses the SAME bot token, so one running beside a live daemon
+            # is a second getUpdates consumer. That is one of the things a
+            # local lock cannot see (instance_lock.CANNOT_DETECT), and putting
+            # dry runs under the lock is a separate decision, not this one.
+            telegram.set_ownership_state(instance_lock.ACTIVE,
+                                         "dry run, sends nothing")
             return True
-        self._enter_standby(now)  # contended
-        return False
+        res = instance_lock.try_acquire()
+        if res == "unavailable":
+            # "I could not tell" is not "I am alone", and it never was. This is
+            # a missing lock primitive OR an os.open that raised, which is what
+            # a read-only remount, an EIO/ESTALE mount fault, fd exhaustion or
+            # a full volume does. Both readings end in the same place now.
+            #
+            # There used to be a "blind resume" path here as well: after the
+            # holder's published seq stood still for a while, this copy resumed
+            # anyway so a volume that permanently lost locking could not mute
+            # the bot forever. That premise does not hold. The lease record
+            # lives on the SAME volume whose failure sent us down this branch,
+            # so the fault that stops us reading the lock also stops the live
+            # holder's renew from landing, and a frozen seq is a symptom of our
+            # own broken disk rather than proof the holder died. And a copy
+            # that cannot read the shared volume cannot read positions.json
+            # coherently either, so it has no business trading on it.
+            self._held_lock = False
+            self._enter_blocked(now, "lock")
+            return False
+        if res == "contended":
+            self._held_lock = False
+            self._enter_standby(now)
+            return False
+        # acquired or held: ownership is established. That is necessary and not
+        # yet sufficient.
+        if res == "held" and self._held_lock and self._reconciled:
+            # already ACTIVE and STILL holding the same handle. "held" is doing
+            # real work in that condition: "acquired" means this process did
+            # NOT have the lock a moment ago, and whatever ran in the gap could
+            # have written the book, so a re-acquisition has to reconcile again
+            # rather than trust a snapshot from before the gap.
+            # Re-asserted every cycle rather than only on the transition,
+            # because run_session re-enters STARTING at its top and this is
+            # what un-gags it again.
+            #
+            # ACTIVE is not a state you enter once and stop checking. Astra's
+            # table puts "storage unhealthy" in BLOCKED's entry condition and
+            # the comment above this block repeats it, but state_health() was
+            # asked in exactly one place, inside _reconcile_all, and this fast
+            # path returns before ever reaching it again. There was no
+            # ACTIVE -> RECOVERING or ACTIVE -> BLOCKED edge of any kind, so a
+            # state.json torn AFTER promotion left this copy alerting and
+            # saving off a file it could no longer read. Asked read only, and
+            # BEFORE renew(): renew goes through state_update, and load_state
+            # quarantines a corrupt file on sight, so renewing first would move
+            # the bad file aside and hide the very thing being checked.
+            health = config.state_health()
+            if health != "ok":
+                self._reconciled = False   # coming back has to re-read the world
+                self._recovery_tries += 1
+                self._reconcile_report = {"scheduled_jobs": health}
+                self._hold_recovering(now, ["scheduled_jobs"])
+                return False
+            self._set_ownership(instance_lock.ACTIVE, "holding the lock")
+            instance_lock.renew()
+            if self._replay_due():
+                # the SCHEDULED half of the retry. See replay_journal: the
+                # promotion below runs it once, and an already ACTIVE process
+                # returned here and never reached it, so MAX_DELIVERY_RETRIES
+                # had no caller at all and a journaled card whose send failed
+                # was never tried again while the process lived.
+                self.replay_journal(now)
+            return True
+        self._held_lock = True
+        was_standing_by = self._stood_down
+        self._set_ownership(instance_lock.RECOVERING,
+                            "reconciling saved state before sending")
+        ok, failed = self._reconcile_all(now)
+        if not ok:
+            self._recovery_tries += 1
+            self._hold_recovering(now, failed)
+            return False
+        self._reconciled = True
+        self._recovery_tries = 0
+        self._blocked_cause = None
+        self._set_ownership(instance_lock.ACTIVE, "holding the lock")
+        # the lease record is published only NOW, never before the reconcile.
+        # renew goes through config.state_update, which reads state.json, and
+        # load_state QUARANTINES a corrupt one on sight: renewing first moved
+        # the bad file aside and rebuilt it, so the health check one line later
+        # saw a clean file and this copy walked into ACTIVE on a state.json it
+        # had just silently reset. Read before you write.
+        instance_lock.renew(force=(res == "acquired"))
+        # ON THE WAY INTO ACTIVE, and then every REPLAY_EVERY_S for as long as
+        # it stays there. Astra's contract puts "replay local durable intents
+        # under ownership" in RECOVERING, but the wire is gagged in every state
+        # that is not ACTIVE, so a resend attempted there would be dropped and
+        # then recorded as a delivery failure. So the RECONCILE happens in
+        # RECOVERING, above, and the first thing the new owner does with a
+        # working wire is finish what a crash left half done. This used to be
+        # the ONLY call, which meant a failed send was retried on the next
+        # promotion, i.e. on a healthy box, never.
+        self._replay_due()      # stamp it, so the periodic driver above does
+                                # not immediately repeat this pass
+        self.replay_journal(now)
+        if was_standing_by:
+            self._promote(now, "the other copy is gone")
+        return True
+
+    # How often an already ACTIVE process re-drives replay. This is a SCHEDULE,
+    # and the thing that was missing: MAX_DELIVERY_RETRIES=6 bounds attempts,
+    # it does not cause them, and notify_intent deliberately does not queue
+    # into pending_sends (that queue re-broadcasts to everyone). Without a
+    # caller, "retried up to six times" meant "retried on the next promotion",
+    # which on a healthy box is never.
+    REPLAY_EVERY_S = 60
+
+    def _replay_due(self) -> bool:
+        """True at most once every REPLAY_EVERY_S, and stamps as it answers."""
+        t = time_mod.monotonic()
+        if t - getattr(self, "_last_replay", 0.0) < self.REPLAY_EVERY_S:
+            return False
+        self._last_replay = t
+        return True
+
+    # Every durable store a promotion must have in hand before this process is
+    # allowed to send anything. Astra names the set: positions, sniper
+    # positions, day reservations, pending deliveries, the Telegram update
+    # offset, news-seen state and scheduled-job state.
+    def _reconcile_all(self, now: datetime):
+        """Parse every mandatory store into temporary objects, validate them
+        all, and only then replace memory. Returns (ok, failed_names).
+
+        The rule that makes this worth writing: a store that is ABSENT is a
+        clean empty store (a fresh railway volume has none of these files and
+        must still boot), and a store that is PRESENT and unparseable is a
+        mandatory reload failure. Nothing is installed until everything parses,
+        so a good positions.json beside a truncated sniper ledger leaves the
+        book in memory exactly as it was instead of half updating the world.
+
+        This replaces _resync_after_gap, which wrapped the same re-read in
+        try/except, printed, and walked on into ACTIVE ungagged on the boot era
+        snapshot. Folding the two edges into one function is also why they can
+        no longer drift apart: there is one way into ACTIVE now."""
+        report, failed = {}, []
+
+        # "absent" is a clean empty store (a fresh railway volume has none of
+        # these files and must still boot). "reset" is a store that was torn,
+        # was moved aside, and rebuilds itself from scratch with nothing lost:
+        # only a cache may ever answer that, and only _news_seen_health does.
+        CLEAN = ("ok", "absent", "reset")
+
+        def note(name, status):
+            report[name] = status
+            if status not in CLEAN:
+                failed.append(name)
+
+        # 1. storage health FIRST, before any state.json read. config.load_state
+        #    QUARANTINES a corrupt state.json the first time it is read, which
+        #    resets morning_sent, recap_sent, weekly_sent, learn_sent and every
+        #    other once a day guard in the same motion and can re-send a day of
+        #    reports with nobody told. state_health asks without touching.
+        health = config.state_health()
+        note("scheduled_jobs", "ok" if health == "ok" else health)
+        if health != "ok":
+            # every check below reads state.json. Stop here so the asking does
+            # not become the damage.
+            self._reconcile_report = report
+            return False, failed
+
+        # 2. the money store. parsed into temporaries, installed at the end.
+        try:
+            pos_status, pos_rows = self.book.parse_snapshot()
+        except Exception as e:
+            pos_status, pos_rows = "unreadable", []
+            print(f"positions parse failed during recovery: {e}")
+        note("positions", pos_status)
+
+        # 3. the sniper ledger. _read() answers [] for a truncated file, which
+        #    reads as "nothing open" and silently stops live stops being
+        #    watched, so recovery consults parse_snapshot instead.
+        try:
+            snip_status, _snip_rows = sniper_book.parse_snapshot()
+        except Exception as e:
+            snip_status = "unreadable"
+            print(f"sniper ledger parse failed during recovery: {e}")
+        note("sniper_positions", snip_status)
+
+        # 4. the Telegram update offset. A value int() cannot read would crash
+        #    the poll or replay a week of commands.
+        raw_offset = config.state_get("tg_offset", 0)
+        try:
+            int(raw_offset)
+            note("tg_offset", "ok")
+        except (TypeError, ValueError):
+            note("tg_offset", "unreadable")
+
+        # 5. pending deliveries. BOTH stores, because there are two now. The
+        #    legacy queue in state.json (flush_pending iterates pending_sends,
+        #    offer_add_user indexes pending_chats, so the shapes matter) and
+        #    the durable journal W02 introduced, which is where every entry,
+        #    exit and sniper card that is still owed actually lives. Only the
+        #    legacy one was checked, so a promotion could declare "pending
+        #    deliveries: ok" over daily event files the OS would not hand over,
+        #    and the journal's own rebuild folds an unreadable file in as empty.
+        legacy = self._shape_ok([("pending_sends", list), ("pending_chats", dict)])
+        note("pending_deliveries",
+             legacy if legacy != "ok" else self._event_store_health())
+
+        # 6. day reservations: the day/symbol keys a sniper burns before it
+        #    fires. A wrong shape here re-fires or blocks every ticket.
+        note("day_reservations", self._shape_ok(
+            [("sniper_alerted", dict), ("hb_warned", dict)]))
+
+        # 7. news-seen. Its own file, read by the news thread. Absent is clean,
+        #    and so is a torn one now: see _news_seen_health.
+        note("news_seen", self._news_seen_health())
+
+        # scheduled-job day keys share state.json, already health checked
+        # above. They are read through on every access, so nothing is cached to
+        # go stale; what matters is that a dict or list did not land in a slot
+        # the code compares to a date string, because that never matches and
+        # re-sends the report every cycle.
+        for key in ("morning_sent", "recap_sent", "weekly_sent", "learn_sent",
+                    "request_digest_sent", "forward_graded"):
+            val = config.state_get(key)
+            if isinstance(val, (dict, list)):
+                note(f"scheduled_jobs:{key}", "unreadable")
+
+        self._reconcile_report = report
+        if failed:
+            return False, failed
+
+        # ---- everything parsed. install, all at once. ----
+        try:
+            self.book.install(pos_rows)
+        except Exception as e:  # an install that raises is a failed recovery
+            print(f"installing the position book failed: {e}")
+            return False, ["positions"]
+        try:
+            # the day goes with it: reset_day re-reads live_params.json and the
+            # overnight backtest reports, which a copy that sat out the night
+            # would otherwise trade its first morning on.
+            self.day = None       # force the rebuild even on the same date
+            self.reset_day(now)
+        except Exception as e:
+            print(f"day rebuild during recovery failed: {e}")
+            return False, ["day_rebuild"]
+        return True, []
+
+    @staticmethod
+    def _event_store_health() -> str:
+        """The DURABLE delivery store: "ok", "absent" or "unreadable".
+
+        The daily event files are where a committed-but-undelivered card
+        actually lives, and a promotion never looked at them. That matters more
+        than it sounds, because event_journal's rebuild folds an unreadable
+        daily file in as EMPTY (read_jsonl answers value None for status
+        "unreadable" and the fold does `res.value or []`), so a file the OS
+        will not hand over contributes zero events, raises no error and shows
+        up in /health as a clean bill. Asking here, before ACTIVE, is what
+        turns that into a refused promotion.
+
+        The same window the journal rebuilds from is checked, day for day. The
+        INDEX is deliberately NOT a blocker: it is a materialized view and a
+        missing or unreadable one is documented to rebuild from these files.
+
+        Only "unreadable" blocks. A file with a torn LAST LINE reads as
+        "corrupt" and read_jsonl still returns its parseable prefix, which is
+        real evidence: the only line lost is the one a crash was in the middle
+        of writing, which by definition never completed. Refusing on that would
+        brick the bot on the most ordinary crash there is, which is the trap
+        news_seen.json was already caught in."""
+        day = et_now().date()
+        seen_any = False
+        for back in range(event_journal.INDEX_RETAIN_DAYS + 2):
+            try:
+                p = event_journal.daily_path(
+                    (day - timedelta(days=back)).isoformat())
+            except event_journal.JournalUnavailable as e:
+                print(f"durable event directory unusable: {e}")
+                return "unreadable"
+            res = storage_io.read_jsonl(p)
+            if res.status == "missing":
+                continue
+            seen_any = True
+            if res.status == "unreadable":
+                print(f"durable event file {p.name} is unreadable: "
+                      f"{res.error}. a file the OS will not hand over is not "
+                      "an empty one, and the journal's rebuild folds it in as "
+                      "empty, so nothing downstream would ever notice.")
+                return "unreadable"
+        return "ok" if seen_any else "absent"
+
+    @staticmethod
+    def _shape_ok(pairs) -> str:
+        """"ok" when every (key, type) in state.json holds that type or is
+        absent, "unreadable" otherwise. Absent is clean on purpose."""
+        for key, want in pairs:
+            val = config.state_get(key)
+            if val is not None and not isinstance(val, want):
+                print(f"state key {key} has shape {type(val).__name__}, "
+                      f"expected {want.__name__}")
+                return "unreadable"
+        return "ok"
+
+    def _news_seen_health(self) -> str:
+        """news_seen.json: "ok", "absent" or "reset". Never a promotion
+        blocker, and that is the correction.
+
+        It WAS one. news_seen.json is in Astra's mandatory promotion set, and
+        it was also the only store in that set still written with a plain
+        truncate-then-write whose OSError was swallowed, so one SIGKILL inside
+        the 12 second news rewrite, or one ENOSPC, left a torn file that
+        stranded the sole instance in BLOCKED forever on a healthy disk: open
+        positions never monitored, no alerts, and no human-free way back. The
+        write is atomic now (see _save_news_seen), which closes the vector, and
+        this closes the trap it opened.
+
+        A rebuildable cache is not the position book. Everything this file
+        holds is "which headlines have I already texted TODAY", and the news
+        thread's own first-pass-of-the-day branch seeds every current headline
+        SILENTLY, so resetting it costs at most one duplicate BREAKING text for
+        a headline that dropped out of the feed and came back. Losing the
+        position book costs a live trade nobody is watching. They are not the
+        same class of thing and they must not have the same failure mode, so a
+        torn one is moved aside once and reported as reset, and the promotion
+        continues.
+
+        Astra's "promotion is all or nothing" is still honored: the store is
+        reconciled to a known good value before ACTIVE, and what changed is
+        that the known good value for a cache the bot can regenerate is empty
+        rather than unreachable."""
+        try:
+            if not config.NEWS_SEEN_FILE.exists():
+                return "absent"
+        except OSError:
+            return "reset"
+        res = storage_io.read_json(config.NEWS_SEEN_FILE)
+        if res.status == "missing":
+            return "absent"
+        if res.usable and isinstance(res.value, dict):
+            return "ok"
+        bad = config.NEWS_SEEN_FILE.with_suffix(".corrupt")
+        try:
+            if not bad.exists():
+                config.NEWS_SEEN_FILE.replace(bad)
+            else:
+                config.NEWS_SEEN_FILE.unlink()
+            print(f"news_seen.json unreadable ({res.status}), moved aside; "
+                  "today's headlines will be re-seeded silently on the next "
+                  "news pass. No alert is lost by this and none is replayed.")
+        except OSError as e:
+            # even the move failed. Still not a blocker: _load_news_seen reads
+            # a bad file as an unseeded day, which seeds silently and then
+            # republishes the file, so it heals itself on the first pass.
+            print(f"news_seen.json unreadable and could not be moved aside "
+                  f"({e}); the news thread will re-seed over it.")
+        return "reset"
+
+    def _hold_recovering(self, now: datetime, failed):
+        """Hold the lock, stay gagged, keep retrying, and say why.
+
+        This is the branch _promote used to not have. It wrapped the re-read in
+        try/except, printed, and continued into ACTIVE on the boot era
+        snapshot, so a truncated positions.json produced a copy that alerted
+        and saved from a book it could not verify. An older in-memory book is
+        NOT permission to resume."""
+        names = ", ".join(sorted(set(failed))) or "unknown"
+        overdue = self._recovery_tries > self.RECOVERY_ATTEMPTS_BEFORE_BLOCKED
+        state = instance_lock.BLOCKED if overdue else instance_lock.RECOVERING
+        self._set_ownership(state, f"could not reconcile {names}")
+        print(f"instance {state.lower()}: holding the lock but NOT sending, "
+              f"could not read {names} (attempt {self._recovery_tries}). "
+              "an in-memory copy of the book is not permission to resume.")
+        if self._recovery_warned or self._hb_warned_once(
+                "instance_recovery", str(now.date())):
+            return
+        self._recovery_warned = True
+        self._hb_owner(
+            "Heartbeat: I hold the single-instance lock but I cannot read my "
+            f"own saved state ({names}), so I am NOT sending alerts and NOT "
+            "opening anything new. I have an older copy of the book in memory "
+            "and that is not good enough to trade on: I would be acting on a "
+            "picture of the world I could not verify. I keep retrying every "
+            "cycle and start sending the moment those files read cleanly. "
+            "Check the volume. The Railway logs show this on every cycle, "
+            "which is the record to trust if this message does not arrive. "
+            f"Instance {instance_lock.instance_id()}, pid {os.getpid()}.")
+
+    def _enter_blocked(self, now: datetime, cause: str):
+        """Ownership could not be established, so nothing is sent.
+
+        cause is "lock" (no primitive here, or the lock file could not be
+        opened at all). Same gag as standby, different reason, so the owner is
+        told the real one and does not go hunting for a second container that
+        is not there. This replaces the old ACTIVE-DEGRADED branch, which
+        un-gagged the wire and DMed "alerts keep flowing normally"."""
+        self._set_ownership(instance_lock.BLOCKED,
+                            "the instance lock could not be read here")
+        # any earlier reconciliation is void: it was made under an ownership
+        # claim that no longer stands, so coming back has to re-read the world
+        # rather than resume on what was true before the volume broke.
+        self._reconciled = False
+        t = time_mod.monotonic()
+        if t - self._standby_print >= 60:
+            self._standby_print = t
+            # stdout FIRST and every cycle. A DM needs a working network and
+            # can be duplicated by several blocked copies, so the platform log
+            # is the record, not the text message.
+            print("BLOCKED: the instance lock could not be read, so ownership "
+                  "is unknown and I am not sending. a read that failed is not "
+                  "proof I am alone. " + instance_lock.cannot_detect_line()
+                  + " last holder: " + instance_lock.holder_line())
+        if self._blocked_cause == cause and self._blind_warned:
+            return
+        self._blocked_cause = cause
+        self._blind_warned = True
+        if self._hb_warned_once("instance_blind", str(now.date())):
+            return
+        self._hb_owner(
+            "Heartbeat: I could not establish that I am the only copy running "
+            "(the lock is unsupported on this filesystem or the lock file "
+            "cannot be opened), so I am NOT sending alerts and NOT monitoring "
+            "positions. Unknown ownership is not the same as being alone, and "
+            "I will not un-mute myself on a timer: the lease record lives on "
+            "the same volume that is failing, so nothing I can read here tells "
+            "me whether another copy is alive or my disk is broken. I retry "
+            "every cycle and come back on my own the moment the lock works. "
+            + instance_lock.cannot_detect_line()
+            + " You get this at most once a day, and it needs a working "
+            "network to arrive at all, so the Railway logs are the record: "
+            "they carry this line every cycle. Instance "
+            f"{instance_lock.instance_id()}, pid {os.getpid()}.")
 
     def _promote(self, now: datetime, reason: str = "the other copy is gone"):
-        """Standby -> active. Runs the same was-I-down check a fresh boot
-        runs, so a rolling deploy that parked this container through part of a
-        session still reports the gap.
+        """The ceremony after a stand-down ends, run only once the reconcile
+        has actually succeeded.
 
-        Everything cached at BOOT is re-read first, because a stand-down has
-        no time limit. The book is the money one: PositionBook.load() only ran
-        in __init__, main() builds one Service for the life of the process and
-        standby_wait never exits, so a copy that booted at 09:20 and promotes
-        at 10:15 was about to save an empty snapshot over the SPX call the
-        winner opened at 09:52. reload() merges rather than clobbers.
-
-        The day goes with it: reset_day re-reads live_params.json and the
-        overnight backtest reports, which a copy that stood by through the
-        night would otherwise trade its first morning on.
+        The re-read that used to live here is now _reconcile_all, and it runs
+        BEFORE this, because announcing a promotion that then turns out to be
+        unreadable is how a copy talked itself into ACTIVE on a stale book.
 
         Deliberately NOT reloaded: every state.json key (morning_sent,
         recap_sent, sniper_alerted, hb_warned, pending_sends) is read off disk
@@ -692,13 +1550,13 @@ class Service:
         itself after POLL_SECONDS. _last_feed_ok / _last_feed_try stay None on
         purpose: this copy really has not fetched anything yet, and claiming
         the winner's fetches would blind the feed-dead check."""
-        telegram.set_standby(False)
         self._standby_warned = False
         self._wedge_warned = False
         self._blind_warned = False
+        self._recovery_warned = False
         self._stood_down = False
+        self._blocked_cause = None
         self._seqwatch = instance_lock.SeqWatch()
-        self._resync_after_gap(now, reason)
         instance_lock.renew(force=True)
         print(f"instance lease: promoted to active, {reason}.")
         self._hb_owner(
@@ -710,78 +1568,16 @@ class Service:
         except Exception as e:
             print(f"downtime check after promotion failed: {e}")
 
-    def _resync_after_gap(self, now: datetime, reason: str):
-        """Re-read everything that another copy may have changed while this one
-        was not the sole writer.
-
-        Both edges into sole ownership need this, not just the loud one.
-        STANDBY -> ACTIVE goes through _promote, which announces itself; but
-        DEGRADED -> ACTIVE takes the lock without ever having been gagged, and
-        that edge used to skip the re-read entirely and carry a boot-era
-        positions.json straight into the locked state.
-
-        The book is the money one. PositionBook.load() only ran in __init__,
-        main() builds one Service for the life of the process and standby_wait
-        never exits, so a copy that booted at 09:20 and takes over at 10:15 is
-        otherwise about to save its empty snapshot over the SPX call the other
-        copy opened at 09:52, and that position stops being watched for its
-        stop, its half and its give-back with nobody told. reload() merges
-        rather than clobbers.
-
-        The day goes with it: reset_day re-reads live_params.json and the
-        overnight backtest reports, which a copy that sat out the night would
-        otherwise trade its first morning on.
-
-        Deliberately NOT re-read: every state.json key (morning_sent,
-        recap_sent, sniper_alerted, hb_warned, pending_sends) is fetched from
-        disk on each access, so there is nothing cached to go stale and the
-        once-a-day guards still hold. _bars_cache expires itself after
-        POLL_SECONDS. _last_feed_ok / _last_feed_try stay as they are: claiming
-        another copy's fetch times would blind the feed-dead check."""
-        try:  # a bad row must never leave a takeover mute
-            self.book.reload()
-        except Exception as e:
-            print(f"position book reload after {reason} failed: {e}")
-        try:
-            self.day = None       # force the rebuild even on the same date
-            self.reset_day(now)
-        except Exception as e:
-            print(f"day rebuild after {reason} failed: {e}")
-
-    def _hold_standby(self, now: datetime):
-        """Stay mute after a lock read that FAILED. Same gag as
-        _enter_standby, different cause, so the owner is told the real one and
-        does not go hunting for a second container that is not there."""
-        telegram.set_standby(True, "the instance lock cannot be read here")
-        t = time_mod.monotonic()
-        if t - self._standby_print >= 60:
-            self._standby_print = t
-            print("standby held: the instance lock could not be read, and a "
-                  "read that failed is not proof the other copy is gone. "
-                  "last holder: " + instance_lock.holder_line())
-        if self._blind_warned:
-            return
-        self._blind_warned = True
-        if self._hb_warned_once("instance_blind", str(now.date())):
-            return
-        self._hb_owner(
-            "Heartbeat: I stood down for another copy, and now I cannot even "
-            "read the single-instance lock file (the volume is refusing it). "
-            "I am staying quiet rather than assuming I am alone, so I am NOT "
-            "sending alerts, and I will not un-mute myself: the lease record "
-            "lives on the same volume that is failing, so nothing I can read "
-            "here tells me whether the other copy is alive or my disk is "
-            "broken. You get this once a day until it clears. If you know the "
-            "other copy is down, restart me. Last holder: "
-            + instance_lock.holder_line())
-
     def _enter_standby(self, now: datetime):
         """Go mute. The wire gate stops every broadcast, every chat reply and
         the getUpdates poll itself, which is what actually clears the 409."""
-        telegram.set_standby(True, "another instance holds the lease")
-        # remembered for the rest of this boot: once a LIVE holder has been
-        # seen, a later lock read that merely FAILED is not evidence it left.
+        self._set_ownership(instance_lock.STANDBY,
+                            "another instance holds the lease")
+        # remembered for the rest of this boot: a later promotion runs the
+        # stand-down ceremony (the DM, the downtime check) rather than a silent
+        # first acquisition.
         self._stood_down = True
+        self._reconciled = False
         lease = instance_lock.read_lease()
         t = time_mod.monotonic()
         if t - self._standby_print >= 60:  # say why the railway log is quiet
@@ -803,10 +1599,15 @@ class Service:
             "copies were meant to be up.")
 
     def standby_wait(self, now: datetime):
-        """One standby poll. Never exits the process: a copy that quit here
-        would not come back when the other one is torn down, and railway's
-        restartPolicy would just start it into the same contention. It waits,
-        and promotes itself within one poll of the lock freeing.
+        """One wait between ownership attempts, for STANDBY, RECOVERING and
+        BLOCKED alike. Never exits the process: a copy that quit here would not
+        come back when the other one is torn down, and railway's restartPolicy
+        would just start it into the same contention. It waits, and takes over
+        within one poll of the lock freeing.
+
+        The wait is a RETRY interval, not a countdown to activation. Nothing
+        here promotes anything, and no elapsed time is ever compared against a
+        threshold that would.
 
         Also watches for a WEDGED winner: the lock is still held (so the
         process is alive) but its seq has not advanced for STALE_S of this
@@ -815,6 +1616,20 @@ class Service:
         lease exists to prevent."""
         lease = instance_lock.read_lease()
         frozen = self._seqwatch.observe(lease)
+        # ...and only about a DIFFERENT copy. This wait now also serves
+        # RECOVERING and BLOCKED-from-a-failed-reconcile, which are the two new
+        # states where THIS process is the lock holder. renew() is only called
+        # on the way into ACTIVE, so during an outage the lease record stands
+        # still because the sole instance is the one not renewing it, and the
+        # frozen-seq branch fired at itself: the owner was DMed that "the
+        # active copy still holds the lock but has not renewed" and told to
+        # restart it, minutes after an accurate DM saying this copy cannot read
+        # its own state. Restarting changes nothing and the two messages
+        # contradict each other. holding() is pid-checked, so a child that
+        # merely inherited the handle still answers False.
+        if instance_lock.holding():
+            time_mod.sleep(instance_lock.STANDBY_POLL_S)
+            return
         if frozen >= instance_lock.STALE_S and not self._wedge_warned:
             self._wedge_warned = True
             if not self._hb_warned_once("instance_wedged", str(now.date())):
@@ -973,6 +1788,31 @@ class Service:
             f"Next close: {self._next_closure_line(now.date())}",
             config.api_usage_line(),
         ]
+        # the durable event picture. unknown deliveries and orphans are the two
+        # things nothing else in this text would ever show, and an unknown
+        # delivery in particular is a card that may or may not have arrived, so
+        # it has to be visible rather than resolved by guessing.
+        try:
+            lines.append(event_journal.report_text())
+        except Exception as e:                                  # noqa: BLE001
+            lines.append(f"Durable events: cannot be read ({e})")
+        jh = config.state_get("journal_health") or {}
+        if jh.get("ok") is False:
+            lines.append("Durable event journal UNAVAILABLE since "
+                         f"{jh.get('at', 'unknown')}: {jh.get('why', '')}. "
+                         "No new entry alerts. Open positions are still "
+                         "monitored and their exits still send.")
+        ph = config.state_get("position_health") or {}
+        if ph.get("ok") is False:
+            # a card that went out with no tracked position behind it. Said in
+            # its own line because the orphan count above is a number and this
+            # is the sentence that says what the number means for a trade
+            lines.append(
+                f"A {ph.get('kind', 'position')} card went out at "
+                f"{ph.get('at', 'unknown')} for {ph.get('what', 'a trade')} "
+                f"that I could NOT save ({ph.get('why', '')}). It is not being "
+                "watched. Replay retries the write on every pass and it stays "
+                "in the orphan count until it lands.")
         if warns:
             lines.append("Warnings today: " + ", ".join(warns))
         return "\n".join(lines)
@@ -1687,9 +2527,7 @@ class Service:
         lines.append(f"Brain: {self._brain_status()}")
         # rendered from the live lease record, never a typed-in value, so
         # "which copy is answering me" is always checkable from the chat
-        lines.append(instance_lock.status_line(
-            standby=telegram.standby()[0],
-            degraded=getattr(self, "_degraded_warned", False)))
+        lines.append(instance_lock.status_line())
         open_pos = [p for p in self.book.positions if p.state != "closed"]
         if open_pos:
             lines.append("Open positions:")
@@ -1877,8 +2715,25 @@ class Service:
         display = scoreboard.stats_for_card(setup.ticker, setup.direction,
                                             self.book, self.backtest_old,
                                             self.backtest_new)
+        # ---- W02 identity, minted before anything is written or sent ----
+        # candidate_id is the OBSERVATION. It is hashed over the decision's own
+        # inputs including the 5 minute bar the read came from, so the same
+        # unchanged bar re-scanned every POLL_SECONDS is ONE candidate and not
+        # four (Astra section 5). decision_id is the strategy's commitment and
+        # is deliberately NOT derived from it: multiple observations of a setup
+        # are not permission to fire another trade.
+        bar_floor = now.replace(minute=now.minute - now.minute % 5, second=0,
+                                microsecond=0)
+        candidate_id = event_journal.candidate_id_for(
+            date=str(now.date()), ticker=setup.ticker,
+            direction=setup.direction, strike=setup.strike,
+            bar=bar_floor.isoformat(), spot=round(float(setup.spot), 4),
+            mom=round(float(setup.mom_pct), 4))
+        decision_id = event_journal.new_decision_id()
+        position_id = f"{now:%Y%m%d-%H%M%S}-{setup.ticker}-{right}{setup.strike:g}"
         pos = Position(
-            id=f"{now:%Y%m%d-%H%M%S}-{setup.ticker}-{right}{setup.strike:g}",
+            id=position_id,
+            candidate_id=candidate_id, decision_id=decision_id,
             date=str(now.date()), time_et=now.strftime("%H:%M:%S"),
             ticker=setup.ticker, direction=setup.direction, right=right,
             strike=setup.strike, expiry=str(expiry_date),
@@ -1903,14 +2758,65 @@ class Service:
                 pass
         card = cards.entry_card(setup, pos, quote, display, mode, mode_reason,
                                 expiry_date, now.date(), news_lines=news_lines)
-        # persist FIRST, then alert. A crash in between then leaves a tracked
-        # (still-monitored) position that merely missed its entry card —
-        # recoverable — instead of an alerted-but-untracked one that would
-        # re-fire a duplicate BUY next cycle and never get exit alerts.
-        self.book.add(pos)
+        # DURABLE INTENT FIRST, then the position, then the card.
+        #
+        # The old order was book.add then notify, on the reasoning that a
+        # tracked position missing its card is recoverable. It is not: nothing
+        # anywhere said a card was owed, so a crash in that window left a
+        # position that would later fire exit cards for an entry nobody was
+        # ever told about. The journal is the missing third place, and it is
+        # written before either side effect so any crash leaves a record that
+        # says what was owed. The whole modeled position rides along, so replay
+        # rebuilds it without re-running a single strategy check.
+        try:
+            intent = self._commit_intent(
+                "entry", candidate_id=candidate_id, decision_id=decision_id,
+                position_id=position_id, strategy_id="momentum",
+                payload={"position": asdict(pos), "ticker": setup.ticker,
+                         "direction": setup.direction,
+                         "entry_mid": entry_mid, "entry_source": entry_source},
+                recipients=telegram.chat_ids(), text=card)
+        except event_journal.JournalUnavailable as e:
+            # Astra section 3: if durable intent creation fails, do NOT create
+            # an unrecorded new actionable entry. Nothing is tracked and
+            # nothing is sent, the ticker is retried next cycle rather than
+            # burned, and the health condition says why. This lowers alert
+            # availability on purpose.
+            self._journal_down(f"entry intent for {setup.ticker}: {e}")
+            return False
+        if intent is None:      # dry run: print the card, write no shared store
+            self.book.add(pos)
+            self.notify(card)
+            print(f"{now:%H:%M:%S} dry-run entry: {setup.ticker} "
+                  f"{setup.strike:g} {setup.direction} ${entry_mid:.2f}")
+            return True
+        self._journal_ok()
+        pos.intent_id = intent.journal_id
+        # add() reports whether the bytes reached positions.json, and that
+        # return used to be thrown away. A position only this process knows
+        # about stops being monitored the moment the process does, so a
+        # delivered entry card whose publish was REFUSED left a live modeled
+        # trade in no store at all, with the intent resolved on delivery status
+        # alone so replay never looked at it again and orphans() never saw it.
+        landed = self.book.add(pos)
         if not self.dry:  # dry-run must not poison the shared legacy-alert log
             record_alert(setup, now, display)
-        errors = self.notify(card)  # sends the moment it's recorded
+        results = self.notify_intent(card, intent)
+        # position_missing and retry_link are recorded as durable FACTS beside
+        # the position_id, so the next replay pass republishes the book and
+        # orphans() can classify this until it does.
+        event_journal.mark_linked(intent.journal_id, position_id=pos.id,
+                                  candidate_id=candidate_id,
+                                  position_missing=not landed,
+                                  retry_link=not landed)
+        live = event_journal.get(intent.journal_id) or intent
+        if landed and all(d.resolved for d in live.deliveries()):
+            event_journal.resolve(intent.journal_id)
+        if not landed:
+            self._position_unpersisted(
+                "entry", f"{setup.ticker} {setup.strike:g} {setup.direction}",
+                "positions.json publish refused")
+        errors = [r["error"] for r in results if r.get("error")]
         print(f"{now:%H:%M:%S} alert sent: {setup.ticker} {setup.strike:g} "
               f"{setup.direction} entry ${entry_mid:.2f} ({entry_source})"
               + (f" errors: {errors}" if errors else ""))
@@ -2025,13 +2931,65 @@ class Service:
                              self.old_bracket, comparable=comparable)
         builders = {"sell_half": cards.half_card, "runner_trail": cards.trail_card,
                     "stop": cards.stop_card, "expiry_warn": cards.expiry_card}
-        # send/queue the exit alert BEFORE persisting the closed state: a crash
-        # in between then re-evaluates next cycle (at worst a duplicate) instead
-        # of recording 'closed' with the STOP/SELL text never sent.
+        # JOURNAL, then persist, then send. This inverts the old order, which
+        # sent first and saved after on the reasoning that a crash in between
+        # was "at worst a duplicate". It was not: step() has already closed the
+        # row in memory, so a crash before save() made the next boot re-read
+        # the pre exit row, trip the same stop and send the same card AND book
+        # the same leg a second time.
+        #
+        # Safe to invert only because of the two things below it. event_key
+        # makes commit_intent idempotent, so a re-derived leg finds its own
+        # earlier intent instead of committing a second one; and an intent
+        # committed but not yet delivered is replayed on the way into ACTIVE,
+        # so the card still arrives. The exit TRIGGER arithmetic in
+        # positions.step is not touched by any of this.
+        journaled, degraded = [], []
         for ev in events:
-            self.notify(builders[ev["type"]](pos, ev))
+            text = builders[ev["type"]](pos, ev)
+            key = f"{pos.id}:{ev['type']}"
+            intent = None
+            try:
+                intent = self._commit_intent(
+                    "exit", candidate_id=getattr(pos, "candidate_id", ""),
+                    decision_id=getattr(pos, "decision_id", ""),
+                    position_id=pos.id, strategy_id="momentum", event_key=key,
+                    payload={"leg": ev["type"], "pct": ev.get("pct"),
+                             "mark": ev.get("mark"), "mark_source": source,
+                             "trigger_at_et": f"{now:%Y-%m-%d %H:%M:%S}"},
+                    recipients=telegram.chat_ids(), text=text)
+                self._journal_ok()
+            except event_journal.JournalUnavailable as e:
+                # Astra: this must never discard known open positions or stop
+                # their monitoring. The exit still evaluates and the card still
+                # goes out, and the degradation is recorded as an evidence gap.
+                self._journal_down(f"exit intent for {pos.id}: {e}")
             print(f"{now:%H:%M:%S} {pos.ticker}: {ev['type']} at {ev['pct']:+.1f}%")
-        self.book.save()
+            if intent is None:
+                degraded.append(text)
+            elif intent.duplicate and intent.any_attempt():
+                # this leg's card already went on the wire once. replay owns
+                # whatever is still unresolved about it; sending here would be
+                # the second report the whole reorder exists to prevent.
+                print(f"{now:%H:%M:%S} {pos.ticker}: {ev['type']} already "
+                      "committed and sent, not reported twice")
+            else:
+                journaled.append((text, intent))
+        # A leg with NO durable record keeps the old send-then-save order. That
+        # order is right precisely when there is no journal: with nothing to
+        # replay from, a crash between the save and the send loses the card for
+        # good, and a duplicate beats a silent close.
+        for text in degraded:
+            self.notify(text)
+        self.book.save()               # one save per cycle, exactly as before
+        # ...and a leg WITH a durable record sends after it, because the intent
+        # is what makes the card recoverable if this send never happens.
+        for text, intent in journaled:
+            self.notify_intent(text, intent)
+            event_journal.mark_linked(intent.journal_id, position_id=pos.id)
+            live = event_journal.get(intent.journal_id) or intent
+            if all(d.resolved for d in live.deliveries()):
+                event_journal.resolve(intent.journal_id)
 
     # ---------- sniper watch (own thread, US session) ----------
     # The verified pattern used to fire ONLY when someone happened to text
@@ -2193,7 +3151,38 @@ class Service:
         lines.append("Your call.")
         print(f"{now:%H:%M:%S} sniper {name} {row['direction']} {reason} at "
               f"{row['exit_price']} ({r_mult})")
-        self.notify("\n".join(lines))
+        text = "\n".join(lines)
+        # same treatment as the momentum exit: the durable record of this leg
+        # goes down before the card, keyed on the row and the reason, so a
+        # restart that re-grades the same closed row cannot report it twice.
+        # sniper_book.step already published the closed row before we got here,
+        # so the only thing left to make durable is the notification intent.
+        try:
+            intent = self._commit_intent(
+                "sniper_exit", candidate_id=row.get("candidate_id") or "",
+                decision_id=row.get("decision_id") or "",
+                position_id=row.get("id") or "", strategy_id="sniper",
+                event_key=f"{row.get('id')}:{reason}",
+                payload={"symbol": yfs, "reason": reason, "r": r_mult,
+                         "exit_price": row.get("exit_price"),
+                         "exit_via": via},
+                recipients=telegram.chat_ids(), text=text)
+            self._journal_ok()
+        except event_journal.JournalUnavailable as e:
+            self._journal_down(f"sniper exit intent for {yfs}: {e}")
+            self.notify(text)          # never stop reporting an exit
+            return
+        if intent is None:             # dry run: print it, record nothing
+            self.notify(text)
+            return
+        if intent.duplicate and intent.any_attempt():
+            print(f"{now:%H:%M:%S} sniper {name} {reason} already reported, "
+                  "not sent twice")
+            return
+        self.notify_intent(text, intent)
+        live = event_journal.get(intent.journal_id) or intent
+        if all(d.resolved for d in live.deliveries()):
+            event_journal.resolve(intent.journal_id)
 
     def _scan_snipers_once(self, now: datetime, entries_allowed: bool = True):
         import fvg as fvg_mod
@@ -2241,20 +3230,39 @@ class Service:
             # the fill is NOW, after the read, not the pre-scan clock: on a
             # slow scan those can sit in different bars
             fired_at = et_now()
-            if telegram.standby()[0]:
+            if telegram.standby()[0] or not telegram.may_write_shared_state():
                 # last line before the FIRST write, re-checked because the read
                 # above can take seconds and this thread can cross into standby
-                # inside them. the three writes below (the day/symbol key, the
-                # book row, the ledger selection) are one commit, so the gate
-                # sits in front of all three and a pass stopped here leaves
-                # nothing half-written on the shared volume.
-                print("standby mid-pass: sniper commit abandoned before any "
-                      "write")
+                # inside them. a pass stopped here leaves nothing half-written
+                # on the shared volume.
+                #
+                # It asks "may I write the shared volume" rather than "am I on
+                # standby" because a DRY RUN is the other answer to that
+                # question. ensure_active declares a dry run ACTIVE so it can
+                # still answer /status, which left standby False, so a dry copy
+                # walked straight through here and burned the live day key,
+                # committed a shared durable intent and marked a forward
+                # observation selected for a ticket it then (correctly) did not
+                # send. That makes the REAL daemon skip the symbol for the day.
+                print("standby or dry run mid-pass: sniper commit abandoned "
+                      "before any write")
                 return
-            alerted[key] = f"{fired_at:%H:%M}"
-            config.state_set("sniper_alerted",
-                             {k: v for k, v in alerted.items()
-                              if k.startswith(day)})
+            # the strategy's one commitment for this ticket, minted before any
+            # write. It is also the reservation's OWNER, which is what makes a
+            # release safe: only the operation that claimed the day key can
+            # ever hand it back.
+            decision_id = event_journal.new_decision_id()
+            if not config.state_reserve(
+                    "sniper_alerted", key, decision_id,
+                    extra={"hhmm": f"{fired_at:%H:%M}"},
+                    keep=lambda k: k.startswith(day)):
+                # somebody else holds this day/symbol, or the state file could
+                # not be written. either way this pass has no claim and must
+                # not send: the old code wrote the key unconditionally and then
+                # tried to compensate.
+                print(f"{fired_at:%H:%M:%S} sniper {yfs}: the day key is held "
+                      "by another operation, no ticket sent")
+                continue
             d = (r.get("plan") or {}).get("direction", "")
             dec = int(r.get("decimals", 2))
             try:  # the record is read from its report; never let a bad
@@ -2278,24 +3286,49 @@ class Service:
                     + (f" · structure {ticket['target_structure']:.{dec}f}"
                        if ticket.get("target_structure") else ""))
             lines.append("One trade per symbol per day. Your call.")
+            text = "\n".join(lines)
             if telegram.standby()[0]:
-                # the gate above is NOT in front of one commit, whatever the
-                # comment there said: a report file read and this send sit
-                # between the day key and the other two writes, and the send
-                # alone can take seconds. crossing into standby in that window
-                # burned the key on the SHARED volume and sent nothing, so the
-                # winner saw the symbol as already fired and the ticket was
-                # never sent by anybody. hand the key back, dropping only our
-                # own so a concurrent write from the winner survives.
-                config.state_update(
-                    "sniper_alerted",
-                    lambda cur: {k: v for k, v in (cur or {}).items()
-                                 if k != key},
-                    default={})
-                print("standby mid-pass: sniper ticket abandoned and the day "
-                      f"key for {key} released")
+                # a report file read sits between the claim and the send, and
+                # the send alone can take seconds, so this thread really can
+                # cross into standby in that window. NOTHING has gone on the
+                # wire yet, so the reservation is still merely claimed and
+                # handing it back is honest. state_release_owned checks the
+                # owner AND the lifecycle state, so unlike the old compensating
+                # delete it cannot remove a newer claimant's key (Astra A06).
+                config.state_release_owned("sniper_alerted", key, decision_id)
+                print("standby mid-pass: sniper ticket abandoned and this "
+                      f"operation's own day key for {key} released")
                 return
-            self.notify("\n".join(lines))
+            # DURABLE INTENT, then the position, then the ledger link, then the
+            # card. The old order sent first and linked last inside a try that
+            # only printed, so a fault there lost the link for good: the card
+            # went out and the row still said selected=False, which quietly
+            # dropped a delivered alert from the forward cohort (Astra A05).
+            position_id = f"{day}-{fired_at:%H%M%S}-{yfs}-{d}"
+            try:
+                intent = self._commit_intent(
+                    "sniper_entry", candidate_id=cid or "",
+                    decision_id=decision_id, position_id=position_id,
+                    strategy_id="sniper",
+                    payload={"symbol": yfs, "direction": d,
+                             "entry": ticket["entry"], "stop": ticket["stop"],
+                             "target": ticket["target"],
+                             "fired_at": f"{fired_at:%Y-%m-%d %H:%M:%S}"},
+                    recipients=telegram.chat_ids(), text=text)
+                self._journal_ok()
+            except event_journal.JournalUnavailable as e:
+                # no unrecorded actionable entry. the claim is released
+                # (nothing was sent), so tomorrow's, or this cycle's, retry can
+                # take it cleanly once the volume is writable again.
+                config.state_release_owned("sniper_alerted", key, decision_id)
+                self._journal_down(f"sniper entry intent for {yfs}: {e}")
+                continue
+            if intent is None:
+                # unreachable while the shared-writer gate above stands, and
+                # asserted here so a later edit that moves it fails loudly on
+                # its own line instead of inside this thread's catch-all
+                config.state_release_owned("sniper_alerted", key, decision_id)
+                continue
             # Track it. Until this existed the bot texted a ticket and then
             # went silent forever: no exit alert, and no way to ever know
             # whether its own verified pattern actually won.
@@ -2304,19 +3337,54 @@ class Service:
                 direction=d, entry=ticket["entry"], stop=ticket["stop"],
                 target=ticket["target"], day=day,
                 time_et=f"{fired_at:%H:%M:%S}", decimals=dec, entry_ts=fired_at,
-                candidate_id=cid)
-            # AFTER the card and the position, never before: this is the only
-            # place that records which observation was actually broadcast, and
-            # a ledger fault must not delay or break an alert already sent.
+                candidate_id=cid, decision_id=decision_id,
+                intent_id=intent.journal_id, position_id=position_id)
+            # BEFORE the send now, not after: the link is what puts a delivered
+            # alert in its cohort, and it is recoverable from the intent either
+            # way, so there is no reason left to leave it until last.
+            # open_trade answers None on a busy ledger lock, an unreadable book
+            # or a refused write, and it always did; what was missing is that
+            # the code then substituted the DERIVED position_id everywhere as
+            # if a row existed. That recorded a link to a position that is not
+            # there, so orphans() could not classify it, replay resolved the
+            # intent on delivery alone, and a live stop went unwatched with
+            # /health reporting zero orphans.
+            tracked_id = (pos or {}).get("id")
             if cid:
                 try:
-                    import forward_ledger
-                    forward_ledger.mark_selected(
-                        cid, fired_at_et=fired_at,
-                        position_id=(pos or {}).get("id"))
+                    res = forward_ledger.mark_selected(
+                        cid, fired_at_et=fired_at, position_id=tracked_id,
+                        decision_id=decision_id, intent_id=intent.journal_id,
+                        delivery_confirmed=False)
+                    if not res:
+                        print(f"{fired_at:%H:%M:%S} sniper selection not "
+                              f"recorded for {yfs}: {res}; replay will retry")
                 except Exception as e:
                     print(f"{fired_at:%H:%M:%S} sniper selection not recorded "
                           f"for {yfs}: {e}")
+            results = self._deliver(intent, None, text=text)
+            # ANY send attempt commits the reservation for good. An ambiguous
+            # delivered request is not an unsent opportunity, so from here the
+            # day key is terminal and nothing releases it.
+            config.state_commit_owned("sniper_alerted", key, decision_id)
+            event_journal.mark_linked(
+                intent.journal_id, position_id=tracked_id,
+                candidate_id=cid or None,
+                ledger_linked=bool(cid),
+                position_missing=pos is None,
+                retry_link=pos is None)
+            live = event_journal.get(intent.journal_id) or intent
+            if live.delivery_confirmed and cid:
+                forward_ledger.mark_selected(
+                    cid, fired_at_et=fired_at, position_id=tracked_id,
+                    decision_id=decision_id, intent_id=intent.journal_id,
+                    delivery_confirmed=True)
+            if pos is not None and all(dl.resolved for dl in live.deliveries()):
+                event_journal.resolve(intent.journal_id)
+            if pos is None:
+                self._position_unpersisted(
+                    "sniper", f"{r.get('instrument', yfs)} {d}",
+                    "the sniper ledger refused the row")
             print(f"{fired_at:%H:%M:%S} sniper FIRED {r.get('instrument', yfs)} {d} "
                   f"entry {ticket['entry']} stop {ticket['stop']} "
                   f"target {ticket['target']}")
@@ -2374,18 +3442,48 @@ class Service:
             self._news_stop.wait(max(3, config.NEWS_POLL_SECONDS))
 
     def _load_news_seen(self):
-        try:
-            d = json.loads(config.NEWS_SEEN_FILE.read_text(encoding="utf-8-sig"))
-            return d.get("seen", []), d.get("date")
-        except (OSError, json.JSONDecodeError):
-            return [], None
+        """(headlines already texted today, the day they belong to).
 
-    def _save_news_seen(self, seen, day):
-        try:  # only the news thread writes this file -> no cross-thread race
-            config.NEWS_SEEN_FILE.write_text(
-                json.dumps({"seen": seen, "date": day}), encoding="utf-8")
-        except OSError:
-            pass
+        A file that will not read comes back as an UNSEEDED day rather than as
+        a seeded empty one, which is what makes a reset safe: the caller's
+        first-pass branch then seeds every current headline silently instead
+        of texting them all again."""
+        res = storage_io.read_json(config.NEWS_SEEN_FILE)
+        if res.usable and isinstance(res.value, dict):
+            seen = res.value.get("seen")
+            return (seen if isinstance(seen, list) else []), res.value.get("date")
+        return [], None
+
+    def _save_news_seen(self, seen, day) -> bool:
+        """Publish the dedup cache through the shared protocol. Returns whether
+        the bytes landed.
+
+        This was the last mandatory reconcile store still written with a plain
+        Path.write_text, which TRUNCATES first: a SIGKILL, a redeploy or an OOM
+        kill inside the 12 second rewrite left partial JSON on disk, and an
+        ENOSPC out of the middle of it left zero bytes, with the OSError
+        swallowed by a bare `except OSError: pass` so nothing anywhere said so.
+        A torn file then failed the promotion check and stranded the only
+        instance in BLOCKED. storage_io stages, fsyncs and replaces, so the
+        file on disk is either the old content or the new one and never a
+        prefix of either, and it reports a refusal instead of hiding it.
+
+        The ownership question is asked HERE, at the one writer of this file,
+        for the same reason PositionBook.save asks it at its own publish: a
+        copy that does not own the shared volume (standing by, recovering, or a
+        dry run, which ensure_active declares ACTIVE so it can still answer
+        /status) that marks a headline seen makes the copy that IS working skip
+        that BREAKING alert entirely. The call sites check too; this is the one
+        that cannot be forgotten."""
+        if not telegram.may_write_shared_state():
+            return False
+        res = storage_io.write_json(config.NEWS_SEEN_FILE,
+                                    {"seen": seen, "date": day})
+        if not res.ok:
+            print(f"news_seen.json not persisted ({res.status} {res.error}); "
+                  "the headlines already texted this pass may be texted again "
+                  "after a restart. The file on disk is unchanged.")
+        return bool(res.ok)
 
     def _scan_news_once(self):
         """One pass: text the moment a NEW hot headline hits the wires.
@@ -2826,13 +3924,14 @@ class Service:
     # ---------- main loops ----------
 
     def run_session(self):
+        self._enter_starting()  # gagged until ownership is established
         now = et_now()
         if not self.ensure_active(now):
-            # the daemon loop owns the standby wait and the promotion. a plain
-            # one-shot session run has no outer loop, so it just returns and
-            # the process exits: the copy that HOLDS the lease keeps alerting.
-            print("standby: another copy of the bot holds the instance lease, "
-                  "so this session will not run.")
+            # the daemon loop owns the wait and the promotion. a plain one-shot
+            # session run has no outer loop, so it just returns and the process
+            # exits: whichever copy OWNS the token keeps alerting.
+            print("not running this session: "
+                  f"{instance_lock.status_line()}")
             return
         self.reset_day(now)
         self.check_downtime_on_start(now)  # were we silently down mid-session?
@@ -2915,15 +4014,22 @@ class Service:
             keep_awake(False)
 
     def daemon(self):
+        # gagged before the first ownership answer. the window between process
+        # start and that answer used to be wide open, so a boot could poll
+        # getUpdates and send from a copy that turned out to be the loser one
+        # tick later.
+        self._enter_starting()
         print("Daemon mode: running around the clock. Commands answered "
               "any time; sessions run on trading days 8:31-15:12 CT.")
         while True:
             now = et_now()
             try:
-                # FIRST thing in the loop. a copy that lost the singleton
-                # lease does nothing at all: no poll, no scan, no monitoring,
-                # no once-a-day job. it stays alive and retries, so the moment
-                # the other container is torn down it promotes itself.
+                # FIRST thing in the loop. a copy that does not own the token,
+                # or owns it but has not reconciled its saved state, does
+                # nothing at all: no poll, no scan, no monitoring, no
+                # once-a-day job. it stays alive and retries, so it takes over
+                # the moment the other container is torn down, and it starts
+                # sending the moment a broken volume reads cleanly again.
                 if not self.ensure_active(now):
                     self.standby_wait(now)
                     continue
@@ -3032,7 +4138,24 @@ def main():
     p.add_argument("--weekly", action="store_true", help="send the weekly report now")
     args = p.parse_args()
     if args.setup:
-        telegram.print_chat_ids()
+        # --setup is a REAL getUpdates poll, so it is a production token
+        # consumer exactly like the daemon. Astra lists "getUpdates utilities"
+        # among the second consumers a file lock cannot see, and a poll
+        # ACKNOWLEDGES updates through the offset, so running this beside a
+        # live daemon can swallow a command that copy should have answered.
+        # It asks for ownership like everything else instead of being trusted
+        # because a human typed it.
+        res = instance_lock.try_acquire()
+        if res not in ("acquired", "held"):
+            print("not printing chat ids: another copy owns this bot token "
+                  f"({res}). {instance_lock.holder_line()}. Stop it first.")
+            return
+        telegram.set_ownership_state(instance_lock.ACTIVE, "setup holds the lock")
+        try:
+            telegram.print_chat_ids()
+        finally:
+            telegram.set_ownership_state(instance_lock.STARTING, "setup done")
+            instance_lock.release()
         return
     svc = Service(dry_run=args.dry_run)
     if args.test:

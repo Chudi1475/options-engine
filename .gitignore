@@ -21,9 +21,18 @@ user_trades.json
 user_trades_test.json
 *.tmp
 scanner.lock
+# storage_io keeps one lock sidecar beside every file it serialises. They are
+# runtime artifacts like the staging files above, nothing ever reads them for
+# content, and the module never deletes one, so they must not be committed.
+*.lock
 logs/
 
 # the astra handoff carries the live trading record and the account size.
 # it goes to the reviewer directly, not to a public repo.
 HANDOFF_FOR_ASTRA_*.md
 ASTRA_PACKET_*.md
+
+# the durable event journal (W02). Runtime state on the deployment volume, and
+# on a local run DATA_DIR defaults to the repo, so these would otherwise land
+# here. The daily files carry alert text; nothing about them belongs in git.
+events/

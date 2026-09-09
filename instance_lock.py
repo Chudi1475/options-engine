@@ -1,26 +1,71 @@
-"""Singleton lease for the one process allowed to poll Telegram and send.
+"""Ownership of the one process allowed to poll Telegram and send.
 
 Telegram allows exactly ONE getUpdates consumer per bot token. A second copy
 gets 409 Conflict, the two split commands between them, and both fire every
 alert. On a shared volume it is worse than noisy: both write positions.json,
 so a second copy can mark a position closed in the file the first one then
-never alerts on. That is the money bug, so the loser must not monitor at all.
+never alerts on. That is the money bug, so a copy that is not the owner must
+not monitor at all.
+
+WHAT THIS LOCK CAN SEE
+    Cooperating processes that open the SAME lock object on the SAME
+    filesystem, subject to that filesystem's locking semantics. Two runs in one
+    DATA_DIR are caught immediately, on the first attempt. That is the whole
+    list.
+
+WHAT THIS LOCK CANNOT SEE
+    Everything in CANNOT_DETECT below, which is the machine readable version
+    of the same sentence: another machine, another service or deployment, a
+    replica, a copied or independently mounted volume, an old binary that
+    ignores this protocol, a desktop Task Scheduler entry, a webhook, an ad hoc
+    getUpdates script. Advisory locking only works when every writer
+    participates, so a program that does not ask is not excluded by it. Nothing
+    here may be read as proof that this process is the only one alive, and no
+    owner facing line generated from this module claims otherwise.
+
+DEPLOYMENT TOPOLOGY IS UNPROVEN FROM HERE
+    Railway's volume documentation says it PREVENTS simultaneous active
+    deployments mounted to the same service volume, so the shared volume
+    rolling promotion story a local two process test seems to prove has never
+    been reproduced on the platform. Treat it as unproven. The posture this
+    release ships is the conservative one: a single service, no external
+    production pollers, and a controlled handoff. Do not write code or text
+    that asserts a topology nobody has observed.
 
 Why the LOCK decides and the state.json record does not
 -------------------------------------------------------
-An OS advisory lock on DATA_DIR/scanner.lock is the authority. The record
-{instance_id, pid, host, seq, heartbeat_ts} written to state.json is only the
-observable half: it names the holder in a stand-down DM, in /status, and to
-the wedge detector.
+An OS advisory lock on DATA_DIR/scanner.lock is the authority for the part it
+can see. The record {instance_id, pid, host, seq, heartbeat_ts} written to
+state.json is only the observable half: it names the holder in a stand down DM,
+in /status, and to the wedge detector.
 
 That inversion is what survives railway's restartPolicy ALWAYS. The kernel
 releases the lock when the holder's handles close, which includes SIGKILL and
 a container teardown, so a crashed instance leaves NO stale lock and the
 restarted container reclaims on its FIRST attempt: no timeout, no clock read,
 no human. A record-only lease would need a staleness timeout, and every
-timeout choice is a way to brick the bot on restart. Going silent is far worse
-than the double alert this module prevents, so every ambiguous case here
-resolves toward "keep alerting".
+timeout choice is a way to brick the bot on restart.
+
+What that inversion does NOT buy is permission to act when the lock cannot be
+read at all. Unknown ownership is not exclusive ownership. A process that
+cannot establish ownership goes to BLOCKED and stays quiet, and the way back is
+the lock becoming acquirable again, never a timer (see the state table below
+and scanner.ensure_active).
+
+The five states
+---------------
+    STARTING    booted, ownership not established. local checks only.
+    STANDBY     another cooperating process holds the lock. bounded retries.
+    RECOVERING  lock held, durable state not reconciled yet. no new entries and
+                no fresh strategy notifications.
+    ACTIVE      ownership held AND every mandatory store reconciled.
+    BLOCKED     lock unsupported, storage unhealthy, recovery incomplete or
+                ownership uncertain. local health reporting and bounded
+                acquisition retries, never activation on a timer.
+
+There is no ACTIVE-DEGRADED. A warning about observation QUALITY (a stale feed,
+missing chart data) is a different thing and may fire while ownership is
+genuinely held, but it never confers ownership.
 
 Nothing branches on a wall clock. heartbeat_ts is for display only. Freshness
 is judged solely by whether seq advances, measured against the OBSERVER's own
@@ -31,15 +76,6 @@ This does NOT reuse forward_ledger._os_lock. That one is a 0.75s critical
 section that unlocks; this one is held for the life of the process and needs a
 tri-state answer (acquired / contended / unavailable), where the ledger's
 helper collapses contention and no-primitive into the same None.
-
-What it can and cannot see
---------------------------
-CAN: two processes sharing DATA_DIR, which is two railway containers on one
-volume (a rolling-deploy overlap or an accidental double deploy) and two runs
-in the same local DATA_DIR. Detection is immediate, on the first attempt.
-CANNOT: the cloud daemon and a desktop "python scanner.py" at the same time.
-Different filesystems, no shared state.json, no shared lock file. That pair
-stays covered only by the existing 409 warning in scanner._warn_conflict.
 """
 
 import errno
@@ -64,30 +100,70 @@ try:
 except ImportError:                    # Linux
     _msvcrt = None
 
+# O_NOINHERIT on Windows, O_CLOEXEC on linux, 0 on anything that has neither.
+# Same intent either way: the handle must not survive into a child.
+_NOINHERIT = getattr(os, "O_NOINHERIT", 0) or getattr(os, "O_CLOEXEC", 0)
+
 LOCK_NAME = "scanner.lock"
 LEASE_KEY = "instance_lease"
 RENEW_S = 20        # how often the holder republishes its record
 STALE_S = 180       # seq frozen this long: warn the owner, never take over
 STANDBY_POLL_S = 5  # how often a loser re-asks for the lock
 ACQUIRE_BUDGET_S = 0.3  # a brief retry so a mid-flight release is not missed
-# A copy that has ALREADY stood down and then cannot read the lock at all (a
-# read-only remount, EIO or ESTALE on the mount, fd exhaustion) must not read
-# that failure as "I am alone": see scanner.ensure_active. There is no
-# BLIND_RESUME_S here any more, and that absence is deliberate. A timed way
-# back, gated on the holder's published seq standing still, was tried and is
-# unsound: the lease record lives on the SAME volume whose failure blinded this
-# copy, so that fault also stops the live holder's renew from landing, and a
-# frozen seq is a symptom of our own broken disk rather than proof the holder
-# died. Acting on it puts two copies on the wire during exactly the fault the
-# lease exists to survive. Nothing readable from here separates the two cases,
-# so the mute copy stays mute and tells the owner once a day.
+
+# The ownership states, spelled once so /status, the DMs and the tests all read
+# the same string instead of three hand-typed copies drifting apart.
+STARTING = "STARTING"
+STANDBY = "STANDBY"
+RECOVERING = "RECOVERING"
+ACTIVE = "ACTIVE"
+BLOCKED = "BLOCKED"
+STATES = (STARTING, STANDBY, RECOVERING, ACTIVE, BLOCKED)
+
+# Everything a local advisory lock is blind to. This is a LIST rather than a
+# paragraph so the honesty is testable: the module docstring, status_line and
+# every owner facing stand down or blocked note are generated from it, and a
+# check can assert they match. A hand typed sentence goes stale the first time
+# somebody adds a way to run a second copy.
+CANNOT_DETECT = (
+    "another machine",
+    "another Railway service or deployment",
+    "a second replica of this service",
+    "a copied or independently mounted volume",
+    "an old binary that ignores this lock",
+    "a desktop Task Scheduler entry",
+    "a Telegram webhook configuration",
+    "an ad hoc getUpdates script",
+)
+
+
+def cannot_detect_line() -> str:
+    """One sentence naming what this lock cannot see. Rendered from
+    CANNOT_DETECT so the text and the list can never disagree."""
+    return ("This lock only sees processes that share this filesystem and "
+            "cooperate with it. It cannot see " + ", ".join(CANNOT_DETECT) + ".")
+# A copy that cannot read the lock at all (a read-only remount, EIO or ESTALE
+# on the mount, fd exhaustion, a full volume) must not read that failure as "I
+# am alone", whether or not it has ever seen a holder: see
+# scanner.ensure_active, where it goes to BLOCKED. There is no BLIND_RESUME_S
+# here and there is no timer of any other name, and that absence is deliberate.
+# A timed way back, gated on the holder's published seq standing still, was
+# tried and is unsound: the lease record lives on the SAME volume whose failure
+# blinded this copy, so that fault also stops the live holder's renew from
+# landing, and a frozen seq is a symptom of our own broken disk rather than
+# proof the holder died. Acting on it puts two copies on the wire during
+# exactly the fault the lease exists to survive. Nothing readable from here
+# separates the two cases, so the mute copy stays mute and tells the owner once
+# a day.
 
 # The ONLY errnos that mean "somebody else holds it". Everything else an
 # advisory lock can raise means the filesystem cannot lock at all: ENOLCK and
 # EOPNOTSUPP on a share or an overlay that has no lock support, EINVAL and
-# ENOSYS on a kernel that refuses the call. Reading those as contention would
-# make a bot on such a volume silence ITSELF forever, with no second copy
-# anywhere. Fail open instead, exactly like a missing primitive.
+# ENOSYS on a kernel that refuses the call. Those are not contention, they are
+# "ownership cannot be established here", which is a different answer with a
+# different owner facing message: the fix is a volume that can lock, not
+# hunting for a second copy that does not exist. Both end in a quiet bot, so
+# telling them apart is the only kindness available.
 _CONTENDED_ERRNOS = {
     errno.EACCES,                                  # msvcrt LK_NBLCK on Windows
     errno.EAGAIN,                                  # fcntl LOCK_NB on Linux
@@ -101,9 +177,41 @@ _ID = uuid.uuid4().hex[:12]
 # closing the handle releases the lock, so the process would quietly stop being
 # the singleton while still believing it was.
 _fd = None
+# The pid that actually took the lock. A child that inherits or duplicates the
+# handle would otherwise read _fd is not None as "I own this", and then two
+# processes both believe they are the singleton off ONE acquisition. Astra
+# section 3 names it: do not assume killing one parent releases a handle
+# retained by a child.
+_owner_pid = None
 _seq = 0
 _last_renew = 0.0
 _lock = threading.RLock()
+
+# The one place that answers "what am I allowed to do right now". scanner drives
+# it, telegram and /status read it. Boot value is STARTING because a process
+# that has not asked for the lock yet owns nothing, and that is the safe end of
+# the question.
+_state = (STARTING, "process booted, ownership not established")
+
+
+def state() -> str:
+    """The current ownership state, one of STATES."""
+    return _state[0]
+
+
+def state_reason() -> str:
+    """Why the process is in that state, for /status and the ops DM."""
+    return _state[1]
+
+
+def set_state(name: str, reason: str = ""):
+    """Record the state. Callers are scanner's state machine and the tests;
+    nothing here acts on it, because acting on ownership is exactly the
+    decision that must stay in one place."""
+    global _state
+    if name not in STATES:
+        raise ValueError(f"unknown ownership state {name!r}")
+    _state = (name, reason or "")
 
 
 def instance_id() -> str:
@@ -125,32 +233,51 @@ def lock_path():
 
 
 def holding() -> bool:
-    return _fd is not None
+    """True only for the process that actually TOOK the lock.
+
+    The pid check is the whole point. A forked or spawned child inherits the
+    parent's open handle and would otherwise answer True here off an
+    acquisition it never made, so two processes would both believe they are the
+    singleton. The handle is opened non inheritable as well; this is the second
+    belt, for a duplicated fd or an interpreter that hands one down anyway."""
+    return _fd is not None and _owner_pid == os.getpid()
 
 
 def try_acquire(budget_s: float = ACQUIRE_BUDGET_S) -> str:
-    """Take the singleton lock. Returns one of:
+    """Ask for the singleton lock. Returns one of:
 
         "acquired"    this process now holds it
         "held"        it already did, nothing changed
-        "contended"   another live process holds it, stand down
-        "unavailable" no lock primitive here, so nobody can be checked
+        "contended"   another cooperating process holds it, stand down
+        "unavailable" OWNERSHIP IS UNKNOWN: there is no lock primitive here, or
+                      the lock file could not be opened at all
 
-    "unavailable" is deliberately NOT "contended": failing closed on a
-    platform with no flock would brick the bot, and a silent bot is worse than
-    a duplicate card. The caller keeps running and tells the owner once.
+    "unavailable" is deliberately NOT "contended", because the two need
+    different handling, and it is just as deliberately NOT a licence. It says
+    the question could not be answered, and an unanswered ownership question is
+    not ownership: see scanner.ensure_active, where it lands in BLOCKED. This
+    function reports; it never decides.
     """
-    global _fd
+    global _fd, _owner_pid
     with _lock:
-        if _fd is not None:
+        if _fd is not None and _owner_pid == os.getpid():
             return "held"
         if _msvcrt is None and _fcntl is None:
             return "unavailable"
         try:
-            fd = os.open(str(lock_path()), os.O_RDWR | os.O_CREAT)
+            # non inheritable on purpose: a child must not receive a handle
+            # that keeps the lock alive after this process dies, which would
+            # turn a crash into a wedge nobody can clear without finding the
+            # child. os.open already defaults to this on py3, and saying so
+            # here keeps it from being changed by accident.
+            fd = os.open(str(lock_path()), os.O_RDWR | os.O_CREAT | _NOINHERIT)
+            try:
+                os.set_inheritable(fd, False)
+            except (OSError, AttributeError):
+                pass
         except OSError as e:
             print(f"instance lock: cannot open {lock_path()} ({e}), "
-                  "running without the guard")
+                  "so ownership is UNKNOWN here")
             return "unavailable"
         deadline = time.monotonic() + max(0.0, budget_s)
         while True:
@@ -161,17 +288,18 @@ def try_acquire(budget_s: float = ACQUIRE_BUDGET_S) -> str:
                 else:
                     _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
                 _fd = fd
+                _owner_pid = os.getpid()
                 return "acquired"
             except OSError as e:
                 if e.errno not in _CONTENDED_ERRNOS:
                     # not "someone holds it", but "this filesystem cannot
-                    # lock". keep alerting rather than silence ourselves.
+                    # lock", so ownership cannot be established here at all.
                     try:
                         os.close(fd)
                     except OSError:
                         pass
                     print(f"instance lock: {lock_path()} cannot be locked on "
-                          f"this filesystem ({e}), running without the guard")
+                          f"this filesystem ({e}), so ownership is UNKNOWN")
                     return "unavailable"
                 # the other side may be one syscall away from releasing (a
                 # rolling deploy tearing the old container down), so spend a
@@ -187,10 +315,15 @@ def try_acquire(budget_s: float = ACQUIRE_BUDGET_S) -> str:
 
 def release():
     """Drop the lock. This is also exactly what the kernel does at process
-    death, which is what makes the reclaim path need no timeout."""
-    global _fd
+    death, which is what makes the reclaim path need no timeout.
+
+    The lock FILE is left where it is, always. Unlinking or replacing it while
+    any owner exists hands the next process a lock on a different inode, which
+    excludes nobody, and then two copies both believe they own the token."""
+    global _fd, _owner_pid
     with _lock:
         fd, _fd = _fd, None
+        _owner_pid = None
         if fd is None:
             return
         try:
@@ -301,15 +434,32 @@ def holder_line(lease=None) -> str:
             f"{_renewal_text(lease.get('heartbeat_ts'))}")
 
 
-def status_line(standby: bool = False, degraded: bool = False) -> str:
-    """The /status line. Reads the live record, never a typed-in value."""
-    if degraded:
-        return (f"Instance: active, NO singleton lock on this filesystem "
-                f"(id {_ID}, pid {os.getpid()}). A second copy would not be "
-                f"caught here.")
-    if standby or _fd is None:
+def status_line(state_name: str = None) -> str:
+    """The /status line, one per ownership state. Reads the live record and the
+    live state, never a typed-in value.
+
+    The old version had a "degraded" line reading "active, NO singleton lock on
+    this filesystem". That sentence was the unsafe default written down: it
+    announced that ownership was unknown and that the bot was alerting anyway.
+    There is no line for that any more, because there is no such state."""
+    st = state() if state_name is None else state_name
+    who = f"id {_ID}, pid {os.getpid()}"
+    if st == BLOCKED:
+        return (f"Instance: BLOCKED, NOT sending ({who}). "
+                f"{state_reason() or 'ownership could not be established'}. "
+                + cannot_detect_line())
+    if st == STANDBY:
         return "Instance: STANDBY, another copy holds the lease: " + holder_line()
+    if st == RECOVERING:
+        return (f"Instance: RECOVERING, holding the lock but not yet sending "
+                f"({who}). {state_reason() or 'reconciling saved state'}.")
+    if st == STARTING:
+        return f"Instance: STARTING, ownership not established yet ({who})."
+    if not holding():
+        # ACTIVE without the handle is a bookkeeping bug, not a state. Say so
+        # rather than printing a confident "active" line nobody should trust.
+        return (f"Instance: ACTIVE was recorded without the lock handle "
+                f"({who}). Treat this as unknown ownership and restart me.")
     lease = read_lease()
     seq = lease.get("seq") if lease.get("instance_id") == _ID else 0
-    return (f"Instance: active (id {_ID}, pid {os.getpid()}, "
-            f"renewal {seq})")
+    return f"Instance: active ({who}, renewal {seq})"

@@ -20,14 +20,12 @@ old-rules shadow also closes — otherwise the comparison would be rigged.
 
 import json
 import math
-import os
-import threading
-import time as time_mod
 from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime, time
 
 import config
 import market_calendar
+import storage_io
 
 CLOSE_T = time(16, 0)
 _warn = 16 * 60 - int(config.EXPIRY_WARN_MINUTES)
@@ -102,6 +100,20 @@ class Position:
                                # to the caller's current bracket (old behavior).
     old_rules: dict = field(default_factory=lambda: {
         "status": "open", "exit_pct": None, "exit_reason": None, "exit_time": None})
+    # W02 identity. Three ids with three different jobs, carried on the row so
+    # a delivered card, the observation behind it and this position name each
+    # other instead of being matched afterwards by guessing on a clock.
+    #   candidate_id  the OBSERVATION this came from
+    #   decision_id   the strategy's one commitment. Two observations of the
+    #                 same setup are not permission to fire twice, so this is
+    #                 also the key add() dedups on.
+    #   intent_id     the durable journal record that was written before the
+    #                 card was sent
+    # Rows written before these existed simply lack them and _parse_file's
+    # allowed-key filter already tolerates that, so there is no migration.
+    candidate_id: str = ""
+    decision_id: str = ""
+    intent_id: str = ""
 
     def pct_of(self, mark: float) -> float:
         return (mark / self.entry_mid - 1) * 100 if self.entry_mid else 0.0
@@ -236,10 +248,29 @@ def step(pos: Position, now: datetime, mark: float, mark_source: str,
     return events
 
 
+def _may_write() -> bool:
+    """True when this copy owns the shared volume and may publish the book.
+
+    Imported lazily on purpose: this is the position model and it must not grow
+    an import-time dependency on the transport (same rule sniper_book follows).
+    A transport that is not loaded at all means nothing has declared a
+    stand-down, so the answer is yes and a one-shot tool behaves as before."""
+    try:
+        import telegram
+        return bool(telegram.may_write_shared_state())
+    except Exception:
+        return True
+
+
 class PositionBook:
     def __init__(self, path=None):
         self.path = path or config.POSITIONS_FILE
         self.positions = []
+        # the status of the LAST read of positions.json: "ok", "missing",
+        # "unreadable" or "corrupt". _parse_file returning None cannot say
+        # which, and a promotion needs to know: a missing book is a fact, an
+        # unreadable one is a mystery and is not permission to resume.
+        self.last_read_status = "missing"
         self.load()
 
     def _parse_file(self):
@@ -248,14 +279,15 @@ class PositionBook:
         None means "leave what you have", never "the book is empty". That
         distinction only matters to reload(): at boot the book is empty either
         way, so this is behavior-identical there, but on a promotion an
-        unreadable file must not be allowed to look like a closed book."""
-        if not self.path.exists():
+        unreadable file must not be allowed to look like a closed book.
+        last_read_status carries WHICH of the untrustworthy answers it was."""
+        res = storage_io.read_json(self.path)
+        self.last_read_status = res.status
+        if not res.usable:
             return None
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
-        except (json.JSONDecodeError, OSError, ValueError):
-            return None
+        raw = res.value
         if not isinstance(raw, list):
+            self.last_read_status = "corrupt"
             return None
         # parse each record on its own and filter unknown keys, so ONE bad /
         # legacy / schema-evolved record can never crash the whole bot on boot
@@ -269,6 +301,43 @@ class PositionBook:
                 rid = p.get("id") if isinstance(p, dict) else repr(p)
                 print(f"skipping unloadable position record {rid}: {e}")
         return out
+
+    def parse_snapshot(self):
+        """The file's rows as TEMPORARY objects, plus what the read was worth.
+
+        Returns (status, rows) where status is one of:
+            "ok"          the file parsed, rows are its contents
+            "absent"      there is no file, which is a real and clean state.
+                          A fresh volume has no positions.json and must still
+                          be allowed to boot.
+            "unreadable"  the file is there and could not be turned into rows
+
+        Nothing on the instance is touched, and that is the whole point. A
+        promotion has to parse and validate EVERY mandatory store before any of
+        them replaces memory, so a book that parses beside a sniper ledger that
+        does not can never leave half the world installed (Astra section 3:
+        promotion is all or nothing)."""
+        rows = self._parse_file()
+        if rows is not None:
+            return "ok", rows
+        if self.last_read_status == "missing":
+            return "absent", []
+        return "unreadable", []
+
+    def install(self, rows):
+        """Replace memory with an already parsed and already validated
+        snapshot, MERGING anything only this copy knows about.
+
+        Split out of reload() so a caller can parse first, check that every
+        other mandatory store parsed too, and only then commit. Same merge rule
+        reload documents, for the same reason."""
+        known = {p.id for p in rows}
+        merged = list(rows)
+        for p in self.positions:
+            if p.id not in known:
+                merged.append(p)
+                known.add(p.id)
+        self.positions = merged
 
     def load(self):
         parsed = self._parse_file()
@@ -302,39 +371,64 @@ class PositionBook:
         disk = self._parse_file()
         if disk is None:
             return
-        known = {p.id for p in disk}
-        merged = list(disk)
+        self.install(disk)
+
+    def save(self) -> bool:
+        """Publish the book through the shared protocol. Returns whether the
+        bytes actually landed.
+
+        This used to retry a denied replace exactly once and let an ENOSPC out
+        of the staging write straight through to the caller, so a full volume
+        raised out of the middle of a scan and a second WinError 5 lost the
+        book. storage_io retries a bounded number of times, reports a full
+        disk as a status instead of an exception, and never leaves an orphan
+        staging file behind."""
+        if not _may_write():
+            # not this copy's file to write. the gag stops the cards, not the
+            # writes, so the ownership question has to be asked down here at
+            # the publish as well as at the caller: a copy that is standing by,
+            # still recovering, or blocked on unknown ownership would otherwise
+            # put ITS snapshot over the owner's open rows, and those positions
+            # stop being watched for their stop, their half and their give back
+            # with nobody told. This used to be a call site check in scanner,
+            # which is one forgotten call away from the same bug.
+            return False
+        res = storage_io.write_json(self.path,
+                                    [asdict(p) for p in self.positions])
+        if not res.ok:
+            print(f"PositionBook.save: could NOT persist {self.path.name}: "
+                  f"{res.status} {res.error}")
+        return bool(res.ok)
+
+    def find_by_decision(self, decision_id: str):
+        """The position opened for one strategy decision, or None.
+
+        The join replay needs: after a crash between the durable intent and
+        this book, recovery has to ask "is there already a position for that
+        decision" and get a definite answer, rather than inferring one from a
+        card that may or may not have gone out."""
+        if not decision_id:
+            return None
         for p in self.positions:
-            if p.id not in known:
-                merged.append(p)
-                known.add(p.id)
-        self.positions = merged
+            if getattr(p, "decision_id", "") == decision_id:
+                return p
+        return None
 
-    def save(self):
-        # unique temp per pid/thread (mirrors config.save_state) so two writers
-        # never clobber one shared tmp -> torn JSON or FileNotFoundError
-        tmp = self.path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-        try:
-            tmp.write_text(json.dumps([asdict(p) for p in self.positions], indent=1),
-                           encoding="utf-8")
-            try:
-                tmp.replace(self.path)
-            except (PermissionError, FileNotFoundError):  # mid-read / volume blip
-                time_mod.sleep(0.2)
-                try:
-                    tmp.replace(self.path)
-                except (PermissionError, FileNotFoundError) as e:
-                    print(f"PositionBook.save: could NOT persist positions.json: {e}")
-        finally:
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except OSError:
-                pass
+    def add(self, pos: Position) -> bool:
+        """Track a new position. Returns whether it reached the disk: a
+        position only this process knows about stops being monitored the
+        moment the process does.
 
-    def add(self, pos: Position):
+        Idempotent on decision_id. A crash between the journal append and this
+        call leaves an intent that replay re-applies, and without this check
+        that replay would open a SECOND position for one decision, doubling a
+        modeled trade off a recovery. A row with no decision_id (every legacy
+        row, and every dry run) behaves exactly as before."""
+        prior = self.find_by_decision(getattr(pos, "decision_id", ""))
+        if prior is not None:
+            return True     # already tracked for this decision; nothing to do
         self.positions.append(pos)
-        self.save()
+        return self.save()
 
     def needs_monitoring(self, today: date) -> list:
         """Positions that still need price updates: open ones, plus closed

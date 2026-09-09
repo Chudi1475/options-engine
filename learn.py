@@ -52,6 +52,7 @@ from zoneinfo import ZoneInfo
 
 import config
 import live_params
+import storage_io
 import strategy_spec
 import telegram
 from positions import PositionBook
@@ -218,8 +219,7 @@ def review_history(max_new: int = 25) -> int:
                  "reviewed_at": et_now().strftime("%Y-%m-%d %H:%M:%S %Z")}
         entry["revision"] = 1
         entry["payload_hash"] = _payload_hash(entry)
-        with REVIEWS_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+        storage_io.append_jsonl(REVIEWS_FILE, entry)
         # a real lesson from a deep review feeds the same digest the brain
         # reads, so it carries its provenance: which trade it came from, how
         # much weight it has earned, and which review revision produced it.
@@ -860,33 +860,47 @@ def _append_lesson(entry: dict):
                       f"({e}); kept out of the digest anyway: {str(x)[:80]}")
     kind = _lesson_kind(entry)
     session = entry.get("session")
-    if kind != "deep" and session and LESSONS_LOG.exists():
-        try:
-            lines = LESSONS_LOG.read_text(encoding="utf-8-sig").splitlines()
-        except OSError:
-            lines = None
-        if lines is not None:
-            kept, dropped = [], 0
-            for line in lines:
-                try:
-                    old = json.loads(line)
-                except json.JSONDecodeError:
+    # The upsert READS the file, drops the rows it is replacing and republishes
+    # the whole thing, and then appends. Both halves have to be inside ONE
+    # lock: unlocked, any line another writer appended between the read and
+    # the replace was destroyed, and the temp name (one shared
+    # lessons.jsonl.tmp) meant two rewriters clobbered each other's staging
+    # file as well.
+    with storage_io.file_lock(LESSONS_LOG) as lk:
+        if not lk.held:
+            print(f"learn: lessons.jsonl is held by another writer ({lk.why}); "
+                  "this lesson was not recorded")
+            return
+        if kind != "deep" and session and LESSONS_LOG.exists():
+            # read as TEXT on purpose: a line the parser cannot read is copied
+            # through verbatim rather than re-encoded or dropped, and an
+            # unreadable file leaves `lines` None so nothing is published
+            # over it
+            try:
+                lines = LESSONS_LOG.read_text(encoding="utf-8-sig").splitlines()
+            except OSError as e:
+                lines = None
+                print(f"learn: lessons.jsonl could not be read ({e}); the "
+                      "upsert was skipped and the lesson appended")
+            if lines is not None:
+                kept, dropped = [], 0
+                for line in lines:
+                    try:
+                        old = json.loads(line)
+                    except json.JSONDecodeError:
+                        kept.append(line)
+                        continue
+                    if (old.get("session") == session
+                            and _lesson_kind(old) == kind):
+                        dropped += 1
+                        continue
                     kept.append(line)
-                    continue
-                if old.get("session") == session and _lesson_kind(old) == kind:
-                    dropped += 1
-                    continue
-                kept.append(line)
-            if dropped:
-                try:
-                    tmp = LESSONS_LOG.with_suffix(".jsonl.tmp")
-                    tmp.write_text("\n".join(kept) + ("\n" if kept else ""),
-                                   encoding="utf-8")
-                    tmp.replace(LESSONS_LOG)
-                except OSError as e:  # rewrite failed: append still lands below
-                    print(f"learn: lesson upsert rewrite failed ({e}); appending")
-    with LESSONS_LOG.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
+                if dropped:
+                    out = storage_io.write_lines(LESSONS_LOG, kept)
+                    if not out.ok:  # rewrite failed: the append still lands
+                        print("learn: lesson upsert rewrite failed "
+                              f"({out.status} {out.error}); appending")
+        storage_io.append_jsonl(LESSONS_LOG, entry)
 
 
 def _all_lessons() -> list:
@@ -1006,7 +1020,16 @@ def _rebuild_digest():
               f"hard rules ({window} entry window, {spec.floor_txt()} "
               f"win-rate floor, {spec.exit_plan_short()}).\n")
     body = "\n".join(f"- ({tag}) {lesson}" for tag, lesson in bullets) or "- (none yet)"
-    LESSONS_DIGEST.write_text(header + "\n" + pin + body + "\n", encoding="utf-8")
+    # atomic, because the brain READS this file: a plain write_text can be
+    # read half written and a torn digest goes straight into a prompt.
+    # A failed publish RAISES, because every caller decides what to do from
+    # that, and a rebuild reported as done when it was not is exactly the
+    # claim R04b exists to stop.
+    out = storage_io.write_text(LESSONS_DIGEST,
+                                header + "\n" + pin + body + "\n")
+    if not out.ok:
+        raise OSError(f"could not persist {LESSONS_DIGEST.name}: "
+                      f"{out.status} {out.error}")
 
 
 def _owner_message(record, lesson, prop=None) -> str:
@@ -1599,13 +1622,18 @@ def import_reviews_result(path: str, reviewer: str = "offline") -> dict:
         lines.append(json.dumps(entry) + "\n")
 
     if lines:
-        with REVIEWS_FILE.open("a", encoding="utf-8") as f:
-            f.write("".join(lines))
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except (OSError, ValueError):
-                pass          # no fsync on this handle; the append still landed
+        # durable, because an import that is replayed after a crash must not
+        # re-import rows it already wrote. One call, under the reviews file's
+        # own lock, so a partial batch cannot interleave with another writer.
+        landed = storage_io.append_text(REVIEWS_FILE, "".join(lines),
+                                        durable=True)
+        if not landed.ok:
+            # ok stays False and nothing downstream runs: an import that
+            # reported success for rows the disk never took would be resumed
+            # as already done
+            out["problems"].append(f"append failed ({landed.status} "
+                                   f"{landed.error}); nothing imported")
+            return out
         out["written"] = len(lines)
     out["resumed"] = len(already)
 
@@ -1632,33 +1660,49 @@ def import_reviews(path: str, reviewer: str = "offline") -> int:
 def _supersede_lessons(review_id: str, revision: int) -> int:
     """Mark every earlier lesson row for this review inactive and point it at
     the revision that replaced it. The text STAYS in lessons.jsonl for audit;
-    only the active digest drops it. Rewrites through a temp file, and a line
-    the parser cannot read is copied through untouched."""
+    only the active digest drops it. The read and the rewrite are one locked
+    transaction, and a line the parser cannot read is copied through
+    untouched. This had no error handling at all: the WinError 5 that hits
+    this machine about one run in ten raised straight out of the nightly
+    review."""
     if not LESSONS_LOG.exists():
         return 0
-    lines = LESSONS_LOG.read_text(encoding="utf-8-sig").splitlines()
-    kept, changed = [], 0
-    for line in lines:
+    with storage_io.file_lock(LESSONS_LOG) as lk:
+        if not lk.held:
+            print("learn: lessons.jsonl is held by another writer "
+                  f"({lk.why}); nothing was superseded")
+            return 0
         try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
+            lines = LESSONS_LOG.read_text(encoding="utf-8-sig").splitlines()
+        except OSError as e:
+            print(f"learn: lessons.jsonl could not be read ({e}); nothing "
+                  "was superseded and nothing was published over it")
+            return 0
+        kept, changed = [], 0
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                kept.append(line)
+                continue
+            if (row.get("source_review_id") == review_id
+                    and (_review_revision(row) or 1) < revision
+                    and row.get("active") is not False):
+                row["active"] = False
+                row["superseded_by"] = _review_key(review_id, revision)
+                changed += 1
+                kept.append(json.dumps(row))
+                continue
             kept.append(line)
-            continue
-        if (row.get("source_review_id") == review_id
-                and (_review_revision(row) or 1) < revision
-                and row.get("active") is not False):
-            row["active"] = False
-            row["superseded_by"] = _review_key(review_id, revision)
-            changed += 1
-            kept.append(json.dumps(row))
-            continue
-        kept.append(line)
-    if changed:
-        tmp = LESSONS_LOG.with_suffix(".jsonl.tmp")
-        tmp.write_text("\n".join(kept) + ("\n" if kept else ""),
-                       encoding="utf-8")
-        tmp.replace(LESSONS_LOG)
-    return changed
+        if changed:
+            out = storage_io.write_lines(LESSONS_LOG, kept)
+            if not out.ok:
+                # a count of rows the disk never took would tell the caller a
+                # revision superseded lessons that are still active
+                print(f"learn: could NOT persist {LESSONS_LOG.name}: "
+                      f"{out.status} {out.error}; nothing was superseded")
+                return 0
+        return changed
 
 
 def repair_lessons(reviews_file) -> dict:
@@ -1760,86 +1804,100 @@ def migrate_legacy_lessons(reviews_file=None) -> dict:
     the same session. Nothing else. A row that matches neither is stamped
     __unmapped__ and reported, never attached to a trade on a guess.
 
-    A copy of the file is written first, the rewrite goes through a temp file,
-    and a line the parser cannot read is copied through untouched."""
+    A copy of the file is written first, the rewrite is an atomic publish,
+    and a line the parser cannot read is copied through untouched. The
+    read, the mapping and the rewrite are all inside ONE lock: this
+    republishes the whole file, so a lesson appended while the mapping ran
+    would otherwise be destroyed by it."""
     result = {"ok": True, "mapped": 0, "unmapped": 0, "rows": 0,
               "backup": "", "errors": []}
     reviews_file = reviews_file if reviews_file is not None else REVIEWS_FILE
     if not LESSONS_LOG.exists():
         return result
-    try:
-        rows = _read_reviews(reviews_file)
-        lines = LESSONS_LOG.read_text(encoding="utf-8-sig").splitlines()
-    except OSError as e:
-        result["ok"] = False
-        result["errors"].append(f"cannot read ({e}); nothing written")
-        return result
-
-    by_review, by_text = {}, {}
-    for r in rows:
-        rid = r.get("id")
-        if not rid:
-            continue
-        rev = _review_revision(r) or 1
-        by_review.setdefault(" ".join(_derived_review_line(r).split()),
-                             (str(rid), rev, r))
-        lesson = " ".join(str(r.get("lesson") or "").lower().split())
-        if lesson:
-            by_text.setdefault((str(r.get("date") or ""), lesson),
-                               (str(rid), rev, r))
-
-    kept = []
-    for line in lines:
+    with storage_io.file_lock(LESSONS_LOG) as lk:
+        if not lk.held:
+            result["ok"] = False
+            result["errors"].append(
+                f"lessons.jsonl is held by another writer ({lk.why}); "
+                "nothing written")
+            return result
         try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            kept.append(line)
-            continue
-        result["rows"] += 1
-        if row.get("source_review_id"):
-            kept.append(line)
-            continue
-        review = " ".join(str(row.get("review") or "").split())
-        hit = by_review.get(review)
-        if hit is None:
-            for lesson in row.get("lessons") or []:
-                hit = by_text.get((str(row.get("session") or ""),
-                                   " ".join(str(lesson).lower().split())))
-                if hit:
-                    break
-        if hit is None:
-            row["source_review_id"] = UNMAPPED
-            row["migrated_from"] = "legacy"
-            result["unmapped"] += 1
-        else:
-            rid, rev, r = hit
-            row["source_review_id"] = rid
-            row["review_revision"] = rev
-            row["source_payload_hash"] = (r.get("payload_hash")
-                                          or _payload_hash(r))
-            row["trade_ids"] = row.get("trade_ids") or [rid]
-            row["migrated_from"] = "legacy"
-            result["mapped"] += 1
-        kept.append(json.dumps(row))
+            rows = _read_reviews(reviews_file)
+            lines = LESSONS_LOG.read_text(encoding="utf-8-sig").splitlines()
+        except OSError as e:
+            result["ok"] = False
+            result["errors"].append(f"cannot read ({e}); nothing written")
+            return result
 
-    if not (result["mapped"] or result["unmapped"]):
-        return result
-    try:
+        by_review, by_text = {}, {}
+        for r in rows:
+            rid = r.get("id")
+            if not rid:
+                continue
+            rev = _review_revision(r) or 1
+            by_review.setdefault(" ".join(_derived_review_line(r).split()),
+                                 (str(rid), rev, r))
+            lesson = " ".join(str(r.get("lesson") or "").lower().split())
+            if lesson:
+                by_text.setdefault((str(r.get("date") or ""), lesson),
+                                   (str(rid), rev, r))
+
+        kept = []
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                kept.append(line)
+                continue
+            result["rows"] += 1
+            if row.get("source_review_id"):
+                kept.append(line)
+                continue
+            review = " ".join(str(row.get("review") or "").split())
+            hit = by_review.get(review)
+            if hit is None:
+                for lesson in row.get("lessons") or []:
+                    hit = by_text.get((str(row.get("session") or ""),
+                                       " ".join(str(lesson).lower().split())))
+                    if hit:
+                        break
+            if hit is None:
+                row["source_review_id"] = UNMAPPED
+                row["migrated_from"] = "legacy"
+                result["unmapped"] += 1
+            else:
+                rid, rev, r = hit
+                row["source_review_id"] = rid
+                row["review_revision"] = rev
+                row["source_payload_hash"] = (r.get("payload_hash")
+                                              or _payload_hash(r))
+                row["trade_ids"] = row.get("trade_ids") or [rid]
+                row["migrated_from"] = "legacy"
+                result["mapped"] += 1
+            kept.append(json.dumps(row))
+
+        if not (result["mapped"] or result["unmapped"]):
+            return result
         backup = LESSONS_LOG.with_name(
             LESSONS_LOG.name + "."
             + et_now().strftime("%Y%m%d%H%M%S") + ".pre-migrate")
-        backup.write_text("\n".join(lines) + ("\n" if lines else ""),
-                          encoding="utf-8")
+        saved = storage_io.write_lines(backup, lines)
+        if not saved.ok:  # no copy, no rewrite: it is the only way back
+            result["ok"] = False
+            result["errors"].append(
+                f"backup failed ({saved.status} {saved.error}); "
+                "nothing changed")
+            result["mapped"], result["unmapped"] = 0, 0
+            return result
         result["backup"] = backup.name
-        tmp = LESSONS_LOG.with_suffix(".jsonl.tmp")
-        tmp.write_text("\n".join(kept) + ("\n" if kept else ""),
-                       encoding="utf-8")
-        tmp.replace(LESSONS_LOG)
-    except OSError as e:
-        result["ok"] = False
-        result["errors"].append(f"rewrite failed ({e}); nothing changed")
-        result["mapped"], result["unmapped"] = 0, 0
-    return result
+        wrote = storage_io.write_lines(LESSONS_LOG, kept)
+        if not wrote.ok:
+            result["ok"] = False
+            result["errors"].append(
+                f"rewrite failed ({wrote.status} {wrote.error}); "
+                "nothing changed")
+            result["mapped"], result["unmapped"] = 0, 0
+        return result
 
 
 def main() -> int:

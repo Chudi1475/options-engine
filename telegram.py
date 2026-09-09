@@ -100,7 +100,13 @@ def send_to(chat_id, text: str, ops: bool = False):
 
     ops=True marks an operations note to the owner (a heartbeat, a stand-down
     notice). Those are the ONE thing a standby copy may still send: an
-    instance that has been told to go quiet must still be able to say why."""
+    instance that has been told to go quiet must still be able to say why.
+
+    Untouched by W02, on purpose. It still loops _send_one and still stops at
+    the first error, so news, ops DMs, heartbeats, charts and every other
+    caller behave exactly as before, and the tests that stub _send_one still
+    reach the seam they stub. The journaled path calls send_to_detailed
+    instead, which is where the per part accounting lives."""
     for part in split_message(text):
         err = _send_one(chat_id, part, ops=ops)
         if err:
@@ -115,6 +121,38 @@ def send_to(chat_id, text: str, ops: bool = False):
 # gate lives at the wire where nothing can route around it.
 _standby = (False, "")
 
+# The ownership state this process believes it is in, one of instance_lock's
+# five. Carried here as well as in instance_lock so the wire can refuse a poll
+# without importing the lock module on a hot path, and so /status, the write
+# gates and the tests all read the value the gate itself uses.
+#
+# STARTING is the boot value on purpose: a process that has not established
+# ownership owns nothing, and only ACTIVE may poll getUpdates.
+_ownership = ("STARTING", "process booted, ownership not established")
+
+
+def set_ownership_state(name: str, reason: str = ""):
+    """Record the ownership state AND drive the wire gag from it.
+
+    One call instead of two, because the two used to be able to disagree: the
+    old code un-gagged the wire in a state that did not own the lock at all.
+    Everything that is not ACTIVE is gagged, which covers STARTING (nothing
+    established yet), STANDBY (another copy owns it), RECOVERING (owned, but
+    the saved state is not reconciled, so no new entries and no fresh strategy
+    notifications) and BLOCKED (ownership unknown)."""
+    global _ownership
+    _ownership = (str(name), reason or "")
+    set_standby(str(name) != "ACTIVE", reason)
+
+
+def ownership_state() -> str:
+    """The current state name. The poll gate and /status read this."""
+    return _ownership[0]
+
+
+def ownership_reason() -> str:
+    return _ownership[1]
+
 
 def set_standby(on: bool, reason: str = ""):
     """Gag (or ungag) every outbound call except ops DMs to the owner."""
@@ -125,6 +163,31 @@ def set_standby(on: bool, reason: str = ""):
 def standby() -> tuple:
     """(on, reason). scanner reads this before doing any work at all."""
     return _standby
+
+
+def may_write_shared_state() -> bool:
+    """True when this process may publish the files on the shared volume:
+    positions.json, the sniper ledger, the forward ledger.
+
+    The gate reads the standby flag rather than the state name so a one-shot
+    tool or a test that never runs the ownership machine behaves exactly as it
+    did before. Under the machine the two are the same question, because
+    set_ownership_state gags everything that is not ACTIVE, so STARTING,
+    STANDBY, RECOVERING and BLOCKED all answer False here.
+
+    The hazard is one bug in three files: a copy that does not own the volume
+    writes its own snapshot over the owner's open rows, and those positions
+    stop being watched for their stop, their half and their give back with
+    nobody told.
+
+    A dry run answers False too. ensure_active declares a dry run ACTIVE so it
+    can still answer /status, which left _standby False and therefore made the
+    dry copy an authorized writer of every shared store: it could burn the live
+    sniper day key, open a row in the shared ledger and mark a forward
+    observation selected, all for a trade nobody was ever told about. Its own
+    scratch book (positions_dryrun.json) stops being persisted as a
+    consequence, which costs a dry run nothing it needed."""
+    return not _standby[0] and not _dry_run[0]
 
 
 # A test that wants to exercise the POLLING logic itself (the 409 handling, the
@@ -141,8 +204,60 @@ def allow_test_poll(on: bool):
 
     Only meaningful under BOT_TEST_MODE. Set it True around the polling tests
     and False again in their finally block; anything else that forgets stays
-    guarded."""
+    guarded.
+
+    It also stands in for ownership, because a test driving the parser IS
+    playing the ACTIVE instance. That is not a hole in the ownership gate: the
+    flag does nothing unless test_mode() is on, and test_instance_lifecycle
+    proves the real gate with test_mode switched OFF, walking every non-ACTIVE
+    state against a transport that records every call."""
     _test_poll_ok[0] = bool(on)
+
+
+def may_poll() -> tuple:
+    """(allowed, why_not) for a getUpdates poll.
+
+    Telegram allows exactly one getUpdates consumer per token, and a poll also
+    ACKNOWLEDGES updates through the offset, so a copy that polls without
+    owning the token does not merely duplicate work: it can swallow a command
+    the real owner should have answered. This is the one half of the second
+    consumer problem a local lock can actually enforce, so it is enforced at
+    the wire and not at any call site."""
+    if test_mode() and not _test_poll_ok[0]:
+        return False, "test mode"
+    if _standby[0]:
+        return False, "standby: " + (_standby[1] or "not the owner")
+    if _test_poll_ok[0]:
+        return True, ""
+    if _ownership[0] != "ACTIVE":
+        return False, f"ownership state {_ownership[0]}"
+    return True, ""
+
+
+# Is this process a dry run? Same reasoning as test_mode below, and the same
+# hazard already realised once: the dry check used to live at each call site
+# (notify and notify_intent), the sniper entry path was rewritten to call
+# Service._deliver directly, and _deliver has no such check, so
+# `python scanner.py --dry-run` put real sniper tickets on three real phones
+# using the live bot token. A call site can be forgotten; the wire cannot.
+# Kept as a one element list so scanner can flip it without a global.
+_dry_run = [False]
+
+
+def set_dry_run(on: bool):
+    """Declare this process a dry run, or declare that it is not.
+
+    scanner.Service.__init__ calls it on BOTH branches, so the flag always
+    describes the service that was actually built rather than sticking from an
+    earlier one. Nothing else sets it: a dry run is a whole process, not a
+    per-call mode."""
+    _dry_run[0] = bool(on)
+
+
+def dry_run() -> bool:
+    """True when this process must put nothing on the wire and write no shared
+    store. /status and the tests read the same value the gate uses."""
+    return _dry_run[0]
 
 
 def test_mode() -> bool:
@@ -160,16 +275,61 @@ def test_mode() -> bool:
     return bool(os.environ.get("BOT_TEST_MODE", "").strip())
 
 
-def _send_one(chat_id, text: str, ops: bool = False):
-    """Send one already-fitting message. Returns an error string or None."""
-    if test_mode():
+# A test that wants to exercise the SEND classifier itself (which exceptions
+# mean unknown, which mean failed, what a partial multi-part send reports) has
+# to opt in here, after stubbing the transport. Same shape and same reasoning
+# as allow_test_poll above: the default is off, so a test that forgets stays
+# silently safe rather than silently live, and nothing here does anything at
+# all unless test_mode() is already on.
+_test_send_ok = [False]
+
+
+def allow_test_send(on: bool):
+    """Let this test drive the send path against ITS OWN stubbed transport.
+
+    Only meaningful under BOT_TEST_MODE. Set it True around the delivery tests
+    and False again in their finally block. The standby gate is still checked
+    FIRST and is not affected by this, so a stand-down still drops the send."""
+    _test_send_ok[0] = bool(on)
+
+
+# what the five delivery states are called. Defined here rather than imported
+# from event_journal so the transport does not depend on the journal, and
+# spelled out rather than left to strings at each call site.
+_CONFIRMED, _FAILED, _UNKNOWN = "confirmed", "failed", "unknown"
+
+
+def _send_part(chat_id, text: str, ops: bool = False):
+    """Send ONE already-fitting message and say precisely what happened.
+
+    Returns (status, provider_message_id, error_class, error_text).
+
+    The distinction this exists for: a requests.ReadTimeout or a chunked
+    encoding abort is raised AFTER the request body has gone out, so the
+    message may well be sitting in the recipient's chat. A ConnectionError
+    before the write is a message that certainly did not go. The old code
+    collapsed both into one error string, queued it, and re-broadcast it, which
+    is how an ambiguous acknowledgment became a second copy of a card. A 5xx is
+    the same ambiguity from the server side: Telegram received the request and
+    could not say what it did with it."""
+    if _dry_run[0]:
+        # checked FIRST and with no ops exemption: a dry run that still DMed
+        # the owner is a dry run that texts a real person. Reported as failed
+        # with a named class, so a caller that records per recipient outcomes
+        # writes down "not sent" rather than inventing a delivery.
+        print(f"[dry run, not sent -> {chat_id}] {text[:120]}")
+        return _FAILED, None, "dry_run", None
+    if test_mode() and not _test_send_ok[0]:
         print(f"[test mode, not sent -> {chat_id}] {text[:120]}")
-        return None
+        # not sent, and honest about it. error_text stays None so every legacy
+        # caller sees exactly what it saw before.
+        return _FAILED, None, "test_mode", None
     if _standby[0] and not ops:
         # a second copy of the bot is up and this one lost the lease. dropping
         # here rather than at each call site is the whole point of a wire gate.
         print(f"[standby, not sent -> {chat_id}] {text[:80]}")
-        return f"{chat_id}: standby instance, not sent"
+        return (_FAILED, None, "standby",
+                f"{chat_id}: standby instance, not sent")
     try:
         r = _session.post(
             f"https://api.telegram.org/bot{_token()}/sendMessage",
@@ -182,10 +342,114 @@ def _send_one(chat_id, text: str, ops: bool = False):
                 f"https://api.telegram.org/bot{_token()}/sendMessage",
                 json={"chat_id": chat_id, "text": text}, timeout=10)
         if not r.ok:
-            return f"{chat_id}: {r.status_code} {r.text[:200]}"
+            err = f"{chat_id}: {r.status_code} {r.text[:200]}"
+            if r.status_code >= 500:
+                # the body was written and the server will not say what it did
+                return _UNKNOWN, None, f"http_{r.status_code}", err
+            return _FAILED, None, f"http_{r.status_code}", err
+        mid = None
+        try:
+            mid = (r.json() or {}).get("result", {}).get("message_id")
+        except (ValueError, AttributeError):
+            mid = None
+        return _CONFIRMED, mid, "", None
     except requests.RequestException as e:
-        return f"{chat_id}: {e}"
-    return None
+        return (_UNKNOWN if _ambiguous(e) else _FAILED), None, \
+            type(e).__name__, f"{chat_id}: {e}"
+
+
+def _ambiguous(e) -> bool:
+    """True when the request may already have reached Telegram.
+
+    Read timeouts and chunked encoding aborts happen after the body is on the
+    wire. A connect timeout, a DNS failure or a refused connection happen
+    before it. Astra: uncertain network acknowledgments must remain visible
+    rather than silently retried as new trades, and that is only possible if
+    the two are told apart here."""
+    if isinstance(e, requests.exceptions.ConnectTimeout):
+        return False           # checked first: it is a subclass of both
+    return isinstance(e, (requests.exceptions.ReadTimeout,
+                          requests.exceptions.Timeout,
+                          requests.exceptions.ChunkedEncodingError))
+
+
+def _send_one(chat_id, text: str, ops: bool = False):
+    """Send one already-fitting message. Returns an error string or None.
+
+    Kept exactly as it was for every existing caller; the classification now
+    happens one level down so the journal can see it."""
+    return _send_part(chat_id, text, ops=ops)[3]
+
+
+def send_to_detailed(chat_id, text: str, ops: bool = False, start_part: int = 0):
+    """Send to one chat and report the outcome per PART.
+
+    A three part message whose second part fails used to come back as a single
+    error string with no part count, so a retry re-sent part one to a chat that
+    already had it. start_part resumes at the first unconfirmed part instead.
+
+    An unknown on ANY part makes the whole recipient unknown: once one part may
+    have landed, re-sending the message is no longer a safe repair."""
+    parts = split_message(text)
+    total = len(parts)
+    confirmed = max(0, min(int(start_part or 0), total))
+    mid, error_class, error = None, "", None
+    status = _CONFIRMED
+    for part in parts[confirmed:]:
+        st, m, cls, err = _send_part(chat_id, part, ops=ops)
+        if st == _CONFIRMED:
+            confirmed += 1
+            mid = m if m is not None else mid
+            continue
+        status, error_class, error = st, cls, err
+        break
+    return {"status": status, "parts_total": total, "parts_confirmed": confirmed,
+            "message_id": mid, "error_class": error_class, "error": error}
+
+
+def send_detailed(text: str, only_indices=None, ops: bool = False,
+                  start_parts=None) -> list:
+    """Broadcast and report one record PER RECIPIENT.
+
+    only_indices lets a journal driven retry hit just the recipients that are
+    still unresolved. That is the whole difference from the old retry, which
+    re-broadcast the entire text to every chat, so one recipient with a
+    permanent 403 cost everyone else a duplicate on every pass.
+
+    start_parts is {recipient_index: parts already confirmed}. Without it
+    send_to_detailed's resume was dead code on the production retry path: every
+    caller left start_part at 0, so replaying a three part card whose second
+    part failed re-sent part one to a chat that already had it. The caller
+    supplies it because only the caller knows the text is the same one those
+    parts belonged to.
+
+    The recipient is identified by its index and an opaque ref. The raw chat id
+    is never returned, so it cannot end up in a journal line or a report by
+    accident."""
+    ids = chat_ids()
+    if not ids:
+        raise RuntimeError("TELEGRAM_CHAT_IDS not set, run scanner.py --setup")
+    wanted = list(range(len(ids))) if only_indices is None \
+        else [i for i in only_indices if 0 <= i < len(ids)]
+    out = []
+    for i in wanted:
+        rec = send_to_detailed(ids[i], text, ops=ops,
+                               start_part=int((start_parts or {}).get(i) or 0))
+        rec["recipient_index"] = i
+        rec["recipient_ref"] = _ref(ids[i])
+        out.append(rec)
+    return out
+
+
+def _ref(chat_id) -> str:
+    """The opaque handle for one recipient. Imported lazily so the transport
+    keeps no import-time dependency on the journal, and so a one-shot tool with
+    no data dir can still send."""
+    try:
+        import event_journal
+        return event_journal.recipient_ref(chat_id)
+    except Exception:                                       # noqa: BLE001
+        return ""
 
 
 def _retry_after(r) -> int:
@@ -221,6 +485,11 @@ def _send_photo_raw(chat_id, photo, caption: str = ""):
     """Send one photo. `photo` is bytes (multipart upload) or a Telegram
     file_id string (instant, no upload). Returns (error|None, file_id|None)
     so a broadcast can upload once and reuse the file_id everywhere else."""
+    if _dry_run[0]:
+        # the sniper path fans a marked-up chart out to everyone right after
+        # the ticket, on a code path with no dry check of its own
+        print(f"[dry run, photo not sent -> {chat_id}]")
+        return None, None
     if test_mode():
         print(f"[test mode, photo not sent -> {chat_id}]")
         return None, None
@@ -350,24 +619,22 @@ def get_messages(timeout: int = 0):
     AFTER processing, so a crash mid-message replays it instead of losing
     it — replay is the safe direction here."""
     global _conflict
-    offset = int(config.state_get("tg_offset", 0))
-    if test_mode() and not _test_poll_ok[0]:
-        # The RECEIVE half of the wire guard, which was missing. Every send
-        # path checked test_mode; this one checked only the lease, so an
-        # offline test run polled the live token for real. Two consequences,
-        # both observed on 2026-09-08: Telegram allows one getUpdates consumer
-        # per token, so the cloud bot took a 409 and texted the owner about a
-        # stray instance that was really just the suite running on the desktop.
-        # And worse, a poll ACKNOWLEDGES updates through the offset, so a
-        # command typed while a local suite was running could be swallowed here
-        # and never answered by the copy that was actually on duty. A test may
-        # not text a real person, and it may not take their mail either.
-        return [], offset
-    if _standby[0]:
-        # THE line that removes the 409 at its source. Telegram allows one
-        # getUpdates consumer per token, so the copy that lost the lease must
-        # not poll at all. It has no commands to answer because it never
-        # receives one; the winner answers every command.
+    try:
+        offset = int(config.state_get("tg_offset", 0))
+    except (TypeError, ValueError):
+        # a garbled offset is not a reason to poll from zero and replay a
+        # week of commands. hand back 0 and let the reconcile catch the file.
+        offset = 0
+    ok, why = may_poll()
+    if not ok:
+        # THE line that removes the 409 at its source, now covering all four
+        # non-owning states rather than the standby boolean alone. Every reason
+        # is one of: the offline suite must not touch the live token (that
+        # really happened on 2026-09-08, and a poll ACKNOWLEDGES updates
+        # through the offset, so a command typed during a local test run could
+        # be swallowed here and never answered by the copy on duty), or this
+        # process does not own the token and has no business consuming its
+        # mail.
         return [], offset
     try:
         r = _session.get(
@@ -415,10 +682,15 @@ def ack_offset(max_id: int):
 
 def print_chat_ids():
     """--setup helper: show everyone who has messaged the bot."""
-    if test_mode():
-        # same wire rule as get_messages: this is a real getUpdates poll and it
-        # would fight the live consumer for the token
-        print("[TEST MODE] would poll getUpdates for chat ids")
+    ok, why = may_poll()
+    if not ok:
+        # same wire rule as get_messages, and for the same two reasons: this is
+        # a real getUpdates poll, so it fights the live consumer for the token
+        # and acknowledges updates through the offset. Astra lists "getUpdates
+        # utilities" among the second consumers a file lock cannot see, and
+        # this is one of them, so it asks the same question everything else
+        # asks instead of being trusted because a human typed it.
+        print(f"not polling getUpdates for chat ids: {why}")
         return
     r = requests.get(f"https://api.telegram.org/bot{_token()}/getUpdates", timeout=10)
     r.raise_for_status()

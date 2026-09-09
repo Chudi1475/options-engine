@@ -104,20 +104,21 @@
     "cards.py": "d2672ffce8043a9c",
     "charts.py": "0ad06a90703450be",
     "coach.py": "069052921a0e06da",
-    "config.py": "daeb472de76f6b69",
+    "config.py": "696dcc17da4cbcf7",
     "data_feed.py": "4dac75720cb143ce",
-    "forward_ledger.py": "2ce62c30d8bde320",
+    "event_journal.py": "e5cd08abe00d8305",
+    "forward_ledger.py": "66d29e12d791aca3",
     "fvg.py": "ec370361da78c0d9",
     "gen_docs.py": "af4f6320ebcf9b20",
-    "instance_lock.py": "bb8fd82991f3ef20",
+    "instance_lock.py": "741c6f1164e09e57",
     "intake.py": "c48cda4ba604e36b",
-    "learn.py": "1521fd7f5050cb48",
+    "learn.py": "1c91d9ae225e7e9f",
     "live_params.py": "80fb6fa061a32b62",
     "market_calendar.py": "7b3a7dd50396ca53",
-    "market_tools.py": "a3d35f7970ad46bc",
+    "market_tools.py": "6e4897e013753035",
     "market_tools_check.py": "00d20d01f84d2851",
     "news.py": "ed2bd6368a99dbbb",
-    "positions.py": "5bf4824971c29dc9",
+    "positions.py": "e3139788f7f23b29",
     "quote_check.py": "dbcca48fce1acac4",
     "quotes.py": "6eb4060ccebbf57f",
     "recap.py": "9030e7b288890499",
@@ -125,30 +126,36 @@
     "replay_day.py": "ed3bae704e0c0a4d",
     "rescore_round6_session.py": "268c1fed6fd15184",
     "risk_gate.py": "cfbffbd765e8dd12",
-    "scanner.py": "adaaa2f5080c3b7d",
+    "scanner.py": "b68c9d9fd7086954",
     "scoreboard.py": "69e15b7dff3b44e9",
-    "self_improve.py": "b99ae998d7f2a8d0",
+    "self_improve.py": "0cf331e0e4b36820",
     "send_all_samples.py": "51b401fb1483c64e",
-    "sniper_book.py": "7d4ec5845c61dac2",
+    "sniper_book.py": "3db73db284c0e497",
+    "storage_io.py": "4493e7cc97d8c2ef",
     "strategy.py": "95905dbc3300f73a",
     "strategy_spec.py": "c7d2865979a8bf99",
     "study_wins.py": "87700dec7f0eafde",
-    "telegram.py": "c380f90c3d85954c",
+    "telegram.py": "f0ed0afeb3b71129",
     "test_adduser.py": "18251b1e48e44158",
+    "test_batchA_regressions.py": "479d7ad9a64c587c",
     "test_charts.py": "c6195c475802aa9e",
+    "test_event_recovery.py": "0390903e6e74bf2b",
     "test_exit_styles.py": "ca27ded5d2b2ee12",
     "test_grading_integrity.py": "1713529ebd9737a8",
-    "test_instance_lease.py": "88c23ff7896a0041",
-    "test_ledger_integrity.py": "5bfe72cdfbc5ee7e",
+    "test_instance_lease.py": "e70b86b24ddebf86",
+    "test_instance_lifecycle.py": "cfaed8215330aed1",
+    "test_journal_integrity.py": "6fc4b173282a9a1b",
+    "test_ledger_integrity.py": "da06901b744a5c3d",
     "test_market_calendar.py": "dca8509d4fb1aaa8",
-    "test_no_em_dash.py": "186f0a7cb2878ad9",
+    "test_no_em_dash.py": "1feb0910c4da549d",
     "test_no_hardcoded_stats.py": "f998773bb3931835",
     "test_packet_provenance.py": "dbb08a25adff4c7a",
-    "test_pipeline.py": "74cfaee91aa2c508",
+    "test_pipeline.py": "e74e8e86e7683162",
     "test_review_import.py": "86463d6aac0ed905",
     "test_review_packet_gate.py": "9d691b7c7915d94d",
     "test_review_regressions.py": "9616bd7f8cc60454",
-    "test_session_fixes.py": "aa5984b6262b5c51",
+    "test_session_fixes.py": "e516fb6239d7f2c8",
+    "test_storage_faults.py": "95acca4310f7181e",
     "test_symbols.py": "27d2bd34c4ac0add",
     "truth_check.py": "d50bb4d92f1110f3",
     "window_study.py": "0d4c578ea5591b08"
@@ -202,33 +209,48 @@
   "source": {
     "branch": "master",
     "clean": false,
-    "commit": "dea9be70d5c6e9a58aee02baa4cc549ee36eeddd",
+    "commit": "e254b2ea205149aa83bd81f2ed9ab4873bad13d1",
     "git_available": true,
-    "parent": "7be213f3f4512bc2e0a717427d6838040a83e883",
+    "parent": "dea9be70d5c6e9a58aee02baa4cc549ee36eeddd",
     "uncommitted": [
-      "M  .claude/QUICK_START.md",
-      "A  release_manifest.json",
-      "A  release_manifest.py",
-      "R  test_replay.py -> replay_day.py",
-      "M  self_improve.py",
-      "M  send_all_samples.py",
-      "M  telegram.py",
-      "M  test_no_em_dash.py",
-      "A  test_packet_provenance.py",
-      "M  test_pipeline.py",
-      "M  test_review_regressions.py"
+      "M .gitignore",
+      " M DEPLOY.md",
+      " M config.py",
+      " A event_journal.py",
+      " M forward_ledger.py",
+      " M instance_lock.py",
+      " M learn.py",
+      " M market_tools.py",
+      " M positions.py",
+      " M release_manifest.json",
+      " M scanner.py",
+      " M self_improve.py",
+      " M sniper_book.py",
+      " A storage_io.py",
+      " M telegram.py",
+      "AM test_batchA_regressions.py",
+      " A test_event_recovery.py",
+      " M test_instance_lease.py",
+      "A  test_instance_lifecycle.py",
+      "A  test_journal_integrity.py",
+      " M test_ledger_integrity.py",
+      " M test_no_em_dash.py",
+      " M test_pipeline.py",
+      " M test_session_fixes.py",
+      " A test_storage_faults.py",
+      "?? astra/"
     ]
   },
   "test_inventory": {
     "gate_source": "self_improve.run_checks",
     "note": "inventory only. Pass/fail belongs to a run with its own exit code (Astra 10.3: suites are not test cases).",
-    "suite_count": 16,
+    "suite_count": 21,
     "suites": [
       {
         "declared_cases": 380,
         "exists": true,
         "file": "test_pipeline.py",
-        "sha256_16": "74cfaee91aa2c508"
+        "sha256_16": "e74e8e86e7683162"
       },
       {
         "declared_cases": 18,
@@ -246,7 +268,7 @@
         "declared_cases": 99,
         "exists": true,
         "file": "test_session_fixes.py",
-        "sha256_16": "aa5984b6262b5c51"
+        "sha256_16": "e516fb6239d7f2c8"
       },
       {
         "declared_cases": 121,
@@ -261,10 +283,10 @@
         "sha256_16": "9616bd7f8cc60454"
       },
       {
-        "declared_cases": 29,
+        "declared_cases": 30,
         "exists": true,
         "file": "test_ledger_integrity.py",
-        "sha256_16": "5bfe72cdfbc5ee7e"
+        "sha256_16": "da06901b744a5c3d"
       },
       {
         "declared_cases": 68,
@@ -279,16 +301,16 @@
         "sha256_16": "1713529ebd9737a8"
       },
       {
-        "declared_cases": 87,
+        "declared_cases": 89,
         "exists": true,
         "file": "test_instance_lease.py",
-        "sha256_16": "88c23ff7896a0041"
+        "sha256_16": "e70b86b24ddebf86"
       },
       {
         "declared_cases": null,
         "exists": true,
         "file": "test_no_em_dash.py",
-        "sha256_16": "186f0a7cb2878ad9"
+        "sha256_16": "1feb0910c4da549d"
       },
       {
         "declared_cases": null,
@@ -319,8 +341,38 @@
         "exists": true,
         "file": "test_symbols.py",
         "sha256_16": "27d2bd34c4ac0add"
+      },
+      {
+        "declared_cases": 96,
+        "exists": true,
+        "file": "test_storage_faults.py",
+        "sha256_16": "95acca4310f7181e"
+      },
+      {
+        "declared_cases": 97,
+        "exists": true,
+        "file": "test_instance_lifecycle.py",
+        "sha256_16": "cfaed8215330aed1"
+      },
+      {
+        "declared_cases": 4,
+        "exists": true,
+        "file": "test_event_recovery.py",
+        "sha256_16": "0390903e6e74bf2b"
+      },
+      {
+        "declared_cases": 3,
+        "exists": true,
+        "file": "test_journal_integrity.py",
+        "sha256_16": "6fc4b173282a9a1b"
+      },
+      {
+        "declared_cases": 4,
+        "exists": true,
+        "file": "test_batchA_regressions.py",
+        "sha256_16": "479d7ad9a64c587c"
       }
     ]
   },
-  "tracked_file_count": 149
+  "tracked_file_count": 156
 }

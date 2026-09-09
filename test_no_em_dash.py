@@ -41,7 +41,18 @@ GUARDED = ("scanner.py", "cards.py", "assistant.py", "news.py", "risk_gate.py",
            # test_packet_provenance, which cross-checks this list against every
            # module that can actually reach the wire: a guard list maintained by
            # hand goes stale the first time someone adds a sender.
-           "send_all_samples.py")
+           "send_all_samples.py",
+           # storage_io's status words and console lines are formatted into
+           # text its callers print and that a health record can DM. It never
+           # imports telegram, deliberately, so the SENDERS scan in
+           # test_packet_provenance cannot pull it in: this one has to be
+           # listed by hand.
+           "storage_io.py",
+           # event_journal renders the orphan and unknown-delivery lines that
+           # scanner appends straight into /health, which the owner reads on
+           # his phone. Same case as storage_io: it never imports telegram, on
+           # purpose, so the SENDERS scan cannot find it.
+           "event_journal.py")
 
 EM_DASH = "—"
 

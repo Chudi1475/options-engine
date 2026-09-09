@@ -1,0 +1,43 @@
+{
+  "kind": "measurement",
+  "label": "Wilson 95% lower bounds for every quoted win-rate cohort. Corrects Astra finding A16.",
+  "z": 1.96,
+  "target_r": 0.4,
+  "zero_cost_binary_breakeven_pct": 71.4286,
+  "breakeven_is": "an arithmetic identity 1/(1+r) for a zero cost binary bet, not an observed guarantee for this strategy",
+  "superseded": {
+    "claim": "Wilson 95% lower bound of 43/53 is 67.4%",
+    "correct_value_pct": 68.6413,
+    "source_of_error": "carried forward from an earlier brief where it described a different cohort, and re-quoted without re-derivation"
+  },
+  "cohorts": [
+    {
+      "cohort": "round6_session_oos",
+      "wins": 43,
+      "n": 53,
+      "point_estimate_pct": 81.132,
+      "wilson95_lower_bound_pct": 68.6413,
+      "clears_breakeven": false,
+      "note": "reports/chart_backtest_round6_session.json, out of sample leg. A fixed configuration MEASUREMENT, and it does not meet the 60 trade floor the rounds used for a qualifying validation (Astra A17)."
+    },
+    {
+      "cohort": "live_sniper_resolved",
+      "wins": 32,
+      "n": 49,
+      "point_estimate_pct": 65.306,
+      "wilson95_lower_bound_pct": 51.3109,
+      "clears_breakeven": false,
+      "note": "the 53 ticket live book, resolved rows only: 32 targets and 17 stops. The four session-end flats are excluded from the rate and reported separately, because calling a flat a loss flatters the stop."
+    },
+    {
+      "cohort": "forward_ledger_t04",
+      "wins": 14,
+      "n": 20,
+      "point_estimate_pct": 70.0,
+      "wilson95_lower_bound_pct": 48.1023,
+      "clears_breakeven": false,
+      "note": "the 20 graded historical forward candidates at the 0.4R tier. A DIFFERENT cohort from the live book, and disjoint from it: the forward rows correspond to zero live alerts (Astra A13)."
+    }
+  ],
+  "reading": "No cohort we quote clears the 71.4286% breakeven at its lower bound. The live book's bound is 51.3%. Point estimates above breakeven at these sample sizes are not evidence of an edge."
+}

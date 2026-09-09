@@ -1,0 +1,87 @@
+{
+  "kind": "planning",
+  "not_a_measurement": "these are sample sizes to plan with, not results",
+  "test": "one sided, alpha 0.05, power 0.80, normal approximation",
+  "z_alpha_one_sided_0.05": 1.6448536269514722,
+  "z_beta_0.80": 0.8416212335729143,
+  "target_r": 0.4,
+  "zero_cost_binary_breakeven_pct": 71.4286,
+  "binary_vs_breakeven": [
+    {
+      "alternative_win_rate_pct": 80.0,
+      "null_is_breakeven_pct": 71.4286,
+      "detectable_difference_pct": 8.5714,
+      "n_independent_observations": 159
+    },
+    {
+      "alternative_win_rate_pct": 78.0,
+      "null_is_breakeven_pct": 71.4286,
+      "detectable_difference_pct": 6.5714,
+      "n_independent_observations": 276
+    },
+    {
+      "alternative_win_rate_pct": 75.0,
+      "null_is_breakeven_pct": 71.4286,
+      "detectable_difference_pct": 3.5714,
+      "n_independent_observations": 962
+    }
+  ],
+  "paired_mean_difference": [
+    {
+      "paired_sd_R": 0.5,
+      "declared_useful_improvement_R": 0.1,
+      "n_independent_clusters": 155
+    },
+    {
+      "paired_sd_R": 0.5,
+      "declared_useful_improvement_R": 0.15,
+      "n_independent_clusters": 69
+    },
+    {
+      "paired_sd_R": 0.5,
+      "declared_useful_improvement_R": 0.2,
+      "n_independent_clusters": 39
+    },
+    {
+      "paired_sd_R": 0.75,
+      "declared_useful_improvement_R": 0.1,
+      "n_independent_clusters": 348
+    },
+    {
+      "paired_sd_R": 0.75,
+      "declared_useful_improvement_R": 0.15,
+      "n_independent_clusters": 155
+    },
+    {
+      "paired_sd_R": 0.75,
+      "declared_useful_improvement_R": 0.2,
+      "n_independent_clusters": 87
+    },
+    {
+      "paired_sd_R": 1.0,
+      "declared_useful_improvement_R": 0.1,
+      "n_independent_clusters": 619
+    },
+    {
+      "paired_sd_R": 1.0,
+      "declared_useful_improvement_R": 0.15,
+      "n_independent_clusters": 275
+    },
+    {
+      "paired_sd_R": 1.0,
+      "declared_useful_improvement_R": 0.2,
+      "n_independent_clusters": 155
+    }
+  ],
+  "why_the_real_requirement_is_larger": [
+    "clustering: SPX and SPY co-fire in the same minute, so trades are not independent observations and the effective n is nearer the session count",
+    "incomplete outcomes: unresolved rows are neither losses nor droppable",
+    "costs: breakeven 71.4286% is the zero-cost identity 1/(1+r); any spread, fee or slippage raises the bar the alternative must clear",
+    "selection: any target, symbol or strike mapping chosen after looking is exploratory and needs its own reserved evidence"
+  ],
+  "reconciles_with_spec": {
+    "astra_said_159_for_80pct": true,
+    "astra_said_276_for_78pct": true,
+    "astra_said_962_for_75pct": true
+  }
+}

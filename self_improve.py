@@ -87,7 +87,7 @@ Hard rules:
   .venv/Scripts/python.exe -m py_compile, then run
   .venv/Scripts/python.exe test_pipeline.py, test_adduser.py,
 test_no_hardcoded_stats.py, test_session_fixes.py, test_market_calendar.py,
-test_instance_lease.py and test_no_em_dash.py.
+test_instance_lease.py, test_instance_lifecycle.py and test_no_em_dash.py.
 All must pass. If you change a rule number, change
 it in config.py and let strategy_spec render it: never type a stat into a card,
 a prompt or a doc, and run `python gen_docs.py` after a config change.
@@ -186,7 +186,27 @@ def run_checks(files: list) -> bool:
                      "test_grading_integrity.py", "test_instance_lease.py",
                      "test_no_em_dash.py", "test_review_packet_gate.py",
                      "test_packet_provenance.py", "test_charts.py",
-                     "test_exit_styles.py", "test_symbols.py"):
+                     "test_exit_styles.py", "test_symbols.py",
+                     # W05. Astra W00: a new test file the release command
+                     # never executes cannot establish a fix. No parentheses
+                     # in this tuple, ever: release_manifest._gate_tests parses
+                     # it with a non-greedy stop at the first close bracket.
+                     "test_storage_faults.py",
+                     # W01, the five-state ownership contract.
+                     "test_instance_lifecycle.py",
+                     # W02, durable events: crash at every persist, send and
+                     # link boundary.
+                     "test_event_recovery.py",
+                     # W02 follow-up, the journal's READS: an unreadable daily
+                     # file, a stale index, an intent older than the retention
+                     # window, and an attempt nobody ever heard back from.
+                     "test_journal_integrity.py",
+                     # The adversarial pass over the W05/W01/W02 batch. A green
+                     # suite hid thirteen defects in scanner, telegram and
+                     # storage_io: the dry run wire, the news_seen brick, the
+                     # missing ACTIVE exit edges, the unscheduled replay and a
+                     # delivered card with no tracked position behind it.
+                     "test_batchA_regressions.py"):
             r = subprocess.run([PYEXE, test], cwd=REPO, timeout=600,
                                capture_output=True, text=True, errors="replace")
             if r.returncode != 0:

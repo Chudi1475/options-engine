@@ -11,6 +11,10 @@ import os
 import threading
 from pathlib import Path
 
+import storage_io  # stdlib only, and it imports nothing from this repo, so a
+                   # ledger or a lock can depend on it without dragging the
+                   # transport or the data dir in at import time
+
 REPO_DIR = Path(__file__).parent
 _STATE_LOCK = threading.RLock()  # serialize state.json read-modify-write across
                                  # the main loop and the news-watcher thread
@@ -253,30 +257,56 @@ def _quarantine_state(reason: str = "") -> None:
 _LAST_GOOD = {}  # last successfully-parsed state, served to readers over a hiccup
 
 
+def state_health() -> str:
+    """Whether state.json can be trusted right now, WITHOUT touching it.
+
+    Returns "ok" (parsed, or genuinely absent, which a fresh volume is),
+    "unreadable" (present and the OS will not hand it over) or "corrupt"
+    (present and the bytes do not parse).
+
+    Read only on purpose, and separate from load_state for that one reason.
+    load_state QUARANTINES a corrupt file the first time it sees one, which
+    resets morning_sent, recap_sent, weekly_sent, learn_sent and every other
+    once a day guard in the same motion and can re-send a day of reports with
+    nobody told. An ownership check has to be able to ASK the question before
+    the process is allowed to send anything, without the asking being the
+    thing that causes the damage. Nothing about the exit thresholds or the
+    gate lives here; this is a file health probe."""
+    res = storage_io.read_json(STATE_FILE)
+    if res.status == "missing":
+        return "ok"
+    if res.status == "ok":
+        return "ok" if isinstance(res.value, dict) else "corrupt"
+    return res.status  # "unreadable" or "corrupt", already the right words
+
+
 def load_state(strict: bool = False) -> dict:
     global _LAST_GOOD
-    if STATE_FILE.exists():
-        try:
-            parsed = json.loads(STATE_FILE.read_text(encoding="utf-8-sig"))
-            if isinstance(parsed, dict):
-                _LAST_GOOD = parsed
-            return parsed
-        except json.JSONDecodeError as e:
-            # Corrupt/torn CONTENT won't heal itself. If we returned {} here, the
-            # next state_set would persist {only_that_key} and wipe everything
-            # else (requests, account_value, tg_offset, dedup keys...). Move the
-            # bad file aside once so a later write rebuilds clean state.
-            _quarantine_state(f"corrupt ({e})")
-            return {}
-        except OSError as e:
-            # The file IS there but momentarily unreadable (mounted-volume
-            # hiccup — save_state anticipates the same on its write side). On a
-            # write path, refuse rather than clobber good-but-unreadable state.
-            # On a read path serve the last-good snapshot (not {}), so a one-cycle
-            # hiccup can't make a dedup check ("recap already sent?") re-fire.
-            if strict:
-                raise _StateUnavailable(str(e))
-            return dict(_LAST_GOOD)
+    # storage_io tells the four answers apart: parsed, absent, present but
+    # unopenable, present but unparseable. Collapsing the last two is what the
+    # branches below have always been working around by hand.
+    res = storage_io.read_json(STATE_FILE)
+    if res.status == "ok":
+        if isinstance(res.value, dict):
+            _LAST_GOOD = res.value
+        return res.value
+    if res.status == "corrupt":
+        # Corrupt/torn CONTENT won't heal itself. If we returned {} here, the
+        # next state_set would persist {only_that_key} and wipe everything
+        # else (requests, account_value, tg_offset, dedup keys...). Move the
+        # bad file aside once so a later write rebuilds clean state.
+        _quarantine_state(f"corrupt ({res.error})")
+        return {}
+    if res.status == "unreadable":
+        # The file IS there but momentarily unreadable (mounted-volume
+        # hiccup, save_state anticipates the same on its write side). On a
+        # write path, refuse rather than clobber good-but-unreadable state.
+        # On a read path serve the last-good snapshot (not {}), so a one-cycle
+        # hiccup can't make a dedup check ("recap already sent?") re-fire.
+        # NEVER quarantined: an unreadable file is not a proven bad one.
+        if strict:
+            raise _StateUnavailable(res.error)
+        return dict(_LAST_GOOD)
     boot = os.environ.get("BOOTSTRAP_STATE", "").strip()
     if boot:  # first boot on a fresh volume: seed state (e.g. so a new cloud
         try:  # deploy doesn't re-send reports the local bot already sent)
@@ -288,30 +318,18 @@ def load_state(strict: bool = False) -> dict:
     return {}
 
 
-def save_state(state: dict) -> None:
-    # unique temp per thread so two concurrent savers never clobber one shared
-    # tmp file (which would publish a torn state.json or raise FileNotFoundError)
+def save_state(state: dict) -> bool:
+    """Publish state.json through the shared protocol. Returns whether the
+    bytes landed: a lost write of a dedup key (recap_sent/morning_sent) would
+    duplicate a report, so it must never fail silently. The old version
+    retried a denied replace exactly once, which is not enough for the
+    WinError 5 that hits this machine about one run in ten."""
     with _STATE_LOCK:
-        tmp = STATE_FILE.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-        try:
-            tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-            try:
-                tmp.replace(STATE_FILE)
-            except (PermissionError, FileNotFoundError):  # mid-read, or the
-                import time                                # volume hiccuped
-                time.sleep(0.2)
-                try:
-                    tmp.replace(STATE_FILE)
-                except (PermissionError, FileNotFoundError) as e:
-                    # don't fail silently — a lost write of a dedup key
-                    # (recap_sent/morning_sent) would duplicate a report
-                    print(f"save_state: could NOT persist state.json: {e}")
-        finally:
-            try:  # never leave an orphan temp file on a failed publish
-                if tmp.exists():
-                    tmp.unlink()
-            except OSError:
-                pass
+        res = storage_io.write_json(STATE_FILE, state, indent=2)
+        if not res.ok:
+            print(f"save_state: could NOT persist {STATE_FILE.name}: "
+                  f"{res.status} {res.error}")
+        return bool(res.ok)
 
 
 def state_get(key, default=None):
@@ -319,7 +337,17 @@ def state_get(key, default=None):
 
 
 def state_set(key, value) -> None:
-    with _STATE_LOCK:  # load -> mutate -> save is one atomic critical section
+    # load -> mutate -> save is ONE critical section, and it now needs two
+    # locks to be one. _STATE_LOCK is a threading.RLock: it serialises the
+    # main loop against the news-watcher thread and says nothing whatever
+    # about a second process on the same volume. The file lock is what covers
+    # that, and it has to be held across the whole transaction rather than
+    # just the publish (Astra section 3).
+    with _STATE_LOCK, storage_io.file_lock(STATE_FILE) as lk:
+        if not lk.held:
+            print(f"state_set({key!r}): state.json is held by another writer "
+                  f"({lk.why}); write skipped rather than raced")
+            return
         try:
             s = load_state(strict=True)
         except _StateUnavailable as e:  # don't overwrite real state we can't read
@@ -334,8 +362,12 @@ def state_update(key, fn, default=None) -> None:
     the whole get->modify->set under one lock. Use this (not state_get then
     state_set) whenever two threads mutate the same key — e.g. the main loop and
     the news-watcher both touching pending_sends — so neither loses the other's
-    update."""
-    with _STATE_LOCK:
+    update. Both locks, for the reason state_set names."""
+    with _STATE_LOCK, storage_io.file_lock(STATE_FILE) as lk:
+        if not lk.held:
+            print(f"state_update({key!r}): state.json is held by another "
+                  f"writer ({lk.why}); write skipped rather than raced")
+            return
         try:
             s = load_state(strict=True)
         except _StateUnavailable as e:  # don't overwrite real state we can't read
@@ -343,6 +375,131 @@ def state_update(key, fn, default=None) -> None:
             return
         s[key] = fn(s.get(key, default))
         save_state(s)
+
+
+# ---------------------------------------------------------------------------
+# owner-identified reservations
+# ---------------------------------------------------------------------------
+# Astra A06, and it replaces the compensating release that shipped yesterday:
+# "Releasing the day key makes the multi step sniper commit atomic" is WRONG.
+# Compensation is not a transaction. It can race with a newer claimant or
+# release a key after an ambiguous successful send. The fix is not a better
+# release, it is an OWNER on the reservation plus explicit lifecycle states, so
+# a release can only ever remove the claim the same operation made.
+#
+# Shape: {key: {"op": <decision id>, "state": "claimed"|"committed",
+#               "at": iso, ...extra}}
+# A legacy plain string ("09:52") is what is on the live volume today. It reads
+# as COMMITTED by an unknown op, so nothing can release it: an old reservation
+# whose owner cannot be established is not an unclaimed one.
+RESERVED_CLAIMED = "claimed"
+RESERVED_COMMITTED = "committed"
+
+
+def _et_stamp() -> str:
+    """ET wall clock for a reservation's audit field. Same ET-not-UTC reason as
+    _et_today: the key itself is an ET day."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return f"{datetime.now(ZoneInfo('America/New_York')):%Y-%m-%d %H:%M:%S}"
+
+
+def _reservation(value) -> dict:
+    """One stored entry, normalised. A legacy string is committed-by-unknown."""
+    if isinstance(value, dict):
+        out = dict(value)
+        out.setdefault("state", RESERVED_COMMITTED)
+        out.setdefault("op", None)
+        return out
+    if value is None:
+        return None
+    return {"op": None, "state": RESERVED_COMMITTED, "legacy": str(value)}
+
+
+def state_reservation(group: str, key: str):
+    """The current holder of one reservation, or None. Read only."""
+    return _reservation((state_get(group, {}) or {}).get(key))
+
+
+def _reserve_txn(group, fn):
+    """Read, modify and write one reservation group in ONE critical section,
+    under both locks. state_update would do the read-modify-write, but the
+    caller also needs the ANSWER (did I get it), and a separate read after the
+    write is a second race, so the transaction is spelled out here."""
+    with _STATE_LOCK, storage_io.file_lock(STATE_FILE) as lk:
+        if not lk.held:
+            print(f"reservation on {group!r}: state.json is held by another "
+                  f"writer ({lk.why}); refusing rather than racing")
+            return False
+        try:
+            s = load_state(strict=True)
+        except _StateUnavailable as e:
+            print(f"reservation on {group!r}: state.json unreadable, refused: {e}")
+            return False
+        cur = s.get(group)
+        cur = dict(cur) if isinstance(cur, dict) else {}
+        ok, new = fn(cur)
+        if not ok:
+            return False
+        s[group] = new
+        return bool(save_state(s))
+
+
+def state_reserve(group: str, key: str, op_id: str, extra=None,
+                  keep=None) -> bool:
+    """Claim one key for one operation. True only if THIS op now holds it.
+
+    Refuses when anyone else holds it, in any lifecycle state, and refuses a
+    legacy string outright. `keep(key) -> bool` prunes the group in the same
+    transaction, so the daily prune of yesterday's sniper keys cannot land as a
+    separate write that a concurrent claim then loses."""
+    def _fn(cur):
+        if keep is not None:
+            cur = {k: v for k, v in cur.items() if keep(k)}
+        held = _reservation(cur.get(key))
+        if held is not None and held.get("op") != op_id:
+            return False, cur
+        entry = {"op": str(op_id), "state": RESERVED_CLAIMED,
+                 "at": _et_stamp()}
+        if held is not None and held.get("state") == RESERVED_COMMITTED:
+            return False, cur          # our own, already terminal; not re-claimable
+        entry.update(extra or {})
+        cur[key] = entry
+        return True, cur
+    return bool(_reserve_txn(group, _fn))
+
+
+def state_commit_owned(group: str, key: str, op_id: str) -> bool:
+    """Move this op's own claim to the terminal state. After this the key is
+    never released by anyone: a request that was put on the wire may have
+    arrived, and an ambiguous delivered request is not an unsent opportunity."""
+    def _fn(cur):
+        held = _reservation(cur.get(key))
+        if held is None or held.get("op") != op_id:
+            return False, cur
+        held["state"] = RESERVED_COMMITTED
+        cur[key] = held
+        return True, cur
+    return bool(_reserve_txn(group, _fn))
+
+
+def state_release_owned(group: str, key: str, op_id: str) -> bool:
+    """Hand back ONLY this op's own still-claimed reservation.
+
+    Two conditions, both load bearing. The op must match, so a stand-down
+    cannot delete a newer claimant's key (that is the A06 defect: the old code
+    dropped whatever sat under the key). And the state must still be claimed,
+    so a reservation that has already been committed, which is what any send
+    attempt makes it, stays put."""
+    def _fn(cur):
+        held = _reservation(cur.get(key))
+        if held is None:
+            return False, cur
+        if held.get("op") != op_id or held.get("state") != RESERVED_CLAIMED:
+            return False, cur
+        cur.pop(key, None)
+        return True, cur
+    return bool(_reserve_txn(group, _fn))
 
 
 def account_value():

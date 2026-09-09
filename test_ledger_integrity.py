@@ -163,11 +163,24 @@ check("R01b: an observation with no ticket still returns nothing",
 # --------------------------------------------------------------------------
 reset()
 _src_mt = (REPO / "market_tools.py").read_text(encoding="utf-8")
-check("R01c: market_tools keeps the id record_candidate returns",
-      "_cid = _fl.record_candidate(" in _src_mt, "call site still discards it")
+# This used to require "_cid = _fl.record_candidate(", i.e. that the reader
+# KEEP whatever the recorder handed back. W02 (Astra's O2) showed that is one
+# defect short: when the ledger write failed the recorder returned None, the
+# reader kept nothing, and the ticket fired carrying no candidate id at all,
+# unlinkable for good. So the requirement is now the stronger one, and the
+# original intent of R01c is untouched: the read still carries an id, it is
+# just no longer contingent on a file write having landed.
+check("R01c: market_tools mints the candidate id in the READ, not from the "
+      "recorder's return value",
+      "candidate_id_for_ticket" in _src_mt
+      and "_cid = _fl.record_candidate(" not in _src_mt,
+      "the id is still contingent on the ledger write landing")
 check("R01c: market_tools hands the id to the read's fvg payload",
       'fvg_info["candidate_id"] = _cid' in _src_mt,
       "no carrier for the id on the read result")
+check("R01c: the same id is handed down to the recorder, so the ticket and "
+      "its ledger row cannot carry two different ones",
+      "candidate_id=_cid" in _src_mt)
 
 _src_sc = (REPO / "scanner.py").read_text(encoding="utf-8")
 check("R01c: the scanner reads the id off the read it is about to alert on",
@@ -548,9 +561,18 @@ guard("cohort: on a repaired day only the SELECTED observation is counted",
 # --------------------------------------------------------------------------
 reset()
 _fl_src = (REPO / "forward_ledger.py").read_text(encoding="utf-8")
+# W05 moved the publish into storage_io, so this is no longer a property of
+# forward_ledger's own source. Checked where it now lives, and BEHAVIOURALLY
+# rather than by grep: two staging names for the same target must differ, and
+# they must carry this process's id.
+import storage_io  # noqa: E402
+_t1 = storage_io._tmp_for(forward_ledger.LEDGER).name
+_t2 = storage_io._tmp_for(forward_ledger.LEDGER).name
 check("write: the publish temp is qualified per process and thread",
-      "getpid()" in _fl_src and "get_ident()" in _fl_src,
-      "every writer still shares one temp file name")
+      "storage_io.write_jsonl_all" in _fl_src
+      and _t1 != _t2 and str(_bot_test_os.getpid()) in _t1
+      and _t1.endswith(".tmp"),
+      f"every writer still shares one temp file name: {_t1} vs {_t2}")
 forward_ledger._write_all([{"event_id": "x", "date": "2026-09-08"}])
 _orphans = [p.name for p in Path(_TMP).glob("sniper_forward*.tmp")]
 check("write: no orphan temp file is left behind", not _orphans, str(_orphans))

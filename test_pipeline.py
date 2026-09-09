@@ -20,8 +20,18 @@ from zoneinfo import ZoneInfo
 
 import cards
 import config
-import positions as poslib
-from positions import Position, PositionBook
+
+# W02 put a durable event journal under DATA_DIR/events and the exit path now
+# appends to it. DATA_DIR defaults to the REPO, so without this the suite would
+# write real journal lines into the production data dir. Every other path in
+# this file already reaches its files through config.DATA_DIR by name, so
+# repointing it here covers those too.
+import pathlib as _pathlib  # noqa: E402
+import tempfile as _tempfile  # noqa: E402
+config.DATA_DIR = _pathlib.Path(_tempfile.mkdtemp(prefix="kelbot_pipeline_"))
+
+import positions as poslib  # noqa: E402
+from positions import Position, PositionBook  # noqa: E402
 
 ET = ZoneInfo("America/New_York")
 TODAY = date(2026, 6, 11)
@@ -2137,9 +2147,13 @@ try:
     telegram.send_to = lambda cid, text, ops=False: dm.append((str(cid), text)) or None
     sess.resp = _Resp(409, _CONFLICT_BODY)
     svc.handle_commands()
+    # "another consumer", not "another copy": a 409 proves competing requests
+    # and says nothing about where they come from, or whether the other end is
+    # even a copy of this program (Astra A04). The warning was reworded to stop
+    # asserting a location it cannot know, so this asserts the new wording.
     check("409: owner warned about the second instance",
           len(dm) == 1 and dm[0][0] == "111"
-          and "another copy" in dm[0][1] and "409" in dm[0][1],
+          and "another consumer" in dm[0][1] and "409" in dm[0][1],
           f"got {dm!r}")
     svc.handle_commands()
     check("409: same-day repeat polls do not re-warn", len(dm) == 1)
@@ -2511,6 +2525,13 @@ def _monitor_svc(spot, sigma):
     svc.sigma = lambda t: sigma
     svc.notified = []
     svc.notify = lambda card: svc.notified.append(card) or []
+    # W02: the exit path journals its intent and then sends through
+    # notify_intent. This object never ran __init__, so it has no .dry and no
+    # health plumbing; capture the card the same way notify is captured. The
+    # journal write itself is real and lands in the temp DATA_DIR above.
+    svc.notify_intent = lambda card, intent: svc.notified.append(card) or []
+    svc._journal_down = lambda why: None
+    svc._journal_ok = lambda: None
     return svc
 
 

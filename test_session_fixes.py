@@ -27,6 +27,15 @@ import pandas as pd
 
 import config
 
+# W02 put a durable event journal under DATA_DIR/events, and the exit paths
+# this file drives now append to it. DATA_DIR defaults to the REPO, so without
+# this the suite would write real journal lines into the production data dir.
+# Everything below already reaches its files through config.DATA_DIR by name,
+# so repointing it here covers the ledgers and state files too.
+import pathlib as _pathlib  # noqa: E402
+import tempfile as _tempfile  # noqa: E402
+config.DATA_DIR = _pathlib.Path(_tempfile.mkdtemp(prefix="kelbot_session_"))
+
 ET = ZoneInfo("America/New_York")
 failures = []
 
@@ -463,6 +472,12 @@ try:
     svc2 = scanner.Service.__new__(scanner.Service)
     texts2 = []
     svc2.notify = lambda text: texts2.append(text)
+    # W02: the sniper exit journals its notification intent and then sends
+    # through notify_intent. This object never ran __init__, so it has no .dry
+    # and no book; capture the text the same way notify is captured.
+    svc2.notify_intent = lambda text, intent: texts2.append(text) or []
+    svc2._journal_down = lambda why: None
+    svc2._journal_ok = lambda: None
     sniper_book.open_trade("TSLA", "TSLA", "SELL", 300.0, 302.0, 299.2,
                            "2026-08-21", "15:55:20", entry_ts=fri)
     svc2._step_sniper("TSLA", 301.0, mon, mon_bars)

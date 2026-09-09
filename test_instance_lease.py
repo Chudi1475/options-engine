@@ -380,7 +380,19 @@ check("L7 a garbage heartbeat does not crash the renderer",
                                                  "heartbeat_ts": "nonsense"}))
 
 # ---------------------------------------------------------------------------
-print("\n--- L8. no lock primitive means keep alerting, not go silent ---")
+print("\n--- L8. no lock primitive means BLOCKED, not alert anyway ---")
+
+# REWRITTEN for the five-state ownership contract (Astra A03, decision 2).
+# This block used to assert the opposite of what it asserts now: that a
+# platform with no lock primitive kept alerting with the wire un-gagged, on the
+# argument that a silent bot is worse than a duplicate card. Astra overturned
+# that as an unsafe default, because unknown ownership is not exclusive
+# ownership, and the same code rejected blind resume (L13) for exactly the
+# reason it accepted this. The two assertions retired here are the old
+# "ensure_active is True" and "the wire is NOT gagged"; everything else in the
+# block, including the once-a-day damping and the errno classification below,
+# is unchanged and still passing. test_instance_lifecycle section C is the full
+# replacement coverage.
 
 _saved_m, _saved_f = instance_lock._msvcrt, instance_lock._fcntl
 instance_lock.release()
@@ -394,10 +406,13 @@ try:
     check("L8 try_acquire reports unavailable, not contended",
           instance_lock.try_acquire() == "unavailable")
     now = scanner.et_now()
-    check("L8 the bot keeps running when the platform has no lock",
-          degraded.ensure_active(now) is True)
-    check("L8 the wire is NOT gagged in the degraded state",
-          telegram.standby()[0] is False)
+    check("L8 a platform with no lock does NOT become active",
+          degraded.ensure_active(now) is False)
+    check("L8 the wire is gagged, because ownership is unknown",
+          telegram.standby()[0] is True)
+    check("L8 the state says BLOCKED",
+          telegram.ownership_state() == instance_lock.BLOCKED,
+          telegram.ownership_state())
     check("L8 the owner is told once", len(dms) == 1, str(len(dms)))
     degraded.ensure_active(now)
     check("L8 and is not told again every cycle", len(dms) == 1, str(len(dms)))
@@ -558,9 +573,15 @@ def _counting_reload():
 
 
 standby_copy.reload_tunables = _counting_reload
-telegram.set_standby(True, "test")
 _real_try = instance_lock.try_acquire
 try:
+    # stand the copy down through the REAL path rather than by flipping the
+    # wire flag by hand. The promotion ceremony keys on having actually stood
+    # down, not on the gag, because the gag is now also on during STARTING and
+    # a fresh boot must not announce itself as a promotion every restart.
+    instance_lock.try_acquire = lambda *a, **k: "contended"
+    check("L11 the copy stands down while the other one holds the lock",
+          standby_copy.ensure_active(scanner.et_now()) is False)
     instance_lock.try_acquire = lambda *a, **k: "acquired"
     check("L11 the copy promotes the moment the lock frees",
           standby_copy.ensure_active(scanner.et_now()) is True)
@@ -580,7 +601,11 @@ check("L11 the first save after promotion does not erase the winner's row",
       "A-0952" in on_disk11, str(on_disk11))
 check("L11 the promotion also re-reads the day's tunables",
       reloads["n"] >= 1, str(reloads["n"]))
-check("L11 the owner is told it promoted", len(promo_dms) == 1, str(promo_dms))
+# by CONTENT, not by total: standing down for real (above) also DMs the owner,
+# same reason L9 counts its wedge warning that way.
+check("L11 the owner is told it promoted",
+      len([t for t in promo_dms if "promoted to active" in t]) == 1,
+      str(promo_dms))
 
 # ---------------------------------------------------------------------------
 print("\n--- L12. a standby copy mutates no shared state, only the wire ---")
@@ -666,8 +691,14 @@ try:
     telegram.set_standby(True, "test")
     got12 = forward_ledger.mark_selected(cid12, fired_at_et=scanner.et_now(),
                                          position_id="p12")
+    # `is False` before W02, falsy-with-a-reason after it. mark_selected now
+    # returns a MarkResult because replay has to tell a MISSING observation row
+    # (an orphan nobody can repair) from a REFUSED write (a disk fault a retry
+    # fixes) from a stand-down. It is still falsy exactly when the link did not
+    # land, so the refusal this check exists for is unchanged.
     check("L12 forward_ledger.mark_selected refuses to write in standby",
-          got12 is False, str(got12))
+          not got12 and getattr(got12, "status", "")
+          == forward_ledger.MarkResult.STANDING_BY, str(got12))
     check("L12 the forward ledger is byte-identical after the standby copy ran",
           forward_ledger.LEDGER.read_bytes() == before12)
 finally:
@@ -725,15 +756,19 @@ try:
           l13.ensure_active(now13) is False)
     check("L13 and stays gagged", telegram.standby()[0] is True)
 
-    # a copy that has observed NOTHING yet is a different case: failing open at
-    # boot is what keeps a volume with no lock primitive from bricking the bot.
+    # REWRITTEN with L8, same reversal. A copy that has observed nothing yet
+    # used to be treated as a different case, and failed OPEN on this fault on
+    # the grounds that a boot has seen no holder. It is the same question with
+    # the same answer: the read failed, so ownership is unknown, so it is not
+    # ownership. The two retired assertions here are the old "a fresh boot
+    # still fails open" and "a fresh boot is not gagged".
     telegram.set_standby(False)
     booting13 = scanner.Service()
     booting13.dry = False
     booting13._hb_owner = lambda text: None
-    check("L13 a fresh boot still fails open on the same fault",
-          booting13.ensure_active(now13) is True)
-    check("L13 and a fresh boot is not gagged", telegram.standby()[0] is False)
+    check("L13 a fresh boot does NOT fail open on the same fault",
+          booting13.ensure_active(now13) is False)
+    check("L13 and a fresh boot is gagged too", telegram.standby()[0] is True)
 
     # the normal restart path, with the fault cleared: the winner is torn down,
     # the kernel drops its lock, and the mute copy promotes on its next tick

@@ -18,13 +18,11 @@ must never break a read or an alert.
 import contextlib
 import json
 import math
-import os
-import threading
-import time as _time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import config
+import storage_io
 
 ET = ZoneInfo("America/New_York")
 LEDGER = config.DATA_DIR / "sniper_forward.jsonl"
@@ -32,119 +30,53 @@ LEDGER = config.DATA_DIR / "sniper_forward.jsonl"
 # ---------------------------------------------------------------------------
 # serialising the read-modify-write
 # ---------------------------------------------------------------------------
-# Two layers, because the clobber has two shapes. The RLock stops the threads
-# INSIDE this process (the sniper watch, the brain reply workers, the main
-# loop) from interleaving a read with someone else's rewrite. The OS file lock
-# on a sidecar stops a SECOND process (a coach run, an ad-hoc script against
-# the same volume) from doing the same thing.
+# One lock, from storage_io, covering the whole read-modify-write rather than
+# just the publish at the end of it. It layers a per-file in-process RLock
+# under an OS lock on a sidecar beside the ledger, so the threads in this
+# process (the sniper watch, the brain reply workers, the main loop) and a
+# SECOND process on the same volume (a coach run, an ad-hoc script) are both
+# serialised, and it releases on process death because the OS holds it.
 #
-# Platform: msvcrt on Windows, fcntl on the Linux container the worker runs in.
-# Both are stdlib, so neither adds a requirement, and both are released by the
-# OS when the handle or the process dies, so a crash cannot leave the recorder
-# wedged. A sentinel lock FILE would survive a crash and wedge it forever,
-# which is why one is not used here.
-try:
-    import fcntl as _fcntl
-except ImportError:                    # Windows
-    _fcntl = None
-try:
-    import msvcrt as _msvcrt
-except ImportError:                    # Linux
-    _msvcrt = None
-
-_LEDGER_LOCK = threading.RLock()
-_DEPTH = threading.local()             # so a nested _locked() cannot deadlock
+# What changed and why: the old version computed
+# `outermost = got and depth == 0`, so when the in-process RLock timed out no
+# OS lock was attempted AT ALL and the whole-file rewrite then ran completely
+# unserialised, with one warning. Failing open on the LOCK is not the same
+# thing as failing open on the WRITE. The contract that a ledger hiccup never
+# breaks a read or an alert is now kept by handing the caller a lock it can
+# see is unheld: readers carry on, and _write_all refuses to truncate.
 _LOCK_BUDGET_S = 0.75                  # never a latency source on a live scan
 _LOCK_WARNED = [False]
 
 
 def _lock_path():
     """The sidecar, derived from the CURRENT LEDGER value. Tests repoint
-    LEDGER at a temp dir, so this can never be captured at import."""
-    return LEDGER.with_suffix(".lock")
+    LEDGER at a temp dir, so this can never be captured at import.
 
-
-def _os_lock(path, budget_s=_LOCK_BUDGET_S):
-    """A non-blocking cross-process lock with a short bounded retry. Returns
-    an open fd, or None when the budget ran out. Never blocks for long: the
-    caller is often the sniper watch thread mid-scan.
-
-    msvcrt's blocking mode retries for ten seconds before it gives up, which
-    would stall a scan, so the non-blocking flavour is used on both platforms
-    and the waiting is done here where the budget is visible."""
-    fd = os.open(str(path), os.O_RDWR | os.O_CREAT)
-    deadline = _time.monotonic() + budget_s
-    while True:
-        try:
-            os.lseek(fd, 0, os.SEEK_SET)
-            if _msvcrt is not None:
-                _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
-            elif _fcntl is not None:
-                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-            else:                      # neither primitive: the RLock alone
-                os.close(fd)
-                return None
-            return fd
-        except OSError:
-            if _time.monotonic() >= deadline:
-                os.close(fd)
-                return None
-            _time.sleep(0.01)
-
-
-def _os_unlock(fd):
-    try:
-        os.lseek(fd, 0, os.SEEK_SET)
-        if _msvcrt is not None:
-            _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
-        elif _fcntl is not None:
-            _fcntl.flock(fd, _fcntl.LOCK_UN)
-    except OSError:
-        pass
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+    name + '.lock', not with_suffix: with_suffix turned sniper_forward.jsonl
+    into sniper_forward.lock, a name every sibling with the same stem would
+    have collided on."""
+    return storage_io.lock_path(LEDGER)
 
 
 def _warn_once(why: str):
     if not _LOCK_WARNED[0]:
         _LOCK_WARNED[0] = True
-        print(f"forward_ledger: proceeding UNLOCKED ({why}). Concurrent "
-              "writes may be lost until this is resolved.")
+        print(f"forward_ledger: ledger lock UNAVAILABLE ({why}). Reads carry "
+              "on; a whole-file rewrite will refuse until this is resolved.")
 
 
 @contextlib.contextmanager
 def _locked():
-    """Serialise a ledger read-modify-write. FAILS OPEN by design: the module
-    contract is that a ledger hiccup never breaks a read or an alert, so a
-    lock that cannot be taken inside the budget logs once and proceeds. That
-    degrades to the old behaviour, never to a dropped observation and never
-    to a stalled scan."""
-    got = _LEDGER_LOCK.acquire(timeout=_LOCK_BUDGET_S)
-    if not got:
-        _warn_once("in-process lock busy")
-    outermost = got and getattr(_DEPTH, "n", 0) == 0
-    fd = None
-    try:
-        if outermost:
-            _DEPTH.n = 1
-            try:
-                fd = _os_lock(_lock_path())
-            except OSError as e:
-                fd = None
-                _warn_once(f"file lock unavailable: {e}")
-            if fd is None:
-                _warn_once("file lock busy or unsupported")
-        yield
-    finally:
-        if outermost:
-            _DEPTH.n = 0
-            if fd is not None:
-                _os_unlock(fd)
-        if got:
-            _LEDGER_LOCK.release()
+    """Serialise a ledger read-modify-write, and SAY whether it worked.
+
+    Yields a storage_io.Lock. Check .held if what you are about to do
+    truncates the file; a pure read may proceed either way, which is what
+    keeps a lock hiccup from breaking a scan or dropping an observation."""
+    with storage_io.file_lock(LEDGER, budget_s=_LOCK_BUDGET_S) as lk:
+        if not lk.held:
+            _warn_once(lk.why)
+        yield lk
+
 
 # how far back the grading download can actually reach. ONE definition on
 # purpose: the period string handed to yfinance and the age a row has to pass
@@ -179,21 +111,18 @@ def _read_all_status():
     Only the grader looks at the flag, and it needs it because an OSError
     swallowed to [] is indistinguishable from an empty or a fully graded
     ledger. That single ambiguity is what let a day whose file could not be
-    opened get written off as finished."""
-    try:
-        if not LEDGER.exists():
-            return [], True        # nothing recorded yet IS a readable state
-        out = []
-        for line in LEDGER.read_text(encoding="utf-8-sig").splitlines():
-            line = line.strip()
-            if line:
-                try:
-                    out.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-        return out, True
-    except OSError:
+    opened get written off as finished.
+
+    The read runs through storage_io now, which underneath tells UNREADABLE
+    (the OS would not hand the file over) apart from CORRUPT (a line the
+    parser could not read). The flag keeps its old meaning on purpose: a
+    missing file and a file with a torn last line are both readable states
+    that return the rows they do have, and only a file nobody could open
+    reports False."""
+    res = storage_io.read_jsonl(LEDGER)
+    if res.status == "unreadable":
         return [], False
+    return list(res.value or []), True
 
 
 def _read_all() -> list:
@@ -223,28 +152,25 @@ def _write_all(records: list):
     """Publish the whole ledger. Call this INSIDE _locked(): it truncates and
     replaces, so anything appended since `records` was read is gone.
 
-    The temp name is qualified per process and per thread, the same discipline
-    config.save_state uses. One shared temp name let two writers overwrite
-    each other's staging file before either published, which can publish a
-    mixture or raise, and the old bare `except OSError: pass` then reported
-    success for a write that never happened."""
+    Returns whether the bytes landed, and REFUSES rather than publishing when
+    the ledger lock cannot be taken. The old version had no retry at all, so
+    the WinError 5 that hits this machine about one run in ten lost a whole
+    grading pass; storage_io retries a bounded number of times and reports a
+    full disk as a status. The caller already counts a False as a failed
+    write, so nothing downstream needs to change to notice."""
     if _standing_by():
         return False  # not this copy's file to write; see _standing_by
-    tmp = LEDGER.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-    try:
-        tmp.write_text("\n".join(json.dumps(r) for r in records) + "\n",
-                       encoding="utf-8")
-        tmp.replace(LEDGER)
-        return True
-    except OSError as e:
-        print(f"forward_ledger: could NOT persist {LEDGER.name}: {e}")
-        return False
-    finally:
-        try:                           # never leave an orphan staging file
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
+    if not storage_io.held(LEDGER):
+        # the publish below takes the lock for itself either way, but a caller
+        # that did not hold it across its own READ has already lost anything
+        # appended in between, and that is worth saying out loud
+        print(f"forward_ledger: {LEDGER.name} is being rewritten without the "
+              "ledger lock held across the read; concurrent appends may be lost")
+    res = storage_io.write_jsonl_all(LEDGER, records)
+    if not res.ok:
+        print(f"forward_ledger: could NOT persist {LEDGER.name}: "
+              f"{res.status} {res.error}")
+    return bool(res.ok)
 
 
 def _audit_path():
@@ -266,8 +192,12 @@ def _audit(res: dict):
     try:
         line = {"ts": f"{datetime.now(ET):%Y-%m-%d %H:%M:%S}"}
         line.update(res)
-        with _audit_path().open("a", encoding="utf-8") as f:
-            f.write(json.dumps(line) + "\n")
+        # under the audit file's OWN lock, not the ledger's: two files, two
+        # locks, and this module never pretends the pair is one transaction
+        out = storage_io.append_jsonl(_audit_path(), line)
+        if not out.ok:
+            print("forward_ledger: could not append the grading audit line: "
+                  f"{out.status} {out.error}")
     except OSError as e:
         print(f"forward_ledger: could not append the grading audit line: {e}")
 
@@ -295,6 +225,24 @@ def event_id(day, symbol, direction, time_et, entry, stop) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
+def candidate_id_for_ticket(symbol, direction, ticket, price, now_et) -> str:
+    """The id record_candidate WOULD allocate for this observation.
+
+    One definition, called from two places on purpose. The reader used to keep
+    the id only when record_candidate handed one back, so a refused ledger
+    write produced a ticket that could never be linked to anything: the card
+    went out carrying no candidate id at all. Minting it here lets the reader
+    stamp the ticket first and hand the SAME id to the recorder, so a failed
+    write costs an observation row and not the identity of the alert.
+
+    The values are handed to event_id RAW, exactly as record_candidate has
+    always handed them over. Converting them to float here would change the
+    hash and orphan every id already on the volume."""
+    t = ticket or {}
+    return event_id(f"{now_et:%Y-%m-%d}", symbol, direction,
+                    f"{now_et:%H:%M:%S}", t.get("entry", price), t.get("stop"))
+
+
 def _row_key(r: dict) -> str:
     """The identity of a stored row. Rows written before event_id shipped do
     not carry one, and they are the rows sitting on the live volume, so their
@@ -311,7 +259,8 @@ def _row_key(r: dict) -> str:
 
 def record_candidate(symbol: str, direction: str, price: float, atr: float,
                      ticket: dict, conf: dict, passes: bool, reasons: list,
-                     gap_atr=None, hour_et=None, now_et: datetime = None):
+                     gap_atr=None, hour_et=None, now_et: datetime = None,
+                     candidate_id: str = None):
     """Log one live sniper candidate and RETURN its id. Called from the read
     path; must be fast and can never raise.
 
@@ -344,8 +293,11 @@ def record_candidate(symbol: str, direction: str, price: float, atr: float,
         now = now_et or datetime.now(ET)
         day = f"{now:%Y-%m-%d}"
         stamp = f"{now:%H:%M:%S}"
-        eid = event_id(day, symbol, direction, stamp,
-                       ticket.get("entry", price), ticket.get("stop"))
+        # the caller may already have minted the id and stamped it on the
+        # ticket, which is the only way an alert stays linkable when this write
+        # fails. One derivation either way, so the two can never drift.
+        eid = candidate_id or candidate_id_for_ticket(
+            symbol, direction, ticket, price, now)
         entry = float(ticket.get("entry", price))
         stop = float(ticket.get("stop", 0))
         risk = abs(entry - stop)
@@ -388,30 +340,64 @@ def record_candidate(symbol: str, direction: str, price: float, atr: float,
             for r in _read_all():
                 if _row_key(r) == eid:
                     return eid   # this exact observation is already recorded
-            with LEDGER.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(rec) + "\n")
+            # an append, not a rewrite: it adds a line and destroys nothing, so
+            # it still lands when the lock could not be taken across the dedup
+            # read above. Losing an observation is the one failure this module
+            # is not allowed to have.
+            storage_io.append_jsonl(LEDGER, rec)
         return eid
     except Exception:
         return None
 
 
-def mark_selected(cid: str, fired_at_et=None, position_id=None) -> bool:
+class MarkResult:
+    """What mark_selected actually did, in one word.
+
+    A bool could only ever say "not linked", and the three ways that happens
+    need different answers: a MISSING row is an observation that was never
+    recorded and never will be, so it is an orphan a person has to look at; a
+    REFUSED write is a disk problem that a retry fixes; APPLIED is done. Replay
+    has to tell them apart or it retries the unfixable forever and gives up on
+    the fixable. Still truthy exactly when the link landed, so the existing
+    caller's `if not ...` reads the same as before."""
+
+    APPLIED = "applied"
+    ROW_MISSING = "row_missing"
+    WRITE_REFUSED = "write_refused"
+    STANDING_BY = "standing_by"
+
+    def __init__(self, status: str):
+        self.status = status
+
+    def __bool__(self) -> bool:
+        return self.status == self.APPLIED
+
+    def __repr__(self) -> str:
+        return f"MarkResult({self.status})"
+
+
+def mark_selected(cid: str, fired_at_et=None, position_id=None,
+                  decision_id=None, intent_id=None,
+                  delivery_confirmed=None) -> "MarkResult":
     """Record that ONE observation is the one the bot actually broadcast.
 
-    Called by the alert path after the card has been sent and the position
-    opened, never before, so a ledger fault can never delay or break an alert
-    that has already gone out. `fired_at_et` is the alert clock, which is
-    deliberately kept separate from the row's time_et: time_et is the READ
-    clock the outcome walk is anchored on, and moving it would move already
-    published numbers."""
+    `selected` means the strategy committed its decision. `delivery_confirmed`
+    means Telegram returned an acknowledgment. Astra is explicit that these are
+    two fields and not one: a queued send is not confirmed delivery, and a
+    delivered card whose acknowledgment was lost is neither confirmed nor
+    unsent. Nothing here ever infers delivery from the existence of a position.
+
+    `fired_at_et` is the alert clock, deliberately kept separate from the row's
+    time_et: time_et is the READ clock the outcome walk is anchored on, and
+    moving it would move already published numbers."""
     try:
         if not cid:
-            return False
+            return MarkResult(MarkResult.ROW_MISSING)
         if _standing_by():
             # a mute copy sent no card, so it has no selection to record. it
             # said so once, in the shared file the winner reads. see
             # _standing_by.
-            return False
+            return MarkResult(MarkResult.STANDING_BY)
         if isinstance(fired_at_et, datetime):
             stamp = f"{fired_at_et:%Y-%m-%d %H:%M:%S}"
         else:
@@ -424,9 +410,17 @@ def mark_selected(cid: str, fired_at_et=None, position_id=None) -> bool:
                     r["selected"] = True
                     r["selected_at"] = stamp
                     r["position_id"] = position_id
+                    if decision_id is not None:
+                        r["decision_id"] = decision_id
+                    if intent_id is not None:
+                        r["intent_id"] = intent_id
+                    if delivery_confirmed is not None:
+                        r["delivery_confirmed"] = bool(delivery_confirmed)
+                    else:
+                        r.setdefault("delivery_confirmed", False)
                     hit = True
             if not hit:
-                return False
+                return MarkResult(MarkResult.ROW_MISSING)
             # report the WRITE, not the in-memory edit. returning True on a
             # refused write told the caller the broadcast was linked when the
             # row on disk still says it was not, and _cohort only counts rows
@@ -434,9 +428,23 @@ def mark_selected(cid: str, fired_at_et=None, position_id=None) -> bool:
             # missing from the forward win rate for good. the caller logs a
             # False, which is the only signal anyone gets that the link is
             # gone.
-            return bool(_write_all(records))
+            return MarkResult(MarkResult.APPLIED if _write_all(records)
+                              else MarkResult.WRITE_REFUSED)
     except Exception:
-        return False
+        return MarkResult(MarkResult.WRITE_REFUSED)
+
+
+def unlinked_selected() -> list:
+    """Rows the bot says it broadcast that carry no position. The orphan report
+    reads this: a selected row with no position is a card that went out and
+    then lost its trade, which is exactly what the journal exists to catch."""
+    out = []
+    for r in _read_all():
+        if r.get("selected") and not r.get("position_id"):
+            out.append({"candidate_id": _row_key(r), "date": r.get("date"),
+                        "symbol": r.get("symbol"),
+                        "direction": r.get("direction")})
+    return out
 
 
 def _walk_outcome(rec: dict, bars) -> dict:

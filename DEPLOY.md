@@ -21,6 +21,47 @@ Disable-ScheduledTask -TaskName "options-engine recap"
 
 (Re-enable them with `Enable-ScheduledTask` if you ever leave the cloud.)
 
+## BEFORE YOU DEPLOY: prove the volume can lock
+
+Do this once on the target, and again any time the volume or the base image
+changes. It is not optional paperwork. The bot no longer alerts when it cannot
+establish that it is the only copy running, so a filesystem that cannot take a
+lock now makes the bot go QUIET and say so, where it used to alert anyway and
+warn once. That change is deliberate (unknown ownership is not exclusive
+ownership) and it means a volume that cannot lock has to be found before the
+deploy, not after.
+
+One shot probe against the real DATA_DIR on the target:
+
+```bash
+python -c "import instance_lock as l; print(l.try_acquire()); l.release()"
+```
+
+`acquired` is the only passing answer. `unavailable` means this volume cannot
+lock and the bot will sit in BLOCKED: fix the volume or the mount, do not
+deploy on top of it. `contended` means something is already holding it, which
+is its own answer: find that first.
+
+Then write down the topology, because the lock cannot see most of it (the list
+lives in `instance_lock.CANNOT_DETECT` and the bot prints it in every BLOCKED
+message). Record, with what you actually observed rather than what you assume:
+
+- the Railway project and the service that runs the scanner
+- every deployment on that service, and which one is live
+- the replica count (must be 1)
+- any desktop Task Scheduler entry that starts a scanner or a recap
+- any ad hoc script or getUpdates utility that uses the same bot token
+- the webhook configuration for the token (a webhook and getUpdates are two
+  consumers of the same mail)
+
+Two things this repo does NOT claim, so do not write them into a release note:
+that a shared volume supports a rolling promotion between two live containers
+(Railway documents that it prevents simultaneous active deployments mounted to
+the same service volume, so that story has never been reproduced on the
+platform), and that a Telegram 409 tells you where the other consumer is. The
+posture this release ships is one service, no external production pollers, and
+a controlled handoff. Keep the observed inventory as release evidence.
+
 ## Railway, step by step (one evening, mostly waiting)
 
 1. Install the CLI (needs Node, or use scoop):
