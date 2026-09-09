@@ -30,8 +30,15 @@ Usage:
     python learn.py                    # run tonight's review + send owner digest
     python learn.py --dry-run          # print everything, send nothing, write nothing
     python learn.py --date 2026-06-12  # review a specific past session (testing)
+    python learn.py --export-backlog reviews.json    # offline review lane, out
+    python learn.py --import-reviews reviews.json    # offline review lane, back
+    python learn.py --repair-lessons   # finish derived work; prints a JSON
+                                       # result, exits 1 if it did not finish
+    python learn.py --migrate-legacy   # one-time: attach lesson rows written
+                                       # before they carried a review id
 """
 
+import hashlib
 import json
 import os
 import re
@@ -56,6 +63,24 @@ LESSONS_LOG = config.DATA_DIR / "lessons.jsonl"       # full append-only history
 LESSONS_DIGEST = config.DATA_DIR / "lessons_digest.md"  # distilled playbook the brain reads
 REVIEWS_FILE = config.DATA_DIR / "trade_reviews.jsonl"  # one deep review per closed trade, ever
 DIGEST_KEEP = 20   # most-recent lesson bullets kept in the digest (recency wins)
+
+# A review is identified by (trade id, revision). The revision defaults to 1
+# and comes from the file; a HIGHER revision is a correction the importer
+# accepts and supersedes with, the SAME revision with different judgement is a
+# conflict it refuses, and a LOWER one is stale. payload_hash fingerprints the
+# judgement fields only, so a re-import of byte-identical judgement is provably
+# the same work and can be resumed instead of refused.
+JUDGMENT_FIELDS = ("why", "cause", "cause_detail", "lesson", "reviewer")
+
+# How much weight a lesson's text may carry. 'deterministic' came from the
+# graded record itself, 'model_hypothesis' is a plausible explanation a model
+# wrote, 'owner' is Chudi's own call. A row that declares nothing stays
+# 'unclassified' rather than being given a class it never earned.
+EVIDENCE_CLASSES = ("deterministic", "model_hypothesis", "owner", "unclassified")
+
+# stamped on a legacy lesson row the migration could not map to any review.
+# Never a guess: an unmapped row is reported, not attached to a trade.
+UNMAPPED = "__unmapped__"
 
 
 # ------------------- deep per-trade review (full history) -------------------
@@ -191,15 +216,28 @@ def review_history(max_new: int = 25) -> int:
                  "cause_detail": parsed.get("cause_detail", ""),
                  "lesson": (parsed.get("lesson") or "").strip(),
                  "reviewed_at": et_now().strftime("%Y-%m-%d %H:%M:%S %Z")}
+        entry["revision"] = 1
+        entry["payload_hash"] = _payload_hash(entry)
         with REVIEWS_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
-        # a real lesson from a deep review feeds the same digest the brain reads
+        # a real lesson from a deep review feeds the same digest the brain
+        # reads, so it carries its provenance: which trade it came from, how
+        # much weight it has earned, and which review revision produced it.
+        # Without source_review_id here, this path used to write rows the
+        # repair guard could not see, and the next repair appended a second
+        # copy of every one of them.
         if entry["lesson"]:
             _append_lesson({"session": p.date, "graded_at": entry["reviewed_at"],
                             "wins": 0, "losses": 0, "trades": [],
                             "review": f"deep review {p.ticker} {p.date}: {entry['why']}",
                             "lessons": [entry["lesson"]],
-                            "watch_tomorrow": "", "proposed_change": None})
+                            "watch_tomorrow": "", "proposed_change": None,
+                            "source_review_id": p.id,
+                            "source_payload_hash": entry["payload_hash"],
+                            "review_revision": 1,
+                            "trade_ids": [p.id],
+                            "evidence_class": ("model_hypothesis" if brain_live
+                                               else "deterministic")})
         done += 1
     return done
 
@@ -733,13 +771,78 @@ def _lesson_kind(entry: dict) -> str:
     return "nightly"
 
 
+def strategy_fingerprint() -> str:
+    """A 16 hex fingerprint of the strategy the bot was running when a lesson
+    was written, so a rule from one era is never read as a rule of another.
+
+    COMPUTED from an explicit, sorted projection of the live settings, never
+    typed: no number in this file, and nothing here can change a rule. The
+    projection is explicit on purpose. StrategySpec carries frozenset fields
+    whose repr ordering is not a stable serialisation, so a blind asdict plus
+    str would produce a fingerprint that drifts between runs and make every
+    lesson look like it came from a different strategy."""
+    try:
+        spec = strategy_spec.get()
+        proj = {
+            "entry_window": str(spec.entry_window),
+            "mom_bars": spec.mom_bars,
+            "allowed_setups": sorted(str(x) for x in spec.allowed_setups),
+            "watchlist": sorted(f"{k}={v}" for k, v in
+                                dict(spec.watchlist).items()),
+            "tp_half_pct": spec.tp_half_pct,
+            "stop_pct": spec.stop_pct,
+            "runner_giveback_pct": spec.runner_giveback_pct,
+            "min_winrate": spec.min_winrate,
+            "risk_per_trade_pct": spec.risk_per_trade_pct,
+        }
+        blob = json.dumps(proj, sort_keys=True, default=str)
+    except Exception as e:      # a fingerprint is metadata, never a blocker
+        blob = "unavailable:" + str(e)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _stamp_provenance(entry: dict) -> dict:
+    """Fill in the provenance a lesson row needs to be re-read honestly later:
+    which trades it came from, how much weight it has earned, which strategy
+    was live, which review revision produced it, and whether it is still the
+    active version of that lesson.
+
+    Only fills what the caller did not declare. A row that names no evidence
+    class stays 'unclassified' rather than being handed one it never earned;
+    the digest tags a hypothesis as a hypothesis and leaves the rest alone."""
+    e = dict(entry)
+    if "trade_ids" not in e:
+        ids = []
+        for t in e.get("trades") or []:
+            tid = t.get("id") if isinstance(t, dict) else None
+            if tid:
+                ids.append(str(tid))
+        if not ids and e.get("source_review_id"):
+            ids = [str(e["source_review_id"])]
+        e["trade_ids"] = ids
+    if e.get("evidence_class") not in EVIDENCE_CLASSES:
+        e["evidence_class"] = "unclassified"
+    e.setdefault("strategy_version", strategy_fingerprint())
+    if e.get("source_review_id"):
+        e.setdefault("review_revision", 1)
+        e.setdefault("source_payload_hash", "")
+    e.setdefault("active", True)
+    e.setdefault("superseded_by", None)
+    return e
+
+
 def _append_lesson(entry: dict):
     """Persist one lessons.jsonl row. Nightly and coach rows UPSERT by
     (session, kind): re-running an already-reviewed session (a --date
     backfill, a crash-restart re-fire between send and dedup-mark) replaces
     the previous row instead of stacking a duplicate the digest would count
     twice. The first review of a session is still a pure append; a line the
-    parser cannot read is preserved verbatim, never destroyed."""
+    parser cannot read is preserved verbatim, never destroyed.
+
+    Every row is stamped with its provenance on the way in, so a writer that
+    does not know about the scheme (coach.reflect) still produces a row the
+    digest and the repair path can reason about."""
+    entry = _stamp_provenance(entry)
     moved = [x for x in entry.get("lessons") or [] if _is_rule_change(x)]
     if moved:
         # a rule change phrased as a lesson (coach and deep-review rows land
@@ -853,9 +956,17 @@ def _rebuild_digest():
     only its newest occurrence, so a stretch of look-alike days cannot fill
     the window and evict real lessons. The newest watch_tomorrow is pinned
     above the bullets as a dated FOR TODAY line that expires once its target
-    session has passed."""
+    session has passed.
+
+    A row superseded by a later review revision is skipped: the corrected text
+    is what belongs in the active playbook, while the original stays in
+    lessons.jsonl for audit. A bullet whose row declares itself a model
+    hypothesis is tagged as one, so a plausible explanation cannot read to the
+    brain as an established finding."""
     bullets = []
     for entry in _by_session_newest_first(_all_lessons()):
+        if entry.get("active") is False:
+            continue          # superseded by a later revision of its review
         d = entry.get("session", "")
         tag = ""
         if d:
@@ -864,6 +975,8 @@ def _rebuild_digest():
                     if sys.platform.startswith("win") else "%-m/%-d")
             except ValueError:  # malformed legacy row: keep it, tag it as-is
                 tag = str(d)
+        if entry.get("evidence_class") == "model_hypothesis":
+            tag = (tag + ", hypothesis") if tag else "hypothesis"
         for lesson in entry.get("lessons") or []:
             bullets.append((tag, str(lesson)))
     seen, deduped = set(), []
@@ -962,23 +1075,25 @@ def run(require_date=None, dry=False):
         except Exception as e:
             print(f"learn: deep review skipped ({e})")
 
-    # grade today's sniper candidates (hits/misses at every target tier) so
-    # the forward ledger keeps earning real win rates for bigger targets
+    # READ the forward ledger's nightly line. The grading itself does NOT
+    # happen here any more: it is a free deterministic job on the scanner's
+    # own schedule (Service.maybe_grade_forward), with its own retry budget,
+    # its own needs-attention park, and an audit line per pass. A second
+    # grader in here was unaudited and ran behind LEARN_ENABLED, so the day's
+    # counts moved with a paid-AI switch even though the grading did not.
     ledger_note = ""
     if not dry:
         try:
             import forward_ledger
-            graded = forward_ledger.fill_outcomes()
             ledger_note = forward_ledger.nightly_summary()
-            if graded:
-                print(f"learn: graded {graded} sniper candidate(s) forward")
         except Exception as e:
-            print(f"learn: sniper forward grading skipped ({e})")
+            print(f"learn: sniper forward summary skipped ({e})")
 
     # the coach: a second agent that reviews the WHOLE day (trades, sniper
     # candidates, news, skips), reconstructs the perfect scenario for every
     # imperfection, and feeds the lesson back into the brain's playbook.
-    # Runs AFTER the ledger grading so it sees today's graded outcomes.
+    # Runs late enough in the night that the scanner's grading job has already
+    # filled the day's outcomes, so it reads a graded ledger.
     coach_note = ""
     if not dry:
         try:
@@ -1091,7 +1206,17 @@ def export_backlog(path: str) -> int:
                "row_schema": ["id", "date", "ticker", "direction", "strike",
                               "paper", "final_pnl_pct", "verdict", "why",
                               "cause", "cause_detail", "lesson", "reviewed_at",
-                              "reviewer"],
+                              "reviewer", "revision"],
+               "revision_note": "revision defaults to 1. Re-importing the same "
+                                "file is safe, it resumes whatever the last "
+                                "run did not finish. To CORRECT a review "
+                                "already imported, keep the id and raise "
+                                "revision: that supersedes the old lesson "
+                                "instead of being refused.",
+               "verdict_note": "verdict is a fact of the trade, taken from the "
+                               "tracked position. What the file says is kept "
+                               "as verdict_claimed, and a claim that "
+                               "contradicts the tracked P&L refuses the row.",
                "causes": ["setup", "news", "geopolitics", "macro_event",
                           "volatility", "time_decay", "execution", "unknown"],
                "already_reviewed": len(seen), "pending": len(out),
@@ -1133,27 +1258,162 @@ def _as_bool(v):
     return None
 
 
+def _review_revision(r) -> int:
+    """The revision a review declares. Absent means the first one. A value
+    that is not a whole number at or above 1 returns 0, which the caller
+    reports as a problem instead of guessing what was meant."""
+    v = r.get("revision", r.get("review_revision", 1))
+    if isinstance(v, bool):
+        return 0
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return 0
+    return n if n >= 1 else 0
+
+
+def _payload_hash(r) -> str:
+    """16 hex over the JUDGEMENT fields only, so a re-import of byte-identical
+    judgement is provably the same work and can be resumed rather than refused,
+    while a changed judgement at the same revision is provably a conflict.
+    The outcome fields are deliberately excluded: they come from the tracked
+    position, so they can never differ between two readings of one trade."""
+    payload = {k: ("" if r.get(k) is None else str(r.get(k)).strip())
+               for k in JUDGMENT_FIELDS}
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _review_key(review_id, revision) -> str:
+    return f"{review_id}#r{int(revision)}"
+
+
+def _reviewed_index() -> dict:
+    """id -> the identity of the newest committed review for that trade:
+    {'revision', 'payload_hash'}. payload_hash is None for a legacy row that
+    predates the scheme, and a None hash is never treated as a conflict: it
+    cannot be proven different, so the safe reading is that it is the same."""
+    out = {}
+    if not REVIEWS_FILE.exists():
+        return out
+    for line in REVIEWS_FILE.read_text(encoding="utf-8-sig").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        rid = row.get("id")
+        if not rid:
+            continue
+        rev = _review_revision(row) or 1
+        prev = out.get(rid)
+        if prev is None or rev >= prev["revision"]:
+            out[rid] = {"revision": rev, "payload_hash": row.get("payload_hash")}
+    return out
+
+
+def _verdict_sign(text):
+    """+1, -1 or None for what a claimed verdict asserts about the outcome.
+    Wording-tolerant on purpose: the canonical verdict carries an emoji, an
+    offline reviewer may type WIN or LOSS."""
+    t = " ".join(str(text or "").lower().split())
+    if not t or "not graded" in t or "still open" in t:
+        return None
+    if "right" in t or "win" in t:
+        return 1
+    if "wrong" in t or "loss" in t or "lost" in t or "lose" in t:
+        return -1
+    return None
+
+
 def _lesson_already_recorded(review_id: str) -> bool:
     """Whether this review's lesson is already in the lessons log. Lets an
-    interrupted import repair its derived work without duplicating it."""
-    try:
-        for e in _all_lessons():
-            if e.get("source_review_id") == review_id:
-                return True
-    except Exception:
-        pass
+    interrupted import repair its derived work without duplicating it.
+
+    Both ids must be truthy to match. A legacy row carries no
+    source_review_id, so without that guard a review row with no id matched
+    the first legacy row and had its lesson silently dropped as already done.
+    A read failure is raised, never swallowed: reporting 'not recorded' for
+    every review on a volume blip would re-append the entire lesson history
+    in one pass.
+
+    This is the single-row form. repair_lessons reads the log ONCE through
+    _recorded_lesson_index instead of re-parsing it per review row."""
+    for e in _all_lessons():
+        rid = e.get("source_review_id")
+        if rid and review_id and rid == review_id:
+            return True
     return False
 
 
-def _validate_rows(rows, closed, seen):
-    """Check EVERY row before anything is committed. Returns (ok, problems).
+def _recorded_lesson_index(lessons):
+    """Read the lessons log ONCE and index it two ways.
 
-    Nothing is written when a single row fails. A half-applied import is worse
-    than a refused one: the ledger dedups on id, so a bad row that lands is
-    never revisited."""
+    keys   : {(source_review_id, review_revision)} for rows that carry an id.
+    legacy : rows with no usable id, indexed by the review string and by
+             (session, normalised lesson text), which are the two things a
+             derived row can be matched on without guessing."""
+    keys, legacy_review, legacy_text = set(), {}, {}
+    for i, e in enumerate(lessons):
+        rid = e.get("source_review_id")
+        if rid and rid != UNMAPPED:
+            keys.add((str(rid), _review_revision(e) or 1))
+            continue
+        if rid == UNMAPPED:
+            continue          # already looked at and reported as unmappable
+        review = " ".join(str(e.get("review") or "").split())
+        if review:
+            legacy_review.setdefault(review, []).append(i)
+        session = str(e.get("session") or "")
+        for lesson in e.get("lessons") or []:
+            key = (session, " ".join(str(lesson).lower().split()))
+            if key[1]:
+                legacy_text.setdefault(key, []).append(i)
+    return {"keys": keys, "by_review": legacy_review, "by_text": legacy_text}
+
+
+def _legacy_row_for(review_row, lesson_text, index):
+    """The index of the legacy lessons row this review already produced, or
+    None. Exact matches only: the reconstructed review string first, then the
+    exact lesson text within the same session. Never a fuzzy guess."""
+    review = " ".join(_derived_review_line(review_row).split())
+    hit = index["by_review"].get(review)
+    if hit:
+        return hit[0]
+    key = (str(review_row.get("date") or ""),
+           " ".join(str(lesson_text).lower().split()))
+    hit = index["by_text"].get(key)
+    if hit:
+        return hit[0]
+    return None
+
+
+def _derived_review_line(r) -> str:
+    """The review string a derived lesson carries. Built in one place so the
+    repair path and the legacy matcher cannot drift apart."""
+    return (f"deep review {r.get('ticker','')} {r.get('date','')}: "
+            f"{r.get('why','')}")
+
+
+def _validate_rows(rows, closed, index):
+    """Check EVERY row before anything is committed.
+
+    Returns (fresh, already, problems).
+
+    fresh    rows to write: never seen, or a strictly higher revision that
+             corrects one already on file.
+    already  rows whose identical judgement is already committed at the same
+             revision. Nothing is written for them, but their derived work is
+             still reconciled, which is what makes a retry of a partial batch
+             resume instead of refuse.
+    problems kill the whole batch. A half-applied import is worse than a
+             refused one. A conflicting revision (same id, same revision,
+             different judgement) is a problem on purpose: an import supplies
+             judgement, it never silently overwrites a canonical review."""
     causes = {"setup", "news", "geopolitics", "macro_event", "volatility",
               "time_decay", "execution", "unknown"}
-    ok, problems = [], []
+    fresh, already, problems = [], [], []
     ids_in_file = set()
     for i, r in enumerate(rows):
         where = f"row {i}"
@@ -1169,9 +1429,10 @@ def _validate_rows(rows, closed, seen):
             problems.append(f"{where}: duplicated inside the file")
             continue
         ids_in_file.add(rid)
-        if rid in seen:
-            problems.append(f"{where}: already reviewed; imports never "
-                            "overwrite a canonical review")
+        rev = _review_revision(r)
+        if rev < 1:
+            problems.append(f"{where}: revision {r.get('revision')!r} is not "
+                            "a whole number at or above 1")
             continue
         pos = closed.get(rid)
         if pos is None:
@@ -1192,134 +1453,423 @@ def _validate_rows(rows, closed, seen):
             problems.append(f"{where}: paper={paper} contradicts the tracked "
                             f"position ({bool(getattr(pos, 'paper', False))})")
             continue
+        bad_field = None
         for field in ("why", "cause_detail", "lesson"):
             if r.get(field) is not None and not isinstance(r.get(field), str):
-                problems.append(f"{where}: {field} must be text")
+                bad_field = field
                 break
-        else:
-            ok.append((r, pos, cause.strip()))
-    return ok, problems
+        if bad_field:
+            problems.append(f"{where}: {bad_field} must be text")
+            continue
+        # the verdict is a canonical fact, so a claim that contradicts the
+        # tracked P&L is reported rather than silently discarded
+        claimed = _verdict_sign(r.get("verdict"))
+        if claimed is not None:
+            actual = 1 if (pos.final_pnl_pct or 0) > 0 else -1
+            if claimed != actual:
+                problems.append(
+                    f"{where}: verdict {r.get('verdict')!r} contradicts the "
+                    f"tracked final P&L ({pos.final_pnl_pct}). The verdict is "
+                    "a fact of the trade, not a judgement the file supplies")
+                continue
+        phash = _payload_hash(r)
+        known = index.get(rid)
+        if known is None:
+            fresh.append((r, pos, cause.strip(), rev, phash))
+            continue
+        if rev < known["revision"]:
+            problems.append(f"{where}: revision {rev} is older than the "
+                            f"committed revision {known['revision']}")
+            continue
+        if rev > known["revision"]:
+            fresh.append((r, pos, cause.strip(), rev, phash))
+            continue
+        if known["payload_hash"] and known["payload_hash"] != phash:
+            problems.append(
+                f"{where}: revision {rev} is already committed with a "
+                f"different judgement (on file {known['payload_hash']}, in "
+                f"this file {phash}). Imports never overwrite a canonical "
+                "review. Bump 'revision' to file this as a correction")
+            continue
+        already.append((r, pos, cause.strip(), rev, phash))
+    return fresh, already, problems
 
 
-def import_reviews(path: str, reviewer: str = "offline") -> int:
-    """Commit offline-written reviews into trade_reviews.jsonl.
+def _read_reviews(reviews_file) -> list:
+    """Every committed review row. An unparseable line is skipped, a file the
+    process cannot read is raised: the caller has to record that, because
+    treating an unreadable ledger as an empty one would re-derive everything."""
+    rows = []
+    if not reviews_file.exists():
+        return rows
+    for line in reviews_file.read_text(encoding="utf-8-sig").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def import_reviews_result(path: str, reviewer: str = "offline") -> dict:
+    """Commit offline-written reviews into trade_reviews.jsonl and say exactly
+    what happened. Returns
+    {ok, written, resumed, refused, problems, lessons} .
 
     Every row must resolve to a real closed position, and the immutable trade
     facts (date, ticker, direction, strike, paper, final P&L, verdict) are
     copied FROM that position rather than trusted from the file, so an import
-    can supply judgement but never rewrite what happened. Validation runs over
-    the whole file first: one bad row refuses the batch, because the ledger
-    dedups on id and a bad row that lands is never revisited.
+    can supply judgement but never rewrite what happened. The file's own
+    verdict is kept beside it as verdict_claimed, so a fabricated claim is
+    auditable instead of vanishing.
 
-    Lessons are derived idempotently and the digest is rebuilt once at the end,
-    so an import interrupted between the review write and the lesson write can
-    be repaired by running it again (or with --repair-lessons) instead of
-    leaving a review whose lesson never reached the brain.
-    """
+    Validation runs over the whole file first and any problem refuses the whole
+    batch: a bad row that lands is never revisited. A row already committed at
+    the SAME revision with the SAME judgement is not a problem, it is a
+    resume, so re-running the exact file an interrupted import was given
+    finishes the work instead of refusing it. A different judgement at that
+    same revision is a conflict and does refuse; a higher revision is accepted
+    as a correction that supersedes the earlier lesson.
+
+    The accepted rows are appended in ONE fsynced write, so a batch has a
+    single torn-write window rather than one per row, and the resume rule
+    makes even that window recoverable by running the same file again."""
+    out = {"ok": False, "written": 0, "resumed": 0, "refused": 0,
+           "problems": [], "lessons": {}}
     try:
         with open(path, encoding="utf-8-sig") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
+        out["problems"] = [f"cannot read {path}: {e}"]
         print(f"import: cannot read {path}: {e}")
-        return 0
+        return out
     rows = data.get("reviews") if isinstance(data, dict) else data
     if not isinstance(rows, list):
+        out["problems"] = ["expected a JSON list, or an object with a "
+                           "'reviews' list"]
         print("import: expected a JSON list, or an object with a 'reviews' list")
-        return 0
+        return out
 
     closed = _closed_positions_by_id()
-    seen = _reviewed_ids()
-    ok, problems = _validate_rows(rows, closed, seen)
+    try:
+        index = _reviewed_index()
+    except OSError as e:
+        out["problems"] = [f"cannot read the committed reviews: {e}"]
+        print(f"import: cannot read the committed reviews ({e}); "
+              "nothing written")
+        return out
+
+    fresh, already, problems = _validate_rows(rows, closed, index)
     if problems:
+        out["problems"] = problems
+        out["refused"] = len(problems)
         print(f"import: REFUSED. {len(problems)} problem(s), nothing written:")
         for p in problems[:20]:
             print(f"  - {p}")
         if len(problems) > 20:
             print(f"  ... and {len(problems) - 20} more")
-        return 0
+        return out
 
+    import recap
     stamp = et_now().strftime("%Y-%m-%d %H:%M:%S %Z")
     src = os.path.basename(str(path))
-    written = 0
-    for r, pos, cause in ok:
+    lines = []
+    for r, pos, cause, rev, phash in fresh:
         entry = {
             # immutable facts come from the tracked position, not the file
             "id": pos.id, "date": pos.date, "ticker": pos.ticker,
             "direction": pos.direction, "strike": pos.strike,
             "paper": bool(getattr(pos, "paper", False)),
             "final_pnl_pct": pos.final_pnl_pct,
-            "verdict": r.get("verdict", ""),
-            # judgement comes from the file
+            "verdict": recap.position_story(pos)[0],
+            # judgement comes from the file, and so does the file's own
+            # verdict claim, kept for audit and never used as the fact
+            "verdict_claimed": str(r.get("verdict") or ""),
             "why": r.get("why", ""), "cause": cause,
             "cause_detail": r.get("cause_detail", ""),
             "lesson": (r.get("lesson") or "").strip(),
             "reviewed_at": r.get("reviewed_at") or stamp,
             "reviewer": r.get("reviewer") or reviewer,
+            "revision": rev, "payload_hash": phash,
             "imported_from": src, "imported_at": stamp,
         }
+        lines.append(json.dumps(entry) + "\n")
+
+    if lines:
         with REVIEWS_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
-        written += 1
+            f.write("".join(lines))
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except (OSError, ValueError):
+                pass          # no fsync on this handle; the append still landed
+        out["written"] = len(lines)
+    out["resumed"] = len(already)
 
-    repaired = _derive_lessons_for(REVIEWS_FILE)
-    print(f"imported {written} review(s); {repaired} lesson(s) derived; "
-          "digest rebuilt")
-    return written
+    result = repair_lessons(REVIEWS_FILE)
+    out["lessons"] = result
+    out["ok"] = bool(result.get("ok"))
+    resumed = (f"; {out['resumed']} row(s) resumed" if out["resumed"] else "")
+    if result.get("digest_rebuilt"):
+        tail = "digest rebuilt"
+    else:
+        why = "; ".join(str(e) for e in result.get("errors") or []) or "unknown"
+        tail = f"digest NOT rebuilt ({why})"
+    print(f"imported {out['written']} review(s){resumed}; "
+          f"{result.get('derived', 0)} lesson(s) derived; {tail}")
+    return out
 
 
-def _derive_lessons_for(reviews_file) -> int:
-    """Append a lesson for every reviewed trade that carries one and does not
-    already have it recorded, then rebuild the digest once.
+def import_reviews(path: str, reviewer: str = "offline") -> int:
+    """import_reviews_result, reduced to the count of rows newly written.
+    Kept as the number the older callers and regressions read."""
+    return import_reviews_result(path, reviewer)["written"]
 
-    Idempotent on purpose: this is the repair path. Running it twice adds
-    nothing the second time, so an import that died between writing a review
-    and writing its lesson heals by being run again."""
-    made = 0
+
+def _supersede_lessons(review_id: str, revision: int) -> int:
+    """Mark every earlier lesson row for this review inactive and point it at
+    the revision that replaced it. The text STAYS in lessons.jsonl for audit;
+    only the active digest drops it. Rewrites through a temp file, and a line
+    the parser cannot read is copied through untouched."""
+    if not LESSONS_LOG.exists():
+        return 0
+    lines = LESSONS_LOG.read_text(encoding="utf-8-sig").splitlines()
+    kept, changed = [], 0
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            kept.append(line)
+            continue
+        if (row.get("source_review_id") == review_id
+                and (_review_revision(row) or 1) < revision
+                and row.get("active") is not False):
+            row["active"] = False
+            row["superseded_by"] = _review_key(review_id, revision)
+            changed += 1
+            kept.append(json.dumps(row))
+            continue
+        kept.append(line)
+    if changed:
+        tmp = LESSONS_LOG.with_suffix(".jsonl.tmp")
+        tmp.write_text("\n".join(kept) + ("\n" if kept else ""),
+                       encoding="utf-8")
+        tmp.replace(LESSONS_LOG)
+    return changed
+
+
+def repair_lessons(reviews_file) -> dict:
+    """Derive the lesson every committed review owes, then rebuild the digest,
+    and say exactly what happened.
+
+    Returns {ok, derived, superseded, skipped, legacy_matched, digest_rebuilt,
+    errors}. The caller logs from this, so no message can claim a rebuild that
+    did not happen.
+
+    Idempotent on purpose: this is the repair path. A review whose lesson is
+    already recorded at that revision is skipped; a HIGHER revision derives a
+    new lesson and supersedes the earlier one. A legacy row this review
+    already produced before the ids existed is matched, not duplicated. Each
+    row is caught on its own, so one bad review cannot cost the rest their
+    lessons, and the whole thing never raises at its callers."""
+    result = {"ok": True, "derived": 0, "superseded": 0, "skipped": 0,
+              "legacy_matched": 0, "digest_rebuilt": False, "errors": []}
     try:
-        rows = []
-        if reviews_file.exists():
-            for line in reviews_file.read_text(encoding="utf-8-sig").splitlines():
-                if line.strip():
-                    try:
-                        rows.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-        for r in rows:
-            lesson = (r.get("lesson") or "").strip()
-            if not lesson or _lesson_already_recorded(r.get("id")):
-                continue
+        rows = _read_reviews(reviews_file)
+    except OSError as e:
+        result["ok"] = False
+        result["errors"].append(f"reviews unreadable ({e}); nothing written")
+        return result
+    try:
+        index = _recorded_lesson_index(_all_lessons())
+    except Exception as e:
+        # failing OPEN here would re-append the entire lesson history, so the
+        # honest move is to write nothing and say why
+        result["ok"] = False
+        result["errors"].append(f"lessons log unreadable ({e}); nothing written")
+        return result
+
+    for r in rows:
+        lesson = (r.get("lesson") or "").strip()
+        if not lesson:
+            continue
+        rid = r.get("id")
+        if not rid:
+            result["ok"] = False
+            result["errors"].append("a review row carries a lesson but no id; "
+                                    "its lesson cannot be tracked")
+            continue
+        rev = _review_revision(r) or 1
+        if (str(rid), rev) in index["keys"]:
+            result["skipped"] += 1
+            continue
+        legacy_at = _legacy_row_for(r, lesson, index)
+        if legacy_at is not None:
+            # this review already produced that row, back when the rows
+            # carried no id. Adopting it is --migrate-legacy's job; the one
+            # thing this path must never do is write a second copy.
+            result["legacy_matched"] += 1
+            result["skipped"] += 1
+            continue
+        try:
+            result["superseded"] += _supersede_lessons(str(rid), rev)
             _append_lesson({
                 "session": r.get("date", ""),
                 "graded_at": r.get("reviewed_at", ""),
                 "wins": 0, "losses": 0, "trades": [],
-                "review": f"deep review {r.get('ticker','')} {r.get('date','')}: "
-                          f"{r.get('why','')}",
+                "review": _derived_review_line(r),
                 "lessons": [lesson], "watch_tomorrow": "",
                 "proposed_change": None,
-                "source_review_id": r.get("id"),
+                "source_review_id": str(rid),
+                "source_payload_hash": r.get("payload_hash") or _payload_hash(r),
+                "review_revision": rev,
+                "trade_ids": [str(rid)],
+                "evidence_class": "model_hypothesis",
             })
-            made += 1
+        except Exception as e:
+            result["ok"] = False
+            result["errors"].append(f"{_review_key(rid, rev)}: {e}")
+            continue
+        index["keys"].add((str(rid), rev))
+        result["derived"] += 1
+
+    try:
         _rebuild_digest()
+        result["digest_rebuilt"] = True
     except Exception as e:
-        print(f"import: lesson derivation incomplete ({e})")
-    return made
+        result["ok"] = False
+        result["errors"].append(f"digest rebuild failed ({e})")
+    return result
 
 
-def main():
+def _derive_lessons_for(reviews_file) -> int:
+    """repair_lessons, reduced to the count of lessons newly derived. Kept as
+    the number the older callers and regressions read."""
+    return repair_lessons(reviews_file)["derived"]
+
+
+def migrate_legacy_lessons(reviews_file=None) -> dict:
+    """One-time, deliberate repair of lessons written before the rows carried
+    a source_review_id. Returns {ok, mapped, unmapped, rows, backup, errors}.
+
+    A legacy row is matched to its review by exact equality of the
+    reconstructed review string, and failing that by exact lesson text within
+    the same session. Nothing else. A row that matches neither is stamped
+    __unmapped__ and reported, never attached to a trade on a guess.
+
+    A copy of the file is written first, the rewrite goes through a temp file,
+    and a line the parser cannot read is copied through untouched."""
+    result = {"ok": True, "mapped": 0, "unmapped": 0, "rows": 0,
+              "backup": "", "errors": []}
+    reviews_file = reviews_file if reviews_file is not None else REVIEWS_FILE
+    if not LESSONS_LOG.exists():
+        return result
+    try:
+        rows = _read_reviews(reviews_file)
+        lines = LESSONS_LOG.read_text(encoding="utf-8-sig").splitlines()
+    except OSError as e:
+        result["ok"] = False
+        result["errors"].append(f"cannot read ({e}); nothing written")
+        return result
+
+    by_review, by_text = {}, {}
+    for r in rows:
+        rid = r.get("id")
+        if not rid:
+            continue
+        rev = _review_revision(r) or 1
+        by_review.setdefault(" ".join(_derived_review_line(r).split()),
+                             (str(rid), rev, r))
+        lesson = " ".join(str(r.get("lesson") or "").lower().split())
+        if lesson:
+            by_text.setdefault((str(r.get("date") or ""), lesson),
+                               (str(rid), rev, r))
+
+    kept = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            kept.append(line)
+            continue
+        result["rows"] += 1
+        if row.get("source_review_id"):
+            kept.append(line)
+            continue
+        review = " ".join(str(row.get("review") or "").split())
+        hit = by_review.get(review)
+        if hit is None:
+            for lesson in row.get("lessons") or []:
+                hit = by_text.get((str(row.get("session") or ""),
+                                   " ".join(str(lesson).lower().split())))
+                if hit:
+                    break
+        if hit is None:
+            row["source_review_id"] = UNMAPPED
+            row["migrated_from"] = "legacy"
+            result["unmapped"] += 1
+        else:
+            rid, rev, r = hit
+            row["source_review_id"] = rid
+            row["review_revision"] = rev
+            row["source_payload_hash"] = (r.get("payload_hash")
+                                          or _payload_hash(r))
+            row["trade_ids"] = row.get("trade_ids") or [rid]
+            row["migrated_from"] = "legacy"
+            result["mapped"] += 1
+        kept.append(json.dumps(row))
+
+    if not (result["mapped"] or result["unmapped"]):
+        return result
+    try:
+        backup = LESSONS_LOG.with_name(
+            LESSONS_LOG.name + "."
+            + et_now().strftime("%Y%m%d%H%M%S") + ".pre-migrate")
+        backup.write_text("\n".join(lines) + ("\n" if lines else ""),
+                          encoding="utf-8")
+        result["backup"] = backup.name
+        tmp = LESSONS_LOG.with_suffix(".jsonl.tmp")
+        tmp.write_text("\n".join(kept) + ("\n" if kept else ""),
+                       encoding="utf-8")
+        tmp.replace(LESSONS_LOG)
+    except OSError as e:
+        result["ok"] = False
+        result["errors"].append(f"rewrite failed ({e}); nothing changed")
+        result["mapped"], result["unmapped"] = 0, 0
+    return result
+
+
+def main() -> int:
+    """Exit code, not a count: 0 means the requested work is durably done,
+    1 means it is not. Nothing shells out to learn.py today (scanner calls
+    learn.run and learn.review_history in process), so the codes are free to
+    mean that."""
     if "--export-backlog" in sys.argv:
         i = sys.argv.index("--export-backlog")
-        return export_backlog(sys.argv[i + 1] if i + 1 < len(sys.argv)
-                              else "review_backlog.json")
+        export_backlog(sys.argv[i + 1] if i + 1 < len(sys.argv)
+                       else "review_backlog.json")
+        return 0
     if "--repair-lessons" in sys.argv:
         # recovery path for an import that died between writing a review and
         # writing its lesson: idempotent, so it is always safe to run
-        return _derive_lessons_for(REVIEWS_FILE)
+        result = repair_lessons(REVIEWS_FILE)
+        print(json.dumps(result, sort_keys=True))
+        return 0 if (result["ok"] and result["digest_rebuilt"]) else 1
+    if "--migrate-legacy" in sys.argv:
+        # deliberate one-time adoption of lessons written before the rows
+        # carried a source_review_id. Backs the file up before rewriting it.
+        result = migrate_legacy_lessons(REVIEWS_FILE)
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result["ok"] else 1
     if "--import-reviews" in sys.argv:
         i = sys.argv.index("--import-reviews")
         if i + 1 >= len(sys.argv):
             print("usage: learn.py --import-reviews <file.json>")
-            return 0
-        return import_reviews(sys.argv[i + 1])
+            return 1
+        return 0 if import_reviews_result(sys.argv[i + 1])["ok"] else 1
     dry = "--dry-run" in sys.argv
     date = None
     if "--date" in sys.argv:
@@ -1327,7 +1877,8 @@ def main():
         if i + 1 < len(sys.argv):
             date = sys.argv[i + 1]
     run(require_date=date, dry=dry)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main() or 0)

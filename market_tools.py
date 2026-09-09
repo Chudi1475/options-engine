@@ -989,10 +989,17 @@ def _do_read(disp, yfs, dec, kind, source):
                         _gap_atr = (float(_lconf["top"]) - float(_lconf["bottom"])) / satr
                     except (KeyError, TypeError, ZeroDivisionError):
                         pass
-                    _fl.record_candidate(
+                    # keep the id the recorder allocates. It rides out on the
+                    # read as part of the fvg payload the alert path already
+                    # carries, so the card, the tracked position and this
+                    # observation all name the same candidate instead of being
+                    # matched afterwards by guessing on the day.
+                    _cid = _fl.record_candidate(
                         yfs, _ldir, price, satr, _tk, _lconf,
                         bool(is_sniper), sniper.get("reasons"),
                         gap_atr=_gap_atr, hour_et=_now.hour, now_et=_now)
+                    if _cid:
+                        fvg_info["candidate_id"] = _cid
             except Exception:
                 pass
     except Exception:

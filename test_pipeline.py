@@ -1028,7 +1028,9 @@ check("tg split: unbroken run is hard-cut, nothing dropped",
 
 _orig_send_one = telegram._send_one
 sent = []
-telegram._send_one = lambda cid, t: sent.append((cid, t)) or None
+# the stubs mirror the real _send_one signature, ops kwarg included: send_to
+# threads ops= through so a standby instance can still DM the owner
+telegram._send_one = lambda cid, t, ops=False: sent.append((cid, t)) or None
 try:
     err = telegram.send_to("123", long_text)
 finally:
@@ -1037,7 +1039,7 @@ check("tg send_to: long reply goes out in order with no error",
       err is None and [t for _, t in sent] == parts)
 
 calls = []
-def _fail_second(cid, t):
+def _fail_second(cid, t, ops=False):
     calls.append(t)
     return "400 boom" if len(calls) == 2 else None
 telegram._send_one = _fail_second
@@ -2126,7 +2128,9 @@ try:
     # end to end: handle_commands warns the owner once per day, not per poll
     svc = Service.__new__(Service)
     svc.dry = False
-    telegram.send_to = lambda cid, text: dm.append((str(cid), text)) or None
+    # ops=False in the stub mirrors the real signature; _hb_owner passes
+    # ops=True so an owner DM survives a single-instance stand-down
+    telegram.send_to = lambda cid, text, ops=False: dm.append((str(cid), text)) or None
     sess.resp = _Resp(409, _CONFLICT_BODY)
     svc.handle_commands()
     check("409: owner warned about the second instance",

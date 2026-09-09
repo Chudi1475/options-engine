@@ -1,0 +1,309 @@
+{
+  "kind": "measurement",
+  "label": "live sniper book split two ways: by entry hour (config consistency) and by the 2026-08-22 ship date of the 09:50 window. Nothing selected on these numbers.",
+  "source": "HANDOFF_BUILD/data/SNIPER_RECORDS.csv",
+  "source_rows": 53,
+  "ship_date": "2026-08-22",
+  "note": "These are bot marks on the UNDERLYING, in R. No option premium, no spread, no broker fill. A 'session end' row is flat, not a loss.",
+  "whole_book": {
+    "label": "all 53 tickets",
+    "n": 53,
+    "exits": {
+      "target": 32,
+      "stop": 17,
+      "session end": 4
+    },
+    "resolved": 49,
+    "wins": 32,
+    "win_rate_resolved_pct": 65.3,
+    "rows_with_r": 53,
+    "net_r": -5.525,
+    "avg_r_per_ticket": -0.1042,
+    "by_symbol": {
+      "EUR/USD": {
+        "n": 4,
+        "target": 2,
+        "stop": 2,
+        "net_r": -1.2
+      },
+      "SPX": {
+        "n": 12,
+        "target": 8,
+        "stop": 3,
+        "net_r": -0.022
+      },
+      "SPY": {
+        "n": 16,
+        "target": 10,
+        "stop": 4,
+        "net_r": -0.692
+      },
+      "TSLA": {
+        "n": 17,
+        "target": 11,
+        "stop": 5,
+        "net_r": -1.011
+      },
+      "USD/JPY": {
+        "n": 4,
+        "target": 1,
+        "stop": 3,
+        "net_r": -2.6
+      }
+    }
+  },
+  "split_a_by_entry_hour": {
+    "basis": "the strategy_version column: entry hour 07/08/09 ET is a ticket the current 09:50 window forbids",
+    "forbidden_by_current_window": {
+      "label": "entry before 09:50 ET",
+      "n": 18,
+      "exits": {
+        "target": 14,
+        "stop": 4
+      },
+      "resolved": 18,
+      "wins": 14,
+      "win_rate_resolved_pct": 77.8,
+      "rows_with_r": 18,
+      "net_r": 1.6,
+      "avg_r_per_ticket": 0.0889,
+      "by_symbol": {
+        "EUR/USD": {
+          "n": 2,
+          "target": 2,
+          "stop": 0,
+          "net_r": 0.8
+        },
+        "SPY": {
+          "n": 5,
+          "target": 5,
+          "stop": 0,
+          "net_r": 2.0
+        },
+        "TSLA": {
+          "n": 9,
+          "target": 6,
+          "stop": 3,
+          "net_r": -0.6
+        },
+        "USD/JPY": {
+          "n": 2,
+          "target": 1,
+          "stop": 1,
+          "net_r": -0.6
+        }
+      }
+    },
+    "allowed_by_current_window": {
+      "label": "entry at or after 10:00 ET",
+      "n": 35,
+      "exits": {
+        "target": 18,
+        "stop": 13,
+        "session end": 4
+      },
+      "resolved": 31,
+      "wins": 18,
+      "win_rate_resolved_pct": 58.1,
+      "rows_with_r": 35,
+      "net_r": -7.125,
+      "avg_r_per_ticket": -0.2036,
+      "by_symbol": {
+        "EUR/USD": {
+          "n": 2,
+          "target": 0,
+          "stop": 2,
+          "net_r": -2.0
+        },
+        "SPX": {
+          "n": 12,
+          "target": 8,
+          "stop": 3,
+          "net_r": -0.022
+        },
+        "SPY": {
+          "n": 11,
+          "target": 5,
+          "stop": 4,
+          "net_r": -2.692
+        },
+        "TSLA": {
+          "n": 8,
+          "target": 5,
+          "stop": 2,
+          "net_r": -0.411
+        },
+        "USD/JPY": {
+          "n": 2,
+          "target": 0,
+          "stop": 2,
+          "net_r": -2.0
+        }
+      }
+    }
+  },
+  "split_b_by_ship_date": {
+    "basis": "row date against 2026-08-22, the day the window shipped",
+    "before_ship": {
+      "label": "dated before 2026-08-22",
+      "n": 30,
+      "exits": {
+        "target": 21,
+        "stop": 9
+      },
+      "resolved": 30,
+      "wins": 21,
+      "win_rate_resolved_pct": 70.0,
+      "rows_with_r": 30,
+      "net_r": -0.6,
+      "avg_r_per_ticket": -0.02,
+      "by_symbol": {
+        "EUR/USD": {
+          "n": 3,
+          "target": 2,
+          "stop": 1,
+          "net_r": -0.2
+        },
+        "SPX": {
+          "n": 5,
+          "target": 4,
+          "stop": 1,
+          "net_r": 0.6
+        },
+        "SPY": {
+          "n": 9,
+          "target": 7,
+          "stop": 2,
+          "net_r": 0.8
+        },
+        "TSLA": {
+          "n": 10,
+          "target": 7,
+          "stop": 3,
+          "net_r": -0.2
+        },
+        "USD/JPY": {
+          "n": 3,
+          "target": 1,
+          "stop": 2,
+          "net_r": -1.6
+        }
+      }
+    },
+    "on_or_after_ship": {
+      "label": "dated on or after 2026-08-22",
+      "n": 23,
+      "exits": {
+        "stop": 8,
+        "target": 11,
+        "session end": 4
+      },
+      "resolved": 19,
+      "wins": 11,
+      "win_rate_resolved_pct": 57.9,
+      "rows_with_r": 23,
+      "net_r": -4.925,
+      "avg_r_per_ticket": -0.2141,
+      "by_symbol": {
+        "EUR/USD": {
+          "n": 1,
+          "target": 0,
+          "stop": 1,
+          "net_r": -1.0
+        },
+        "SPX": {
+          "n": 7,
+          "target": 4,
+          "stop": 2,
+          "net_r": -0.622
+        },
+        "SPY": {
+          "n": 7,
+          "target": 3,
+          "stop": 2,
+          "net_r": -1.492
+        },
+        "TSLA": {
+          "n": 7,
+          "target": 4,
+          "stop": 2,
+          "net_r": -0.811
+        },
+        "USD/JPY": {
+          "n": 1,
+          "target": 0,
+          "stop": 1,
+          "net_r": -1.0
+        }
+      }
+    }
+  },
+  "split_c_by_instrument": {
+    "forex": {
+      "label": "EUR/USD and USD/JPY",
+      "n": 8,
+      "exits": {
+        "stop": 5,
+        "target": 3
+      },
+      "resolved": 8,
+      "wins": 3,
+      "win_rate_resolved_pct": 37.5,
+      "rows_with_r": 8,
+      "net_r": -3.8,
+      "avg_r_per_ticket": -0.475,
+      "by_symbol": {
+        "EUR/USD": {
+          "n": 4,
+          "target": 2,
+          "stop": 2,
+          "net_r": -1.2
+        },
+        "USD/JPY": {
+          "n": 4,
+          "target": 1,
+          "stop": 3,
+          "net_r": -2.6
+        }
+      }
+    },
+    "equity_or_index": {
+      "label": "SPX, SPY, TSLA",
+      "n": 45,
+      "exits": {
+        "target": 29,
+        "stop": 12,
+        "session end": 4
+      },
+      "resolved": 41,
+      "wins": 29,
+      "win_rate_resolved_pct": 70.7,
+      "rows_with_r": 45,
+      "net_r": -1.725,
+      "avg_r_per_ticket": -0.0383,
+      "by_symbol": {
+        "SPX": {
+          "n": 12,
+          "target": 8,
+          "stop": 3,
+          "net_r": -0.022
+        },
+        "SPY": {
+          "n": 16,
+          "target": 10,
+          "stop": 4,
+          "net_r": -0.692
+        },
+        "TSLA": {
+          "n": 17,
+          "target": 11,
+          "stop": 5,
+          "net_r": -1.011
+        }
+      }
+    }
+  },
+  "reconciliation": {
+    "why_18_plus_23_is_not_53": "18 is the Split A count of tickets whose entry hour the current window forbids. 23 is the Split B count of tickets dated on or after the ship date. They partition the book along different axes, so they do not add. Split A sums 18 + 35 = 53. Split B sums 30 + 23 = 53."
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "kind": "measurement",
+  "label": "SPX vs SPY on the same signal: strike-grid granularity, moneyness, paired outcomes, and entry spread. Nothing selected on these numbers.",
+  "sources": [
+    "HANDOFF_BUILD/data/MOMENTUM_RECORDS.csv",
+    "HANDOFF_BUILD/data/OPTION_OBSERVATIONS.csv"
+  ],
+  "window": "2026-06-15 to 2026-09-04, closed tracked signals only",
+  "note": "Bot marks, not broker fills. A wider window than ledger_stats.json, which starts 2026-07-01, so per-ticker counts differ from that file on purpose. Both are correct for their own window.",
+  "per_ticker": {
+    "QCOM": {
+      "n": 39,
+      "median_otm_pct_of_spot": 0.6611,
+      "median_premium_pct_of_spot": 1.3333,
+      "median_contract_cost_usd": 227.0,
+      "strike_step_usd": 2.5,
+      "median_spot": 169.8,
+      "strike_grid_pct_of_spot": 1.4723,
+      "quotes_seen": 25,
+      "median_entry_spread_pct_of_mid": 18.66,
+      "entries_with_spread_ge_giveback": 0,
+      "entries_with_spread_ge_half_trigger": 3
+    },
+    "SPX": {
+      "n": 48,
+      "median_otm_pct_of_spot": 0.0296,
+      "median_premium_pct_of_spot": 0.1299,
+      "median_contract_cost_usd": 996.5,
+      "strike_step_usd": 5.0,
+      "median_spot": 7561.65,
+      "strike_grid_pct_of_spot": 0.0661,
+      "quotes_seen": 44,
+      "median_entry_spread_pct_of_mid": 1.255,
+      "entries_with_spread_ge_giveback": 0,
+      "entries_with_spread_ge_half_trigger": 0
+    },
+    "SPY": {
+      "n": 46,
+      "median_otm_pct_of_spot": 0.0651,
+      "median_premium_pct_of_spot": 0.1291,
+      "median_contract_cost_usd": 97.5,
+      "strike_step_usd": 1.0,
+      "median_spot": 762.28,
+      "strike_grid_pct_of_spot": 0.1312,
+      "quotes_seen": 32,
+      "median_entry_spread_pct_of_mid": 1.14,
+      "entries_with_spread_ge_giveback": 0,
+      "entries_with_spread_ge_half_trigger": 0
+    },
+    "TSLA": {
+      "n": 24,
+      "median_otm_pct_of_spot": 0.2863,
+      "median_premium_pct_of_spot": 1.0564,
+      "median_contract_cost_usd": 391.5,
+      "strike_step_usd": 2.5,
+      "median_spot": 354.5,
+      "strike_grid_pct_of_spot": 0.7052,
+      "quotes_seen": 15,
+      "median_entry_spread_pct_of_mid": 2.17,
+      "entries_with_spread_ge_giveback": 0,
+      "entries_with_spread_ge_half_trigger": 0
+    }
+  },
+  "paired_spx_spy": {
+    "pairs": 42,
+    "graded_pairs": 42,
+    "spx_mean_final_pct": 10.48,
+    "spy_mean_final_pct": 2.73,
+    "same_outcome_sign": 33,
+    "median_otm_pct_spx": 0.0296,
+    "median_otm_pct_spy": 0.0651
+  },
+  "finding": {
+    "strike_grid_ratio_spy_over_spx": 1.985,
+    "realized_otm_ratio_spy_over_spx": 2.199,
+    "reading": "The two ratios agree. SPY sits about twice as far out of the money as SPX on the same signal, and the cause is mechanical: its strike grid is twice as coarse as a percentage of spot. This is a strike-selection artifact, not a market view, and it is a candidate explanation for SPY's worse average loss and smaller average win on an identically timed trade.",
+    "spread_hypothesis": "REFUTED at entry. Across every entry with a recorded quote, none had a bid/ask spread at or above the 40 point give-back trail. SPY's entry spread is the tightest of the four names. The bot records no exit-time quote, so the exit-side version of this hypothesis is untestable with what exists today.",
+    "not_established": "This measurement does NOT show that moving SPY's strike closer to the money would make it profitable. It shows the two legs are not the same trade. Testing the fix needs option prices at alternative strikes for past timestamps, which no free source provides."
+  }
+}

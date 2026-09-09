@@ -1,0 +1,71 @@
+{
+  "kind": "measurement",
+  "label": "losses deeper than the -90% stop, split by whether the closing mark was a live quote or a Black-Scholes estimate. Nothing selected on these.",
+  "source": "HANDOFF_BUILD/data/MOMENTUM_RECORDS.csv",
+  "window": "2026-06-15 to 2026-09-04, closed tracked signals only",
+  "stop_level_pct": -90.0,
+  "closed_rows": 157,
+  "stop_exits_total": 46,
+  "stop_exits_past_the_level": 20,
+  "every_past_level_row_was_a_stop": true,
+  "by_mark_source": {
+    "modeled_black_scholes": {
+      "n": 6,
+      "worst": -99.69,
+      "best": -90.14,
+      "max_overshoot_points": 9.69,
+      "exit_reasons": {
+        "stop": 6
+      },
+      "tickers": {
+        "SPX": 2,
+        "SPY": 2,
+        "QCOM": 2
+      }
+    },
+    "live_quote": {
+      "n": 14,
+      "worst": -91.11,
+      "best": -90.23,
+      "max_overshoot_points": 1.11,
+      "exit_reasons": {
+        "stop": 14
+      },
+      "tickers": {
+        "QCOM": 2,
+        "SPY": 6,
+        "SPX": 6
+      }
+    }
+  },
+  "modeled_pnl_pcts": [
+    -99.69,
+    -99.64,
+    -97.12,
+    -93.62,
+    -92.76,
+    -90.14
+  ],
+  "quoted_pnl_pcts": [
+    -91.11,
+    -90.93,
+    -90.91,
+    -90.91,
+    -90.83,
+    -90.75,
+    -90.48,
+    -90.35,
+    -90.35,
+    -90.28,
+    -90.27,
+    -90.26,
+    -90.25,
+    -90.23
+  ],
+  "finding": {
+    "reading": "Every row in the book that closed past the stop level was a stop exit. Split by mark source, the two groups do not overlap in magnitude: the modeled marks hold the deep tail, and no live quote in the book ever produced a comparable loss. The deep losses are a pricing artifact, not market slippage.",
+    "why_it_matters": "Moving the stop level would not have prevented any of them, and a tighter stop costs win rate. MIN_WINRATE is 70, so a setup pushed under the floor stops alerting.",
+    "known_bias": "The estimate is priced with realized volatility from daily closes, not implied vol. On 0DTE, live IV is routinely far above realized, so the model mark is biased on exactly the contracts where the chain goes bid-less near the close.",
+    "not_established": "This does not show what the true exit price was. There is no broker fill and no historical option quote archive, so the honest claim is that the recorded loss is unverified whenever the mark is modeled, not that it is wrong by a known amount."
+  }
+}

@@ -10,7 +10,16 @@ P01  Stretch targets took their sign from a direction variable that had already
 P02  The forward ledger deduplicated on (symbol, direction, date), so the first
      candidate of the day won forever. A 9:35 near miss therefore erased the
      9:50 alert that actually fired, which is why live alerts had no matching
-     forward observation at their real entry.
+     forward observation at their real entry. The rest of that repair, the
+     candidate id being returned and carried onto the alert and the position,
+     and the ledger surviving a concurrent append, lives in
+     test_ledger_integrity.py.
+
+P06  /brain ran its forced billing probe inline on the Telegram command
+     dispatcher, the same thread that walks open positions for stops between
+     cycles, so typing /brain during a billing hold delayed the next
+     monitoring pass by however long the API took to refuse. It now answers
+     at once and a worker texts the verdict back to the same chat.
 
 No network, no Telegram, no model API, no production storage.
 
@@ -126,7 +135,7 @@ ET = ZoneInfo("America/New_York")
 
 
 def _cand(hh, mm, passes, entry, stop, reasons=(), gap=1.6):
-    forward_ledger.record_candidate(
+    return forward_ledger.record_candidate(
         symbol="EURUSD=X", direction="BUY", price=entry, atr=0.0012,
         ticket={"entry": entry, "stop": stop},
         conf={"grade": "A" if passes else "B"},
@@ -157,12 +166,23 @@ _cand(9, 50, True, 1.1020, 1.1008)
 check("P02: re-recording the same event does not create a duplicate",
       len(_rows()) == before, f"{before} -> {len(_rows())}")
 
-# a DIFFERENT passing look later the same day must not become a second entry
-# either: the validated shape is one accepted trade per symbol per day
-_cand(11, 15, True, 1.1050, 1.1038)
-check("P02: a second accepted entry the same day is still refused",
-      len([r for r in _rows() if r.get("passes")]) == 1,
+# A DIFFERENT passing look later the same day is a real observation and is
+# RECORDED. The old rule dropped it on the floor: not demoted, not kept as a
+# reject, no trace at all, so the ledger could not say what the bot had seen.
+# One trade per symbol per day is an ENTRY rule and it still holds, but it
+# lives in the scanner and in sniper_book, not in the recorder. Here it shows
+# up as exactly one observation carrying the selected flag.
+_second = _cand(11, 15, True, 1.1050, 1.1038)
+check("P02: a second passing observation the same day is still recorded",
+      len([r for r in _rows() if r.get("passes")]) == 2,
       f"passing={[r.get('time_et') for r in _rows() if r.get('passes')]}")
+check("P02: recording alone selects nothing for broadcast",
+      not any(r.get("selected") for r in _rows()),
+      f"selected={[r.get('time_et') for r in _rows() if r.get('selected')]}")
+forward_ledger.mark_selected(_second, position_id="pos-test")
+check("P02: exactly one observation is marked as the delivered entry",
+      len([r for r in _rows() if r.get("selected")]) == 1,
+      f"selected={[r.get('time_et') for r in _rows() if r.get('selected')]}")
 
 # but a later REJECT is still recorded, because rejects are the denominator
 _cand(13, 5, False, 1.1070, 1.1058, ["day efficiency 0.9, one-way tape"])
@@ -193,14 +213,28 @@ try:
           not config.learn_enabled() and not config.api_allows("scheduled")[0])
 
     calls = []
-    forward_ledger.fill_outcomes = lambda *a, **k: (calls.append(1), 3)[1]
+    # the grader returns a COUNTS dict now, not a bare int, and the scheduler
+    # claims the day off res["complete"]. A stub that still returned 3 would
+    # blow up on .get inside the job, get swallowed, and show up here as the
+    # unrelated-looking double-grade check failing.
+    _COMPLETE = {"eligible": 1, "graded": 1, "unresolved": 0,
+                 "missing_data": 0, "failed_writes": 0,
+                 "retryable_failures": 0, "permanent_failures": 0,
+                 "read_ok": True, "complete": True}
+    forward_ledger.fill_outcomes = lambda *a, **k: (calls.append(1),
+                                                    dict(_COMPLETE))[1]
 
     svc = scanner.Service.__new__(scanner.Service)
     svc.dry = False
     svc.MAX_JOB_ATTEMPTS = 2
 
     now = datetime(2026, 9, 8, 22, 30, tzinfo=ET)
-    config.state_set("forward_graded", None)
+    # clear the whole grading state, not just the done key: a leftover park or
+    # retry stamp from another section would suppress the call and this would
+    # read as "grading is off when the paid review is off"
+    for _k in ("forward_graded", "forward_grade_attention",
+               "forward_grade_last"):
+        config.state_set(_k, None)
     scanner.Service.maybe_grade_forward(svc, now)
     check("P03: grading runs with the paid review and all AI spend disabled",
           len(calls) == 1, f"calls={len(calls)}")
@@ -346,6 +380,191 @@ finally:
     assistant.probe_billing = _saved_probe
     assistant.billing_hold = _saved_hold
     assistant.enabled = _saved_en
+
+# --------------------------------------------------------------------------
+# P06 (command path): /brain must answer without blocking the dispatcher
+# --------------------------------------------------------------------------
+# run_command is called from handle_commands, on the same loop thread that
+# walks open positions for +25%/give-back/STOP between cycles. The probe
+# /brain forces is up to three attempts at a 15 second timeout plus backoff,
+# and that is one scenario, not a ceiling: requests' timeout bounds each
+# socket operation, not the wall clock. So the dispatcher has to come back at
+# once AND the fresh verdict still has to land in the chat that asked.
+import telegram as _tg
+
+_saved_probe = assistant.probe_billing
+_saved_hold = assistant.billing_hold
+_saved_en = assistant.enabled
+_saved_send = _tg.send_to
+_saved_isowner = _tg.is_owner
+_saved_primary = _tg.primary_owner_id
+try:
+    # the block above left a stubbed 2 second probe holding the in-flight
+    # lock. wait it out so this block only ever times its own work.
+    for _ in range(500):
+        if assistant._PROBE_INFLIGHT.acquire(blocking=False):
+            assistant._PROBE_INFLIGHT.release()
+            break
+        _time.sleep(0.02)
+
+    from scanner import Service
+
+    svc = Service.__new__(Service)   # no network-y __init__, same as test_adduser
+
+    assistant.enabled = lambda: True
+    assistant.billing_hold = lambda: {"since": 1, "last_probe": 1,
+                                      "notified": True}
+    _tg.is_owner = lambda cid: True
+    _tg.primary_owner_id = lambda: "111"
+
+    _sent = []
+    _got_one = threading.Event()
+
+    def _capture(cid, text):
+        _sent.append((str(cid), text))
+        _got_one.set()
+        return None
+
+    _tg.send_to = _capture
+
+    _calls = []
+    _release = threading.Event()
+
+    def _stalled_probe(force=False):
+        _calls.append(bool(force))
+        _release.wait(timeout=5.0)   # stands in for a stalled API
+        return False
+
+    assistant.probe_billing = _stalled_probe
+
+    t0 = _time.monotonic()
+    first = svc.run_command("/brain", "", chat_id="111")
+    elapsed = _time.monotonic() - t0
+    check("P06: /brain returns to the dispatcher immediately",
+          elapsed < 0.5, f"took {elapsed:.2f}s")
+    check("P06: /brain says a check is running",
+          "Checking the API right now" in (first or ""), repr(first))
+
+    for _ in range(500):             # let the worker reach the probe
+        if _calls:
+            break
+        _time.sleep(0.02)
+    check("P06: /brain still forces a real check", _calls == [True], str(_calls))
+
+    second = svc.run_command("/brain", "", chat_id="222")
+    check("P06: a second /brain starts no second probe",
+          _calls == [True], str(_calls))
+    check("P06: the second /brain is told the answer is coming",
+          "Already checking" in (second or ""), repr(second))
+
+    _release.set()                   # the API finally answers
+    check("P06: the verdict is texted after the command already returned",
+          _got_one.wait(timeout=10))
+    for _ in range(500):             # both waiters, one verdict
+        if len(_sent) >= 2:
+            break
+        _time.sleep(0.02)
+    check("P06: both /brain callers get the same fresh verdict",
+          {c for c, _ in _sent} == {"111", "222"}, str(_sent))
+    check("P06: the verdict reads as a check made just now",
+          bool(_sent) and all("Checked just now" in t for _, t in _sent),
+          str(_sent))
+    check("P06: the dispatcher no longer runs the forced probe inline",
+          "probe_billing(force=True)" not in
+          Path(__file__).with_name("scanner.py").read_text(encoding="utf-8-sig"))
+finally:
+    assistant.probe_billing = _saved_probe
+    assistant.billing_hold = _saved_hold
+    assistant.enabled = _saved_en
+    _tg.send_to = _saved_send
+    _tg.is_owner = _saved_isowner
+    _tg.primary_owner_id = _saved_primary
+
+# --------------------------------------------------------------------------
+# P06 (start failure): a worker that never started must not kill /brain
+# --------------------------------------------------------------------------
+# _FORCED_RUNNING is latched BEFORE the worker exists and only the worker's
+# finally clears it. On a container already running the sniper-watch,
+# news-watch, flush-pending, brain-reply and billing-probe workers,
+# Thread.start() can raise "can't start new thread". If that escapes, the flag
+# stays set for the life of the process, the caller's callback stays parked,
+# and every later /brain sees a probe in flight and answers nothing. The
+# automatic path claims the same way with the in-flight lock instead of a flag.
+_saved_probe = assistant.probe_billing
+_saved_hold = assistant.billing_hold
+_saved_en = assistant.enabled
+_saved_threading = assistant.threading
+_saved_send = _tg.send_to
+_saved_primary = _tg.primary_owner_id
+
+
+class _NoNewThreads:
+    """threading with Thread() refusing, the way a maxed-out container does."""
+
+    def Thread(self, *a, **kw):
+        raise RuntimeError("can't start new thread")
+
+    def __getattr__(self, name):
+        return getattr(threading, name)
+
+
+try:
+    assistant.enabled = lambda: True
+    assistant.billing_hold = lambda: {"since": 1, "last_probe": 1,
+                                      "notified": True}
+    assistant.probe_billing = lambda force=False: False
+    _notes = []
+    _tg.send_to = lambda cid, text: _notes.append((str(cid), text))
+    _tg.primary_owner_id = lambda: "111"
+
+    _verdicts = []
+    assistant.threading = _NoNewThreads()
+    _started = assistant.probe_billing_forced(on_done=_verdicts.append)
+
+    check("P06: a /brain whose worker cannot start does not report a probe",
+          _started is False, repr(_started))
+    check("P06: a worker that never started does not latch /brain forever",
+          assistant._FORCED_RUNNING is False)
+    check("P06: no caller is left parked on a worker that never started",
+          assistant._FORCED_WAITERS == [] and len(_verdicts) == 1,
+          f"{assistant._FORCED_WAITERS} {_verdicts}")
+    check("P06: the chat is told the check could not start",
+          any("could not start" in t.lower() for _, t in _notes), str(_notes))
+
+    check("P06: an automatic probe whose worker cannot start returns False",
+          assistant.probe_billing_async() is False)
+    _free = assistant._PROBE_INFLIGHT.acquire(blocking=False)
+    if _free:
+        assistant._PROBE_INFLIGHT.release()
+    check("P06: a probe that never started does not hold the in-flight lock",
+          _free)
+
+    # threads are available again: the next /brain has to be a real check
+    assistant.threading = _saved_threading
+    _verdicts2 = []
+    _ran = threading.Event()
+
+    def _quick_probe(force=False):
+        _ran.set()
+        return True
+
+    assistant.probe_billing = _quick_probe
+    check("P06: the next /brain after a failed start still probes",
+          assistant.probe_billing_forced(on_done=_verdicts2.append) is True)
+    check("P06: that probe reached the API", _ran.wait(timeout=5))
+    for _ in range(500):
+        if _verdicts2:
+            break
+        _time.sleep(0.02)
+    check("P06: and its verdict reaches the caller", _verdicts2 == [True],
+          str(_verdicts2))
+finally:
+    assistant.probe_billing = _saved_probe
+    assistant.billing_hold = _saved_hold
+    assistant.enabled = _saved_en
+    assistant.threading = _saved_threading
+    _tg.send_to = _saved_send
+    _tg.primary_owner_id = _saved_primary
 
 print()
 if failures:

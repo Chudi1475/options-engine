@@ -33,7 +33,9 @@ GUARDED = ("scanner.py", "cards.py", "assistant.py", "news.py", "risk_gate.py",
            "recap.py", "scoreboard.py", "telegram.py", "sniper_book.py",
            "learn.py", "coach.py", "intake.py", "market_tools.py", "charts.py",
            "strategy_spec.py", "forward_ledger.py", "live_params.py",
-           "positions.py", "quotes.py", "strategy.py", "config.py")
+           "positions.py", "quotes.py", "strategy.py", "config.py",
+           # instance_lock renders the stand-down and wedge DMs the owner reads
+           "instance_lock.py")
 
 EM_DASH = "—"
 

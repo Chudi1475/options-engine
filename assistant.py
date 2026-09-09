@@ -202,7 +202,118 @@ def probe_billing_async(force: bool = False) -> bool:
         finally:
             _PROBE_INFLIGHT.release()
 
-    threading.Thread(target=_run, daemon=True, name="billing-probe").start()
+    try:
+        threading.Thread(target=_run, daemon=True, name="billing-probe").start()
+    except Exception as e:
+        # the lock above is the claim, taken BEFORE the worker exists, and only
+        # the worker releases it. a container already running the sniper-watch,
+        # news-watch, flush-pending and reply workers can refuse a new thread,
+        # and a refusal escaping here would leave the claim held for the life of
+        # the process: no automatic probe would ever run again, and every forced
+        # one would sit out its full 25 second wait for a worker that never was.
+        print(f"billing probe could not start: {e}")
+        _PROBE_INFLIGHT.release()
+        return False
+    return True
+
+
+_FORCED_WAIT_S = 25          # how long a forced probe waits for an automatic
+                             # one to get out of the way, on its OWN thread
+_FORCED_LOCK = threading.Lock()   # guards the two names below
+_FORCED_RUNNING = False      # a /brain probe is claimed or in flight
+_FORCED_WAITERS = []         # on_done callbacks awaiting that probe's verdict
+
+
+def _finish_forced(ok):
+    """Release the /brain claim and hand every parked caller the SAME verdict.
+
+    `ok` is True, False, or None for "no check was made at all". None is not a
+    verdict and callers must not render it as one: the path where the worker
+    never starts has nothing to report, and saying otherwise would put a
+    fabricated result in front of the owner.
+
+    Kept out of the worker because the claim is latched before the worker
+    exists, so the path where the worker never starts has to be able to undo it
+    too. A callback that throws must not swallow the other callers' reply."""
+    global _FORCED_RUNNING
+    with _FORCED_LOCK:
+        waiters = list(_FORCED_WAITERS)
+        del _FORCED_WAITERS[:]
+        _FORCED_RUNNING = False
+    for cb in waiters:
+        try:
+            cb(ok)
+        except Exception as e:
+            print(f"forced probe callback failed: {e}")
+
+
+def probe_billing_forced(on_done=None) -> bool:
+    """Run a FORCED billing probe on a background thread and hand the verdict
+    to on_done(ok: bool) when it lands.
+
+    This is the /brain path. The Telegram command dispatcher is the same
+    thread that walks open positions for the half, the give-back trail and
+    the stop between cycles, so no exit can wait on an API call. A forced
+    probe is up to three attempts at a 15 second timeout plus backoff, and
+    that arithmetic is one scenario, not a ceiling: requests' timeout bounds
+    each socket operation, not the wall clock, so a slow resolver, a stalled
+    handshake, or a retry-after the API asks us to honour all stretch it
+    further.
+
+    Single flight: a second /brain while one is still in the air starts no
+    second probe and spends no second token. Its on_done is attached to the
+    one already running, so BOTH chats get the same fresh verdict. Returns
+    True when THIS call started the probe, False when it joined one."""
+    global _FORCED_RUNNING
+    with _FORCED_LOCK:
+        if on_done is not None:
+            _FORCED_WAITERS.append(on_done)
+        if _FORCED_RUNNING:
+            return False
+        _FORCED_RUNNING = True
+
+    def _run():
+        ok = False
+        try:
+            # wait out an automatic probe rather than doubling the call. the
+            # wait happens HERE, on the worker, never on the caller's thread.
+            got = _PROBE_INFLIGHT.acquire(timeout=_FORCED_WAIT_S)
+            try:
+                ok = probe_billing(force=True)
+            finally:
+                if got:
+                    _PROBE_INFLIGHT.release()
+        except Exception as e:
+            print(f"forced billing probe failed: {e}")
+            ok = billing_hold() is None
+        finally:
+            # clear the claim and drain every waiter with the SAME verdict, so
+            # a /brain that joined mid-flight still gets an answer.
+            _finish_forced(ok)
+
+    try:
+        threading.Thread(target=_run, daemon=True,
+                         name="billing-probe-forced").start()
+    except Exception as e:
+        # the claim is latched above, before the worker exists, and only the
+        # worker clears it. a container already running the sniper-watch,
+        # news-watch, flush-pending, brain-reply and billing-probe workers can
+        # refuse a new thread, and a refusal escaping here left the flag set for
+        # the life of the process: every later /brain saw a probe in flight and
+        # answered nothing at all. so unlatch, say plainly that the check never
+        # started, and still hand the parked callers what we know without the
+        # network, the same fallback the worker uses when the probe blows up.
+        print(f"forced billing probe could not start: {e}")
+        # None, not a boolean. Handing back billing_hold() here read as a
+        # verdict, and the caller renders a verdict as "checked just now and
+        # the API still refused", which is a claim about a request that was
+        # never sent. This bot does not get to say it checked something it did
+        # not check. None means exactly that, and the caller says so.
+        _finish_forced(None)
+        _owner_note("Could not start the API check just now, so nothing was "
+                    "asked. Nothing about a trade waits on it. Try /brain "
+                    "again in a moment.")
+        return False
     return True
 
 

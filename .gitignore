@@ -20,4 +20,9 @@ chat_history.json
 user_trades.json
 user_trades_test.json
 *.tmp
+scanner.lock
 logs/
+
+# the astra handoff carries the live trading record and the account size.
+# it goes to the reviewer directly, not to a public repo.
+HANDOFF_FOR_ASTRA_*.md

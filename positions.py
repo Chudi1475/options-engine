@@ -242,13 +242,21 @@ class PositionBook:
         self.positions = []
         self.load()
 
-    def load(self):
+    def _parse_file(self):
+        """The file's rows, or None when there is nothing trustworthy to read.
+
+        None means "leave what you have", never "the book is empty". That
+        distinction only matters to reload(): at boot the book is empty either
+        way, so this is behavior-identical there, but on a promotion an
+        unreadable file must not be allowed to look like a closed book."""
         if not self.path.exists():
-            return
+            return None
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
-        except (json.JSONDecodeError, OSError):
-            raw = []
+        except (json.JSONDecodeError, OSError, ValueError):
+            return None
+        if not isinstance(raw, list):
+            return None
         # parse each record on its own and filter unknown keys, so ONE bad /
         # legacy / schema-evolved record can never crash the whole bot on boot
         # and silently drop every live position from monitoring
@@ -260,7 +268,47 @@ class PositionBook:
             except (TypeError, ValueError, AttributeError) as e:
                 rid = p.get("id") if isinstance(p, dict) else repr(p)
                 print(f"skipping unloadable position record {rid}: {e}")
-        self.positions = out
+        return out
+
+    def load(self):
+        parsed = self._parse_file()
+        if parsed is None:
+            return
+        self.positions = parsed
+
+    def reload(self):
+        """Re-read the file and MERGE it over what is in memory.
+
+        load() only ever ran in __init__, and the daemon builds one book for
+        the life of the process. that is fine while one copy owns the file and
+        wrong the moment two share a volume: a copy that booted, lost the
+        singleton lease and sat in standby is still holding the snapshot it
+        read at BOOT, so its first save() after promoting erases every row the
+        copy that WAS active opened meanwhile, and those positions stop being
+        watched for their stop, their half and their give-back with nobody
+        told. so anything on disk wins (the active copy is the one that was
+        marking it), and a row only this copy knows is kept rather than
+        dropped, because losing a live position is the same money bug pointing
+        the other way. ids are the join; a file that is missing or unreadable
+        leaves memory exactly as it was.
+
+        Nothing is mutated until the parse has actually succeeded. Emptying the
+        list first and then calling load() made the docstring above a lie: a
+        missing file returned early and a bad one raised, and either way the
+        book was left EMPTY rather than untouched. _promote swallows exceptions
+        out of here (a bad row must never leave a promotion mute), so that
+        empty book would have gone straight to save() and erased the winner's
+        open rows, which is the exact money bug reload exists to prevent."""
+        disk = self._parse_file()
+        if disk is None:
+            return
+        known = {p.id for p in disk}
+        merged = list(disk)
+        for p in self.positions:
+            if p.id not in known:
+                merged.append(p)
+                known.add(p.id)
+        self.positions = merged
 
     def save(self):
         # unique temp per pid/thread (mirrors config.save_state) so two writers

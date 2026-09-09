@@ -94,14 +94,37 @@ def split_message(text: str, limit: int = TG_MAX_CHARS) -> list:
     return parts
 
 
-def send_to(chat_id, text: str):
+def send_to(chat_id, text: str, ops: bool = False):
     """Send to one chat, splitting texts over Telegram's length limit into
-    several sequential messages. Returns an error string or None."""
+    several sequential messages. Returns an error string or None.
+
+    ops=True marks an operations note to the owner (a heartbeat, a stand-down
+    notice). Those are the ONE thing a standby copy may still send: an
+    instance that has been told to go quiet must still be able to say why."""
     for part in split_message(text):
-        err = _send_one(chat_id, part)
+        err = _send_one(chat_id, part, ops=ops)
         if err:
             return err
     return None
+
+
+# Set by scanner when this process loses the singleton lease (instance_lock).
+# A losing copy must not broadcast, must not answer chats, and must not poll
+# getUpdates at all: no poll, no 409, and the winner answers everything.
+# Same reasoning as test_mode below: individual call sites can forget, so the
+# gate lives at the wire where nothing can route around it.
+_standby = (False, "")
+
+
+def set_standby(on: bool, reason: str = ""):
+    """Gag (or ungag) every outbound call except ops DMs to the owner."""
+    global _standby
+    _standby = (bool(on), reason or "")
+
+
+def standby() -> tuple:
+    """(on, reason). scanner reads this before doing any work at all."""
+    return _standby
 
 
 def test_mode() -> bool:
@@ -119,11 +142,16 @@ def test_mode() -> bool:
     return bool(os.environ.get("BOT_TEST_MODE", "").strip())
 
 
-def _send_one(chat_id, text: str):
+def _send_one(chat_id, text: str, ops: bool = False):
     """Send one already-fitting message. Returns an error string or None."""
     if test_mode():
         print(f"[test mode, not sent -> {chat_id}] {text[:120]}")
         return None
+    if _standby[0] and not ops:
+        # a second copy of the bot is up and this one lost the lease. dropping
+        # here rather than at each call site is the whole point of a wire gate.
+        print(f"[standby, not sent -> {chat_id}] {text[:80]}")
+        return f"{chat_id}: standby instance, not sent"
     try:
         r = _session.post(
             f"https://api.telegram.org/bot{_token()}/sendMessage",
@@ -178,6 +206,9 @@ def _send_photo_raw(chat_id, photo, caption: str = ""):
     if test_mode():
         print(f"[test mode, photo not sent -> {chat_id}]")
         return None, None
+    if _standby[0]:  # charts are broadcasts; a standby copy sends none of them
+        print(f"[standby, photo not sent -> {chat_id}]")
+        return f"{chat_id}: standby instance, not sent", None
     try:
         if isinstance(photo, (bytes, bytearray)):
             r = _session.post(
@@ -302,6 +333,12 @@ def get_messages(timeout: int = 0):
     it — replay is the safe direction here."""
     global _conflict
     offset = int(config.state_get("tg_offset", 0))
+    if _standby[0]:
+        # THE line that removes the 409 at its source. Telegram allows one
+        # getUpdates consumer per token, so the copy that lost the lease must
+        # not poll at all. It has no commands to answer because it never
+        # receives one; the winner answers every command.
+        return [], offset
     try:
         r = _session.get(
             f"https://api.telegram.org/bot{_token()}/getUpdates",

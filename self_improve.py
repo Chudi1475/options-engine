@@ -86,8 +86,8 @@ Hard rules:
 - Verify before committing: compile every file you touched with
   .venv/Scripts/python.exe -m py_compile, then run
   .venv/Scripts/python.exe test_pipeline.py, test_adduser.py,
-test_no_hardcoded_stats.py, test_session_fixes.py, test_market_calendar.py
-and test_no_em_dash.py.
+test_no_hardcoded_stats.py, test_session_fixes.py, test_market_calendar.py,
+test_instance_lease.py and test_no_em_dash.py.
 All must pass. If you change a rule number, change
 it in config.py and let strategy_spec render it: never type a stat into a card,
 a prompt or a doc, and run `python gen_docs.py` after a config change.
@@ -176,10 +176,15 @@ def run_checks(files: list) -> bool:
             if r.returncode != 0:
                 say(f"gate: compile failed: {r.stderr[:300]}")
                 return False
+        # test_review_packet_gate.py reaches the review packet's own suite,
+        # which lives outside this repo. it SKIPs when no packet is on the
+        # machine, so a worker without the review kit still passes the gate.
         for test in ("test_pipeline.py", "test_adduser.py",
                      "test_no_hardcoded_stats.py", "test_session_fixes.py",
                      "test_market_calendar.py", "test_review_regressions.py",
-                     "test_no_em_dash.py"):
+                     "test_ledger_integrity.py", "test_review_import.py",
+                     "test_grading_integrity.py", "test_instance_lease.py",
+                     "test_no_em_dash.py", "test_review_packet_gate.py"):
             r = subprocess.run([PYEXE, test], cwd=REPO, timeout=600,
                                capture_output=True, text=True, errors="replace")
             if r.returncode != 0:

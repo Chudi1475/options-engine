@@ -82,9 +82,26 @@ def _read() -> list:
         return []
 
 
+def _standing_by() -> bool:
+    """True when this copy lost the single-instance lease.
+
+    this file sits on a shared volume, so a loser that writes it opens rows the
+    winner never announced and closes rows the winner is still watching. the
+    wire gag stops the cards, not the writes, so the check has to sit down here
+    at the write as well as at the caller. imported lazily on purpose: this is
+    a ledger and must not grow an import-time dependency on the transport."""
+    try:
+        import telegram
+        return bool(telegram.standby()[0])
+    except Exception:  # no transport loaded at all: nothing is standing by
+        return False
+
+
 def _write(rows: list) -> None:
     """Atomic publish, same discipline as config.save_state: a torn write here
     would lose an open trade's stop."""
+    if _standing_by():
+        return  # not this copy's file to write while another holds the lease
     try:
         tmp = LEDGER.with_suffix(f".{id(rows)}.tmp")
         tmp.write_text(json.dumps(rows, indent=1), encoding="utf-8")
@@ -127,12 +144,21 @@ def _row_clock(day: str, time_et: str):
 
 def open_trade(symbol: str, display: str, direction: str, entry: float,
                stop: float, target: float, day: str, time_et: str,
-               decimals: int = 2, entry_ts=None) -> dict:
+               decimals: int = 2, entry_ts=None,
+               candidate_id: str = None) -> dict:
     """Track a fired sniper. Returns the stored row, or None if it was
     rejected (bad levels, or one already open on this symbol today).
     `entry_ts` (aware ET datetime or ISO text) pins the entry BAR so the
-    bar-walk in step() starts from the fill bar, like the backtest."""
+    bar-walk in step() starts from the fill bar, like the backtest.
+    `candidate_id` is the forward ledger's id for the observation this ticket
+    came from. Without it the only join between a delivered alert and its
+    forward observation was guesswork on symbol, day and an approximate time,
+    and the two clocks are not even the same one: the observation is stamped
+    with the read clock and this row with the later fired clock. Rows written
+    before this field existed do not carry it, so always read it with .get."""
     try:
+        if _standing_by():
+            return None  # a mute copy tracks nothing; see _standing_by
         if direction not in ("BUY", "SELL"):
             return None
         entry, stop, target = float(entry), float(stop), float(target)
@@ -152,6 +178,9 @@ def open_trade(symbol: str, display: str, direction: str, entry: float,
         ets = _parse_ts(entry_ts) or _row_clock(day, time_et)
         row = {
             "id": f"{day}-{time_et.replace(':', '')}-{symbol}-{direction}",
+            # the forward observation this ticket came from, carried through
+            # rather than re-derived from a clock that does not match
+            "candidate_id": candidate_id,
             "date": day, "time_et": time_et,
             "symbol": symbol, "display": display, "direction": direction,
             "entry": entry, "stop": stop, "target": target,
@@ -241,6 +270,8 @@ def step(symbol: str, price: float, now_et=None, bars=None) -> dict:
     showing both scores a loss.
     """
     try:
+        if _standing_by():
+            return None  # grading rewrites the shared book; see _standing_by
         rows = _read()
         row = next((r for r in rows
                     if r.get("state") == "open" and r.get("symbol") == symbol),

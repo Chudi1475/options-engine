@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import json
+import os
 import random
 import sys
 
@@ -38,6 +39,7 @@ import yfinance as yf
 
 import cards
 import config
+import instance_lock
 import live_params
 import market_calendar
 import news
@@ -141,6 +143,52 @@ def learn_session_due(now: datetime) -> date:
     return market_calendar.prev_trading_day(d)
 
 
+def forward_grade_session(now: datetime) -> date:
+    """The session whose sniper candidates are due to be graded at this tick.
+
+    Grading gets its OWN key, opening at WEEKLY_AT, instead of riding
+    learn_session_due's randomized 21:00-23:45 target. Borrowing the paid
+    review's clock made a free deterministic measurement wait on a paid one
+    and tied the grading key to a setting that has nothing to do with grading.
+
+    What this key does NOT claim is that every row of the session is settled
+    at 16:05. It is not. Two symbols in the sniper roster are 24h FX and the
+    grading download asks for prepost, so a row's bars keep printing well
+    after the equity close. Whether one row can be called final is decided per
+    row inside forward_ledger, and a row that is not final yet is left for the
+    next pass instead of being frozen wrong. See _outcome_is_final there.
+
+    Off-session ticks still point back at the last real session, same as the
+    review does, so a weekend tick or a post-outage restart grades the day
+    that was missed rather than forgetting it."""
+    d = now.date()
+    if is_session_day(d) and now.time() >= WEEKLY_AT:
+        return d
+    return market_calendar.prev_trading_day(d)
+
+
+def _grade_attention_reason(res, n: int) -> str:
+    """A short sentence naming what stayed unresolved, for the parked record.
+
+    Every number in it is read back off the counts the grader returned, so
+    the needs-attention line cannot say anything the ledger did not."""
+    if not isinstance(res, dict):
+        return f"grading raised on every one of {n} passes"
+    if not res.get("read_ok"):
+        return f"the ledger could not be read on any of {n} passes"
+    total = res.get("eligible", 0)
+    bits = []
+    if res.get("missing_data"):
+        bits.append(f"{res['missing_data']} of {total} row(s) still had no "
+                    "data")
+    if res.get("failed_writes"):
+        bits.append(f"{res['failed_writes']} of {total} row(s) could not be "
+                    "persisted")
+    if not bits:
+        bits.append(f"the pass over {total} row(s) did not reconcile")
+    return f"{', '.join(bits)} after {n} passes"
+
+
 def keep_awake(on: bool):
     """Stop the PC from sleeping mid-session (Windows only; no-op anywhere
     else, so this stays cloud-safe). Released when the session ends."""
@@ -199,6 +247,22 @@ class Service:
         self._health_last_stamp = 0.0   # monotonic; throttles the alive-stamp
         self._feed_warned = False       # in-memory: feed-stale DM already sent
         self._feed_none_warned = False  # in-memory: no-data-yet DM already sent
+        # single-instance lease (see ensure_active). all in-memory dampers, so
+        # a crash-looping loser DMs at most once per boot on top of the
+        # persisted once-a-day flag.
+        self._standby_warned = False    # stand-down DM already sent this boot
+        self._wedge_warned = False      # "winner stopped renewing" DM sent
+        self._degraded_warned = False   # "no lock primitive here" DM sent
+        self._stood_down = False        # this copy has SEEN a live holder, so
+                                        # an unreadable lock is no longer proof
+                                        # it is alone (see ensure_active)
+        self._blind_warned = False      # "cannot read the lock" DM sent
+        self._standby_print = 0.0       # monotonic; throttles the standby log
+        self._held_lock = False         # this copy currently owns the OS lock.
+                                        # a DEGRADED copy is active WITHOUT it,
+                                        # so "am I gagged" is not the same
+                                        # question as "did I just take it"
+        self._seqwatch = instance_lock.SeqWatch()
 
     # ---------- plumbing ----------
 
@@ -206,6 +270,14 @@ class Service:
         if self.dry:
             print(f"\n{text}\n")
             log_alert(text, ["dry-run, not sent"])
+            return []
+        if telegram.standby()[0]:
+            # THE most important line in the singleton change. Returning an
+            # error list instead would append this text to pending_sends, and
+            # pending_sends lives in the SHARED state.json, so the WINNER
+            # would later flush and broadcast the loser's duplicates. Return
+            # empty, queue nothing, write no alerts.log line.
+            print(f"[standby, not broadcast] {text[:80]}")
             return []
         try:
             errors = telegram.send(text)
@@ -236,12 +308,26 @@ class Service:
         queued message is dropped after MAX_SEND_RETRIES attempts."""
         if self.dry:
             return
+        if telegram.standby()[0]:
+            # the queue is shared state on a shared volume. the copy holding
+            # the lease owns it; a loser draining it would re-broadcast the
+            # winner's backlog, or burn its retry budget on sends it drops.
+            return
         pending = config.state_get("pending_sends", [])
         if not pending:
             return
         n = len(pending)
         keep = []  # originals still failing and under the retry cap
-        for item in pending:
+        for i, item in enumerate(pending):
+            if telegram.standby()[0]:
+                # this runs on its own thread (flush_pending_bg), so the check
+                # on entry is one moment in time and a long backlog outlives
+                # it. the sniper and news loops re-check every pass for exactly
+                # this reason and this one was missed. hand the rest of the
+                # queue back untouched: the winner owns it now, and dropping it
+                # here would lose alerts nobody ever sent.
+                keep.extend(pending[i:])
+                break
             if isinstance(item, str):  # migrate legacy string-only entries
                 item = {"text": item, "tries": 0}
             if telegram.send("(retry) " + item["text"]):
@@ -282,6 +368,17 @@ class Service:
     # again. Duplicate still beats missing: the first re-broadcast after a
     # crash is allowed, the next is not.
     MAX_JOB_ATTEMPTS = 2
+
+    # Grading is not a send, so it gets its own budget and, more importantly,
+    # its own SPACING. The night loop ticks about every 45 seconds
+    # (handle_commands(timeout=45) in the daemon), so two back-to-back
+    # attempts were both spent inside 90 seconds and any provider outage
+    # longer than that cost the whole day's evidence. Six passes fifteen
+    # minutes apart covers about an hour and a quarter of yfinance being
+    # down. These are scheduler knobs: they change how often the grader
+    # LOOKS, never what it grades or what alerts.
+    GRADE_MAX_ATTEMPTS = 6
+    GRADE_RETRY_S = 900
 
     def _job_attempt(self, job: str, key: str) -> int:
         """Record one attempt for (job, key) and return the new total.
@@ -431,20 +528,37 @@ class Service:
     DOWNTIME_MIN = 10     # warn on restart if silently down this long in-session
 
     def _hb_owner(self, text: str):
-        """DM the OWNER only (never members) with an ops/health note."""
+        """DM the OWNER only (never members) with an ops/health note.
+
+        ops=True, so this is the one channel that survives a stand-down. A
+        copy that lost the singleton lease sends nothing else, and it still
+        has to be able to tell the owner that it stood down and why."""
         owner = telegram.primary_owner_id()
         if not owner or self.dry:
             return
         try:
-            telegram.send_to(owner, text)
+            telegram.send_to(owner, text, ops=True)
         except Exception as e:
             print(f"heartbeat DM failed: {e}")
 
     def _hb_warned_once(self, key: str, day: str) -> bool:
         """True if this warning already fired today; else mark it and return
-        False. Persisted, so a restart can't re-spam the same warning."""
+        False. Persisted, so a restart can't re-spam the same warning.
+
+        A standing-by copy reads but never WRITES. state.json is a whole-file
+        read-modify-write and the only lock around it is a thread lock, which
+        says nothing across two processes on one volume, so a mute copy
+        recording its own dedup flag could publish a stale snapshot of the
+        winner's keys (sniper_alerted, morning_sent, recap_sent) and cause a
+        missed or duplicated alert on the copy that is actually working. That
+        is a much worse trade than the thing this dedup buys. The stand-down
+        DMs are already deduped for the life of the boot by _standby_warned,
+        _blind_warned and _wedge_warned, and a mute copy restarting often
+        enough to repeat itself is a signal worth seeing anyway."""
         if key in (config.state_get("hb_warned", {}) or {}).get(day, []):
             return True
+        if telegram.standby()[0]:
+            return False  # say it, but do not touch the shared file
 
         def upd(w):
             w = w if isinstance(w, dict) else {}
@@ -469,6 +583,249 @@ class Service:
             "instances split commands between them and can send every alert "
             "twice. Check for a stray instance: an old deploy still up, or a "
             "local run alongside the cloud one. Telegram said: " + description)
+
+    # ---------- single-instance lease ----------
+    # One directional state machine, three states, no demotion path:
+    #   ACTIVE            holds the OS lock, behaves exactly as before
+    #   ACTIVE (DEGRADED) no lock primitive on this platform, runs anyway
+    #   STANDBY           another live copy holds the lock, so this one is mute
+    # There is no ACTIVE -> STANDBY edge: a lock cannot be lost while the
+    # holder is alive. STANDBY -> ACTIVE happens the moment the lock frees,
+    # and every one of those edges goes through _promote, which re-reads what
+    # an arbitrarily long stand-down made stale.
+
+    def ensure_active(self, now: datetime) -> bool:
+        """True when this process may send, scan and monitor.
+
+        Fails OPEN on purpose. If the platform has no lock primitive at all,
+        the bot keeps running and the owner is told once, because a bot that
+        silenced itself by mistake is far worse than the duplicate card the
+        lease exists to prevent. That default is right at BOOT, where nothing
+        has been observed yet, and wrong after a stand-down, where a live
+        holder HAS been observed: see the unavailable branch."""
+        if self.dry:
+            return True  # dry-run sends nothing and writes its own book
+        res = instance_lock.try_acquire()
+        if res in ("acquired", "held"):
+            if telegram.standby()[0]:  # we were standing by and just won
+                self._promote(now, "the other copy is gone")
+            elif not self._held_lock:
+                # DEGRADED -> holding the real lock. This copy was never gagged
+                # (a degraded copy keeps alerting on purpose), so keying the
+                # re-read on "was I standing by" skipped it entirely and the
+                # boot snapshot of positions.json survived into the locked
+                # state, where the first save erases the other copy's open
+                # rows. That is the same money bug _promote exists to stop,
+                # reached by the one edge that did not go through it. No
+                # promotion ceremony here: this copy was never down, so it gets
+                # no stand-down DM and no downtime report, only the re-read.
+                self._resync_after_gap(now, "took the instance lock after running "
+                                       "without it")
+            self._held_lock = True
+            telegram.set_standby(False)
+            instance_lock.renew(force=(res == "acquired"))
+            return True
+        self._held_lock = False
+        if res == "unavailable":
+            # "I could not tell" is not "I am alone". try_acquire says
+            # unavailable for a missing lock primitive AND for an os.open that
+            # raised, which is what a read-only remount, an EIO/ESTALE mount
+            # fault or fd exhaustion does. Resuming on that un-gags a copy that
+            # watched a live holder one tick earlier, with no re-verification
+            # at all, and puts two copies on the wire. Hold the stand-down
+            # until there is positive evidence, and the ONLY positive evidence
+            # is the lock itself.
+            #
+            # There used to be a second, "blind resume" path here: after
+            # BLIND_RESUME_S of the holder's published seq standing still, this
+            # copy resumed anyway, so a volume that permanently lost locking
+            # could not mute the bot forever. That premise does not hold. The
+            # lease record lives on the SAME volume whose failure sent us down
+            # this branch, so the fault that stops us reading the lock also
+            # stops the live holder's renew from landing. A frozen seq is then
+            # a symptom of our own broken volume, not proof the holder died,
+            # and both copies go active on exactly the fault the lease exists
+            # to survive. There is no local evidence that separates "the holder
+            # died" from "my volume broke", so the honest move is to stay mute
+            # and say so daily. A copy that cannot read the shared volume also
+            # cannot read positions.json coherently, so it has no business
+            # trading on it.
+            if self._stood_down:
+                self._hold_standby(now)
+                return False
+            telegram.set_standby(False)
+            if not self._degraded_warned:
+                self._degraded_warned = True
+                print("instance lease: no file lock available here, running "
+                      "anyway. a second copy would not be caught.")
+                self._hb_owner(
+                    "Heartbeat: I could not take the single-instance lock on "
+                    "this filesystem, so I am running WITHOUT that guard. "
+                    "Alerts keep flowing normally. If a second copy is ever "
+                    "up, both will text. Instance "
+                    f"{instance_lock.instance_id()}, pid {os.getpid()}.")
+            instance_lock.renew()
+            return True
+        self._enter_standby(now)  # contended
+        return False
+
+    def _promote(self, now: datetime, reason: str = "the other copy is gone"):
+        """Standby -> active. Runs the same was-I-down check a fresh boot
+        runs, so a rolling deploy that parked this container through part of a
+        session still reports the gap.
+
+        Everything cached at BOOT is re-read first, because a stand-down has
+        no time limit. The book is the money one: PositionBook.load() only ran
+        in __init__, main() builds one Service for the life of the process and
+        standby_wait never exits, so a copy that booted at 09:20 and promotes
+        at 10:15 was about to save an empty snapshot over the SPX call the
+        winner opened at 09:52. reload() merges rather than clobbers.
+
+        The day goes with it: reset_day re-reads live_params.json and the
+        overnight backtest reports, which a copy that stood by through the
+        night would otherwise trade its first morning on.
+
+        Deliberately NOT reloaded: every state.json key (morning_sent,
+        recap_sent, sniper_alerted, hb_warned, pending_sends) is read off disk
+        on each access, so there is nothing cached to go stale and the
+        once-a-day guards still hold across a promotion. _bars_cache expires
+        itself after POLL_SECONDS. _last_feed_ok / _last_feed_try stay None on
+        purpose: this copy really has not fetched anything yet, and claiming
+        the winner's fetches would blind the feed-dead check."""
+        telegram.set_standby(False)
+        self._standby_warned = False
+        self._wedge_warned = False
+        self._blind_warned = False
+        self._stood_down = False
+        self._seqwatch = instance_lock.SeqWatch()
+        self._resync_after_gap(now, reason)
+        instance_lock.renew(force=True)
+        print(f"instance lease: promoted to active, {reason}.")
+        self._hb_owner(
+            f"Heartbeat: promoted to active, {reason}. I am now the one "
+            "sending alerts and answering commands. Instance "
+            f"{instance_lock.instance_id()}, pid {os.getpid()}.")
+        try:
+            self.check_downtime_on_start(now)
+        except Exception as e:
+            print(f"downtime check after promotion failed: {e}")
+
+    def _resync_after_gap(self, now: datetime, reason: str):
+        """Re-read everything that another copy may have changed while this one
+        was not the sole writer.
+
+        Both edges into sole ownership need this, not just the loud one.
+        STANDBY -> ACTIVE goes through _promote, which announces itself; but
+        DEGRADED -> ACTIVE takes the lock without ever having been gagged, and
+        that edge used to skip the re-read entirely and carry a boot-era
+        positions.json straight into the locked state.
+
+        The book is the money one. PositionBook.load() only ran in __init__,
+        main() builds one Service for the life of the process and standby_wait
+        never exits, so a copy that booted at 09:20 and takes over at 10:15 is
+        otherwise about to save its empty snapshot over the SPX call the other
+        copy opened at 09:52, and that position stops being watched for its
+        stop, its half and its give-back with nobody told. reload() merges
+        rather than clobbers.
+
+        The day goes with it: reset_day re-reads live_params.json and the
+        overnight backtest reports, which a copy that sat out the night would
+        otherwise trade its first morning on.
+
+        Deliberately NOT re-read: every state.json key (morning_sent,
+        recap_sent, sniper_alerted, hb_warned, pending_sends) is fetched from
+        disk on each access, so there is nothing cached to go stale and the
+        once-a-day guards still hold. _bars_cache expires itself after
+        POLL_SECONDS. _last_feed_ok / _last_feed_try stay as they are: claiming
+        another copy's fetch times would blind the feed-dead check."""
+        try:  # a bad row must never leave a takeover mute
+            self.book.reload()
+        except Exception as e:
+            print(f"position book reload after {reason} failed: {e}")
+        try:
+            self.day = None       # force the rebuild even on the same date
+            self.reset_day(now)
+        except Exception as e:
+            print(f"day rebuild after {reason} failed: {e}")
+
+    def _hold_standby(self, now: datetime):
+        """Stay mute after a lock read that FAILED. Same gag as
+        _enter_standby, different cause, so the owner is told the real one and
+        does not go hunting for a second container that is not there."""
+        telegram.set_standby(True, "the instance lock cannot be read here")
+        t = time_mod.monotonic()
+        if t - self._standby_print >= 60:
+            self._standby_print = t
+            print("standby held: the instance lock could not be read, and a "
+                  "read that failed is not proof the other copy is gone. "
+                  "last holder: " + instance_lock.holder_line())
+        if self._blind_warned:
+            return
+        self._blind_warned = True
+        if self._hb_warned_once("instance_blind", str(now.date())):
+            return
+        self._hb_owner(
+            "Heartbeat: I stood down for another copy, and now I cannot even "
+            "read the single-instance lock file (the volume is refusing it). "
+            "I am staying quiet rather than assuming I am alone, so I am NOT "
+            "sending alerts, and I will not un-mute myself: the lease record "
+            "lives on the same volume that is failing, so nothing I can read "
+            "here tells me whether the other copy is alive or my disk is "
+            "broken. You get this once a day until it clears. If you know the "
+            "other copy is down, restart me. Last holder: "
+            + instance_lock.holder_line())
+
+    def _enter_standby(self, now: datetime):
+        """Go mute. The wire gate stops every broadcast, every chat reply and
+        the getUpdates poll itself, which is what actually clears the 409."""
+        telegram.set_standby(True, "another instance holds the lease")
+        # remembered for the rest of this boot: once a LIVE holder has been
+        # seen, a later lock read that merely FAILED is not evidence it left.
+        self._stood_down = True
+        lease = instance_lock.read_lease()
+        t = time_mod.monotonic()
+        if t - self._standby_print >= 60:  # say why the railway log is quiet
+            self._standby_print = t
+            print("standby: another copy holds the instance lock. not "
+                  "polling, not sending, not monitoring. holder: "
+                  + instance_lock.holder_line(lease))
+        if self._standby_warned:
+            return
+        self._standby_warned = True
+        if self._hb_warned_once("instance_standby", str(now.date())):
+            return
+        self._hb_owner(
+            "Heartbeat: a second copy of this bot is already running, so I "
+            "stood down. I am NOT sending alerts, NOT answering commands and "
+            "NOT monitoring positions while the other copy is up. It holds "
+            "the lease: " + instance_lock.holder_line(lease) + ". I will take "
+            "over on my own the moment it stops. Nothing to do unless both "
+            "copies were meant to be up.")
+
+    def standby_wait(self, now: datetime):
+        """One standby poll. Never exits the process: a copy that quit here
+        would not come back when the other one is torn down, and railway's
+        restartPolicy would just start it into the same contention. It waits,
+        and promotes itself within one poll of the lock freeing.
+
+        Also watches for a WEDGED winner: the lock is still held (so the
+        process is alive) but its seq has not advanced for STALE_S of this
+        observer's own monotonic clock. That gets a DM and nothing else.
+        Stealing from a live-but-hung process is the split brain the whole
+        lease exists to prevent."""
+        lease = instance_lock.read_lease()
+        frozen = self._seqwatch.observe(lease)
+        if frozen >= instance_lock.STALE_S and not self._wedge_warned:
+            self._wedge_warned = True
+            if not self._hb_warned_once("instance_wedged", str(now.date())):
+                self._hb_owner(
+                    "Heartbeat: the active copy of the bot still holds the "
+                    f"lock but has not renewed in about {frozen / 60:.0f} "
+                    "min, so it may be wedged and open positions may not be "
+                    "monitored. I am standing by and will NOT take over on my "
+                    "own. Holder: " + instance_lock.holder_line(lease)
+                    + ". Restarting the stuck copy hands me the lease.")
+        time_mod.sleep(instance_lock.STANDBY_POLL_S)
 
     def health_stamp(self, now: datetime):
         """Throttled 'I'm alive' stamp to state.json (~once a minute)."""
@@ -827,7 +1184,10 @@ class Service:
         if cmd in ("/closed", "/open"):
             return self.cmd_closed(cmd, args)
         if cmd == "/brain":
-            return self.cmd_brain()
+            # the chat goes with it: the API check runs off this thread and
+            # the worker texts the verdict back to whoever asked. the
+            # ADMIN_CMDS gate above already turned away everyone but an owner.
+            return self.cmd_brain(chat_id)
         if cmd == "/calendar":
             return self.cmd_calendar()
         if cmd == "/adduser":
@@ -1191,29 +1551,63 @@ class Service:
                 "No setups, no sniper tickets and no recap that day. "
                 f"Undo with /open {raw}")
 
-    def cmd_brain(self):
+    PROBE_PENDING_TEXT = ("Checking the API right now. One token, and nothing "
+                          "about a trade waits on it. I will text the verdict "
+                          "here the moment it lands.")
+
+    def cmd_brain(self, chat_id: str = ""):
         """/brain: check the paid API right now and say what came back.
 
         This exists because the bot spent days telling the owner his credits
         were empty when they were not. A billing hold used to sit there until
         some unrelated call happened to succeed, and the status line reported
-        the stale verdict as if it were current. One token answers it."""
+        the stale verdict as if it were current. One token answers it.
+
+        The check runs OFF this thread. run_command is called from
+        handle_commands, which is the same loop thread that walks open
+        positions for +25%/give-back/STOP between cycles, and a forced probe
+        is up to three attempts at a 15 second timeout plus backoff. That
+        arithmetic is one scenario, not a ceiling: requests' timeout bounds
+        each socket operation, not the wall clock. So the command answers at
+        once and the worker texts the verdict back to the same chat, the same
+        shape every free-form chat reply already uses (_dispatch_brain)."""
         import assistant
         if not assistant.enabled():
             return "No ANTHROPIC_API_KEY is set, so there is no brain to check."
-        hold = assistant.billing_hold()
-        if hold is None:
+        if assistant.billing_hold() is None:
+            # pure state read, no network: answer in one message as before
             return "\n".join(["Brain: " + assistant.brain_status_line(),
                               config.api_usage_line()])
-        ok = assistant.probe_billing(force=True)  # an operator asked, so
-        # skip the 6-hour interval and actually hit the API
-        if ok:
-            return "\n".join(["Checked just now: the API answered, so the "
-                              "brain is back online.",
-                              config.api_usage_line()])
-        return "\n".join(["Checked just now and the API still refused.",
-                          assistant.brain_status_line(),
-                          config.api_usage_line()])
+        target = str(chat_id or telegram.primary_owner_id() or "")
+
+        def _answer(ok):
+            if ok is None:
+                # the check never ran (the worker could not start). saying
+                # "checked just now" here would be a fabricated result, and
+                # this bot does not report a check it did not make.
+                text = "\n".join(["I could not start the API check, so nothing "
+                                  "was asked and I have no fresh answer.",
+                                  "Last known: " + assistant.brain_status_line(),
+                                  "Try /brain again in a moment.",
+                                  config.api_usage_line()])
+            elif ok:
+                text = "\n".join(["Checked just now: the API answered, so the "
+                                  "brain is back online.",
+                                  config.api_usage_line()])
+            else:
+                text = "\n".join(["Checked just now and the API still refused.",
+                                  assistant.brain_status_line(),
+                                  config.api_usage_line()])
+            if not target:
+                print("/brain verdict had nowhere to go: " + text[:80])
+                return
+            err = telegram.send_to(target, text)
+            if err:
+                print(f"/brain verdict send failed to {target}: {err}")
+
+        started = assistant.probe_billing_forced(on_done=_answer)
+        return (self.PROBE_PENDING_TEXT if started
+                else "Already checking. The verdict lands here in a moment.")
 
     def cmd_calendar(self):
         """/calendar: what the bot thinks the market is doing next."""
@@ -1291,6 +1685,11 @@ class Service:
         except Exception:
             pass
         lines.append(f"Brain: {self._brain_status()}")
+        # rendered from the live lease record, never a typed-in value, so
+        # "which copy is answering me" is always checkable from the chat
+        lines.append(instance_lock.status_line(
+            standby=telegram.standby()[0],
+            degraded=getattr(self, "_degraded_warned", False)))
         open_pos = [p for p in self.book.positions if p.state != "closed"]
         if open_pos:
             lines.append("Open positions:")
@@ -1656,6 +2055,8 @@ class Service:
 
     def start_sniper_watch(self):
         """Safe to call repeatedly; the thread gates its own hours."""
+        if telegram.standby()[0]:
+            return  # a standby copy sends no sniper cards and writes no book
         t = getattr(self, "_sniper_thread", None)
         if t and t.is_alive():
             return
@@ -1696,6 +2097,12 @@ class Service:
         while not self._sniper_stop.is_set():
             now = et_now()
             try:
+                if telegram.standby()[0]:
+                    # defense in depth: this thread can outlive the transition
+                    # into standby, and it writes sniper_book on a shared
+                    # volume. skip the whole pass rather than write.
+                    self._sniper_stop.wait(instance_lock.STANDBY_POLL_S)
+                    continue
                 mode = self.sniper_watch_mode(now, bool(sniper_book.open_rows()))
                 if mode != "off":
                     self._scan_snipers_once(now, entries_allowed=(mode == "entries"))
@@ -1735,6 +2142,11 @@ class Service:
         """Grade an open sniper against the completed bars the read carried
         (then the live price) and text the exit if it just closed. Never
         raises: a tracking fault must not stop the scan."""
+        if telegram.standby()[0]:
+            # grading MUTATES the shared sniper book: it can close a row the
+            # winner is still watching, on the winner's own volume. a mute
+            # copy grades nothing.
+            return
         try:
             row = sniper_book.step(yfs, price, now, bars=bars)
         except Exception as e:
@@ -1786,6 +2198,15 @@ class Service:
     def _scan_snipers_once(self, now: datetime, entries_allowed: bool = True):
         import fvg as fvg_mod
         import market_tools
+        if telegram.standby()[0]:
+            # the wire gag alone is not enough, and the guard at the top of
+            # _sniper_worker's loop does not cover the callers that reach here
+            # another way. this pass burns the day/symbol key in the SHARED
+            # state.json, opens a row in the shared sniper book and marks the
+            # ledger row selected, so a mute copy that ran it once makes the
+            # WINNER skip the entry alert entirely and then text an exit for a
+            # trade nobody was ever told about. read nothing, write nothing.
+            return
         alerted = config.state_get("sniper_alerted", {})
         day = f"{now:%Y-%m-%d}"
         for yfs in sorted(fvg_mod.SNIPER_SYMBOLS):
@@ -1812,9 +2233,24 @@ class Service:
             ticket = ((r.get("fvg") or {}).get("confirming") or {}).get("ticket")
             if not ticket:
                 continue
+            # the forward ledger's id for the observation this ticket came
+            # from, allocated at the read. It is carried onto the position and
+            # handed back to the ledger below, so the delivered alert and its
+            # observation are linked by an id instead of by a guess.
+            cid = (r.get("fvg") or {}).get("candidate_id")
             # the fill is NOW, after the read, not the pre-scan clock: on a
             # slow scan those can sit in different bars
             fired_at = et_now()
+            if telegram.standby()[0]:
+                # last line before the FIRST write, re-checked because the read
+                # above can take seconds and this thread can cross into standby
+                # inside them. the three writes below (the day/symbol key, the
+                # book row, the ledger selection) are one commit, so the gate
+                # sits in front of all three and a pass stopped here leaves
+                # nothing half-written on the shared volume.
+                print("standby mid-pass: sniper commit abandoned before any "
+                      "write")
+                return
             alerted[key] = f"{fired_at:%H:%M}"
             config.state_set("sniper_alerted",
                              {k: v for k, v in alerted.items()
@@ -1842,15 +2278,45 @@ class Service:
                     + (f" · structure {ticket['target_structure']:.{dec}f}"
                        if ticket.get("target_structure") else ""))
             lines.append("One trade per symbol per day. Your call.")
+            if telegram.standby()[0]:
+                # the gate above is NOT in front of one commit, whatever the
+                # comment there said: a report file read and this send sit
+                # between the day key and the other two writes, and the send
+                # alone can take seconds. crossing into standby in that window
+                # burned the key on the SHARED volume and sent nothing, so the
+                # winner saw the symbol as already fired and the ticket was
+                # never sent by anybody. hand the key back, dropping only our
+                # own so a concurrent write from the winner survives.
+                config.state_update(
+                    "sniper_alerted",
+                    lambda cur: {k: v for k, v in (cur or {}).items()
+                                 if k != key},
+                    default={})
+                print("standby mid-pass: sniper ticket abandoned and the day "
+                      f"key for {key} released")
+                return
             self.notify("\n".join(lines))
             # Track it. Until this existed the bot texted a ticket and then
             # went silent forever: no exit alert, and no way to ever know
             # whether its own verified pattern actually won.
-            sniper_book.open_trade(
+            pos = sniper_book.open_trade(
                 symbol=yfs, display=str(r.get("instrument", yfs)),
                 direction=d, entry=ticket["entry"], stop=ticket["stop"],
                 target=ticket["target"], day=day,
-                time_et=f"{fired_at:%H:%M:%S}", decimals=dec, entry_ts=fired_at)
+                time_et=f"{fired_at:%H:%M:%S}", decimals=dec, entry_ts=fired_at,
+                candidate_id=cid)
+            # AFTER the card and the position, never before: this is the only
+            # place that records which observation was actually broadcast, and
+            # a ledger fault must not delay or break an alert already sent.
+            if cid:
+                try:
+                    import forward_ledger
+                    forward_ledger.mark_selected(
+                        cid, fired_at_et=fired_at,
+                        position_id=(pos or {}).get("id"))
+                except Exception as e:
+                    print(f"{fired_at:%H:%M:%S} sniper selection not recorded "
+                          f"for {yfs}: {e}")
             print(f"{fired_at:%H:%M:%S} sniper FIRED {r.get('instrument', yfs)} {d} "
                   f"entry {ticket['entry']} stop {ticket['stop']} "
                   f"target {ticket['target']}")
@@ -1876,6 +2342,8 @@ class Service:
         instant a fresh headline lands instead of waiting on the ~15s trading
         loop, and so a slow AI 'read' never delays the alert or the next trade
         cycle. Safe to call repeatedly."""
+        if telegram.standby()[0]:
+            return  # a standby copy sends no BREAKING texts
         t = getattr(self, "_news_thread", None)
         if t and t.is_alive():
             return
@@ -1894,6 +2362,12 @@ class Service:
         # only runs while a session is live (run_session owns the lifecycle).
         while not self._news_stop.is_set():
             try:
+                if telegram.standby()[0]:
+                    # same reason as the sniper thread: it can outlive the
+                    # transition, and _scan_news_once writes news_seen.json
+                    # on the shared volume before it sends.
+                    self._news_stop.wait(instance_lock.STANDBY_POLL_S)
+                    continue
                 self._scan_news_once()
             except Exception as e:
                 print(f"{et_now():%H:%M:%S} news watcher error (continuing): {e}")
@@ -1952,6 +2426,14 @@ class Service:
         # seen — any extra fresh headlines stay un-seen and fire next pass (a
         # multi-headline burst is exactly when we must not silently drop them)
         to_send = fresh[:3]
+        if telegram.standby()[0]:
+            # the gate at the top of this pass is one moment in time and the
+            # feed fetches above take seconds. news_seen.json is on the SHARED
+            # volume, so a copy that crossed into standby in between would burn
+            # these headlines as seen and then send nothing, and the winner,
+            # reading that same file, would never text them at all. a BREAKING
+            # alert lost outright is worse than one sent a pass late.
+            return
         self._save_news_seen((seen + [t for _, t in to_send])[-300:],
                              str(now.date()))
         for outlet, title in to_send:
@@ -2159,28 +2641,84 @@ class Service:
         never cost measurement.
 
         Own dedup key and bounded attempts, same shape as the other jobs, so a
-        restart cannot double-grade and a bad day cannot retry forever."""
+        restart cannot double-grade and a bad day cannot retry forever.
+
+        The day is claimed on the ledger's own RECONCILIATION, never on the
+        mere fact that the call returned. fill_outcomes used to hand back a
+        bare int, so an unreadable ledger, a missing dependency, a download
+        that raised and a lost write all looked exactly like a finished day,
+        and this job wrote forward_graded on the line after the call, before
+        it had even looked at the answer. The early return above then made the
+        retry it was designed to allow unreachable.
+
+        Exhausting the budget is parked as needs-attention instead of being
+        written with the byte-identical state a real success writes, and a
+        parked day stops re-attempting, so removing that write cannot turn
+        exhaustion into a 45 second spin all evening.
+
+        A row the grader DEFERRED (its own day is still trading, so freezing
+        an answer now would freeze a wrong one) is not a failure and does not
+        hold the key open. It cannot: the budget is six looks fifteen minutes
+        apart and the gate above will not reopen before the next session, so
+        waiting for midnight here would park a healthy day every single
+        evening. The next session's pass walks every ungraded row of every
+        past date and picks it up, well inside the download window."""
         if self.dry or now.time() < WEEKLY_AT:
             return
-        key = str(learn_session_due(now))
+        key = str(forward_grade_session(now))
         if config.state_get("forward_graded") == key:
             return
+        park = config.state_get("forward_grade_attention")
+        if isinstance(park, dict) and park.get("key") == key:
+            return              # already handed to a human; stop re-attempting
+        last = config.state_get("forward_grade_last")
+        if isinstance(last, dict) and last.get("key") == key:
+            try:
+                since = (now - datetime.fromisoformat(
+                    last["at"])).total_seconds()
+            except (ValueError, TypeError, KeyError):
+                since = None    # unreadable stamp: treat it as no spacing
+            if since is not None and since < self.GRADE_RETRY_S:
+                return
         n = self._job_attempt("forward_grade", key)
-        if n > self.MAX_JOB_ATTEMPTS:
-            config.state_set("forward_graded", key)
-            print(f"{now:%H:%M:%S} forward grading attempted {n - 1} times for "
-                  f"{key}; marking done")
-            return
+        config.state_set("forward_grade_last",
+                         {"key": key, "at": now.isoformat()})
+        res = None
         try:
             import forward_ledger
-            graded = forward_ledger.fill_outcomes()
-            config.state_set("forward_graded", key)
-            if graded:
-                print(f"{now:%H:%M:%S} graded {graded} sniper candidate(s) "
-                      f"forward for {key}")
+            # this tick's clock, not a second reading of the wall clock. the
+            # grader decides per row whether the outcome can be called final
+            # yet, and that answer must come from the same moment the job
+            # thinks it is running in.
+            res = forward_ledger.fill_outcomes(now_et=now)
         except Exception as e:
-            print(f"{now:%H:%M:%S} forward grading failed (attempt {n} "
+            print(f"{now:%H:%M:%S} forward grading raised (attempt {n} "
                   f"recorded, will retry): {e}")
+        # isinstance, not truthiness: a dict is ALWAYS truthy, so `if res:`
+        # would read an all-zero failed pass as a success, and anything that
+        # is not the counts contract must never be able to claim the day.
+        if isinstance(res, dict) and res.get("complete"):
+            config.state_set("forward_graded", key)
+            # .get on the two newer counts: a stub or an older result shape
+            # must not turn a finished pass into an exception here.
+            print(f"{now:%H:%M:%S} forward grading complete for {key}: graded "
+                  f"{res['graded']} of {res['eligible']} eligible "
+                  f"(unresolved {res['unresolved']}, deferred "
+                  f"{res.get('pending', 0)} until their day closes, retired "
+                  f"{res.get('retired', 0)}, permanent "
+                  f"{res['permanent_failures']})")
+            return
+        if n >= self.GRADE_MAX_ATTEMPTS:
+            reason = _grade_attention_reason(res, n)
+            config.state_set("forward_grade_attention",
+                             {"key": key, "reason": reason,
+                              "at": now.isoformat(), "counts": res or {}})
+            print(f"{now:%H:%M:%S} forward grading NEEDS ATTENTION for {key}: "
+                  f"{reason}")
+        else:
+            print(f"{now:%H:%M:%S} forward grading incomplete for {key} "
+                  f"(attempt {n} of {self.GRADE_MAX_ATTEMPTS}), will "
+                  f"retry: {res}")
 
     def maybe_holiday_notice(self, now: datetime):
         """Text everyone the evening before the market is shut, so the silence
@@ -2289,6 +2827,13 @@ class Service:
 
     def run_session(self):
         now = et_now()
+        if not self.ensure_active(now):
+            # the daemon loop owns the standby wait and the promotion. a plain
+            # one-shot session run has no outer loop, so it just returns and
+            # the process exits: the copy that HOLDS the lease keeps alerting.
+            print("standby: another copy of the bot holds the instance lease, "
+                  "so this session will not run.")
+            return
         self.reset_day(now)
         self.check_downtime_on_start(now)  # were we silently down mid-session?
         mode_src = "live alerts" if not self.dry else "dry-run"
@@ -2310,6 +2855,11 @@ class Service:
         try:
             while True:
                 now = et_now()
+                if not self.ensure_active(now):
+                    # cannot normally happen: a lock is not lost while its
+                    # holder lives. hand control back to the daemon loop,
+                    # which owns standby, rather than sending from here.
+                    return
                 self.reset_day(now)
                 if now.time() >= session_end_for(now.date()) \
                         or not is_session_day(now.date()):
@@ -2367,10 +2917,19 @@ class Service:
     def daemon(self):
         print("Daemon mode: running around the clock. Commands answered "
               "any time; sessions run on trading days 8:31-15:12 CT.")
-        self.start_sniper_watch()  # gates itself to the US session window
         while True:
             now = et_now()
             try:
+                # FIRST thing in the loop. a copy that lost the singleton
+                # lease does nothing at all: no poll, no scan, no monitoring,
+                # no once-a-day job. it stays alive and retries, so the moment
+                # the other container is torn down it promotes itself.
+                if not self.ensure_active(now):
+                    self.standby_wait(now)
+                    continue
+                # started here, not before the loop, so it also starts on a
+                # promotion. self-guards on is_alive, so repeats cost nothing.
+                self.start_sniper_watch()  # gates itself to the US session window
                 if is_session_day(now.date()):
                     if time(9, 0) <= now.time() < time(9, 30) \
                             and self.premarket_sent_for != now.date():
