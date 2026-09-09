@@ -1,8 +1,12 @@
-"""Replay a historical day through detect_setup + the picky filter and print
+"""Replay a historical day (RESEARCH TOOL, not a regression: it needs the
+network and yfinance only serves 5m bars for roughly the last 60 days, so it
+cannot run in the offline gate. Renamed off the test_ prefix for that reason.)
+
+Replay a historical day through detect_setup + the picky filter and print
 the entry card that would have been sent (entry priced with the labeled
 estimate — historical quotes aren't free).
 
-Usage: python test_replay.py [YYYY-MM-DD]
+Usage: python replay_day.py [YYYY-MM-DD]
 """
 
 import os as _bot_test_os  # NO TEST MAY EVER TEXT A REAL PERSON:

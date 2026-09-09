@@ -18,7 +18,7 @@ from positions import Position
 from quotes import Quote
 from strategy import Setup
 
-TEST = "🧪 TEST — EXAMPLE ONLY, NOT A REAL ALERT 🧪\n\n"
+TEST = "🧪 TEST, EXAMPLE ONLY, NOT A REAL ALERT 🧪\n\n"
 today = date.today()
 # the sample card quotes the same effective entry window the live one would
 window_ct = cards.entry_window_ct(live_params.effective()[0])

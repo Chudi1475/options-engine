@@ -2089,6 +2089,10 @@ _orig_state_file = config.STATE_FILE
 _orig_env = {k: os.environ.get(k) for k in ("TELEGRAM_CHAT_IDS", "OWNER_CHAT_ID")}
 sess = _Sess()
 dm = []
+# this block drives get_messages against the stub above, so it must opt
+# in past the receive-side wire guard (telegram.allow_test_poll). The
+# guard exists because the offline suite used to poll the LIVE token.
+telegram.allow_test_poll(True)
 try:
     telegram._session = sess
     telegram._token = lambda: "TEST"
@@ -2140,6 +2144,7 @@ try:
     svc.handle_commands()
     check("409: same-day repeat polls do not re-warn", len(dm) == 1)
 finally:
+    telegram.allow_test_poll(False)
     telegram._session = _orig_tg_session
     telegram._token = _orig_tg_token
     telegram.send_to = _orig_tg_send_to

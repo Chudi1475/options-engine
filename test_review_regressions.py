@@ -566,6 +566,49 @@ finally:
     _tg.send_to = _saved_send
     _tg.primary_owner_id = _saved_primary
 
+# ---------------------------------------------------------------------------
+# W-conflict: a test may not text a real person, and may not take their mail.
+#
+# The wire guard covered every SEND path but not the RECEIVE path. get_messages
+# checked only the lease, so an offline suite run polled the LIVE token: the
+# cloud bot took a 409 and warned the owner about a stray instance that was the
+# test suite, and because a poll acknowledges updates through the offset, a
+# command typed during a local run could be swallowed and never answered by the
+# copy on duty. Observed in production on 2026-09-08.
+print()
+print("--- getUpdates is inside the test-mode wire guard ---")
+
+_polled = []
+_saved_session_get = _tg._session.get
+
+
+def _tripwire(url, *a, **k):
+    _polled.append(url)
+    raise AssertionError("a test reached the real getUpdates endpoint")
+
+
+try:
+    _tg._session.get = _tripwire
+    _tg.set_standby(False)   # not standing by, so the lease is NOT what is
+                             # protecting us here: test_mode must be
+    check("wire: the lease is not what is holding this back",
+          _tg.standby()[0] is False)
+    import os as _os
+    check("wire: BOT_TEST_MODE is on for this suite",
+          bool(_os.environ.get("BOT_TEST_MODE")))
+    _items, _off = _tg.get_messages(timeout=0)
+    check("wire: get_messages makes no network call in test mode", not _polled,
+          str(_polled))
+    check("wire: it returns no messages", _items == [])
+    check("wire: and it does not move the offset",
+          _off == int(config.state_get("tg_offset", 0)))
+    _tg.print_chat_ids()
+    check("wire: print_chat_ids does not poll either in test mode", not _polled,
+          str(_polled))
+finally:
+    _tg._session.get = _saved_session_get
+
+
 print()
 if failures:
     print(f"{len(failures)} FAILED: " + ", ".join(failures))

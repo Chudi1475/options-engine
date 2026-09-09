@@ -35,7 +35,13 @@ GUARDED = ("scanner.py", "cards.py", "assistant.py", "news.py", "risk_gate.py",
            "strategy_spec.py", "forward_ledger.py", "live_params.py",
            "positions.py", "quotes.py", "strategy.py", "config.py",
            # instance_lock renders the stand-down and wedge DMs the owner reads
-           "instance_lock.py")
+           "instance_lock.py",
+           # send_all_samples calls telegram.send directly, so its sample text
+           # reaches the same three phones a real card does. Found by
+           # test_packet_provenance, which cross-checks this list against every
+           # module that can actually reach the wire: a guard list maintained by
+           # hand goes stale the first time someone adds a sender.
+           "send_all_samples.py")
 
 EM_DASH = "—"
 

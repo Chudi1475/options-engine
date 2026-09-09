@@ -1,0 +1,326 @@
+{
+  "config": {
+    "effective_declared": {
+      "API_DEFAULT_MODE": {
+        "declared": null,
+        "env_overridable": false
+      },
+      "CORRELATED_RISK_PCT": {
+        "declared": "0.5",
+        "env_overridable": true
+      },
+      "EXPIRY_WARN_MINUTES": {
+        "declared": null,
+        "env_overridable": false
+      },
+      "GAP_UP_SKIP_PCT": {
+        "declared": "1.0",
+        "env_overridable": true
+      },
+      "MIN_WINRATE": {
+        "declared": "70.0",
+        "env_overridable": true
+      },
+      "POLL_SECONDS": {
+        "declared": null,
+        "env_overridable": false
+      },
+      "RISK_PER_TRADE_PCT": {
+        "declared": "1.0",
+        "env_overridable": true
+      },
+      "RUNNER_GIVEBACK_PCT": {
+        "declared": "40.0",
+        "env_overridable": true
+      },
+      "SPREAD_COST_PCT": {
+        "declared": "4.0",
+        "env_overridable": true
+      },
+      "STOP_PCT": {
+        "declared": "-90.0",
+        "env_overridable": true
+      },
+      "TP_HALF_PCT": {
+        "declared": "25.0",
+        "env_overridable": true
+      }
+    },
+    "env_var_names_only": [
+      "ALPACA_API_KEY",
+      "ALPACA_API_SECRET",
+      "ANTHROPIC_API_KEY",
+      "BOOTSTRAP_STATE",
+      "BOT_BRAIN_MODEL",
+      "BOT_DEEP_MODEL",
+      "DATA_DIR",
+      "LEARN_ENABLED",
+      "TELEGRAM_BOT_TOKEN",
+      "TELEGRAM_CHAT_IDS"
+    ],
+    "secrets_recorded": false
+  },
+  "deployed": {
+    "deployment_id": "3c91c3bf-4921-4f8f-8cf1-3cbbb7a2dc1b",
+    "matches_source_commit": false,
+    "platform": "railway",
+    "reported": true,
+    "reported_source_commit": "ad404f6c8bed1709ff0dda7a8381e49ee46bf87f",
+    "verified": false,
+    "why_unverified": "deploys here come from `railway up`, which uploads a directory. The platform records no git commit, so the commit above is reported by the operator and cannot be checked from the platform. The deployment id CAN be checked."
+  },
+  "generated_by": "release_manifest.py",
+  "hand_edited": false,
+  "module_hashes": {
+    "alpaca_check.py": "567b831c511f5520",
+    "analyze_history.py": "bbc57c3b5126d861",
+    "assistant.py": "9b9a9f27a88a891a",
+    "backtest.py": "b653c521c14ae626",
+    "backtest_chart.py": "7d3b068205ea9623",
+    "backtest_chart_v2.py": "ebb34338ee56c105",
+    "backtest_chart_v3.py": "95debeb834cdbd0b",
+    "backtest_chart_v4.py": "b240e11f5f927cab",
+    "backtest_chart_v5.py": "e87be1f11f5348c6",
+    "backtest_chart_v6.py": "42461455456bea12",
+    "backtest_entry_filters.py": "5d5e627593ea94a2",
+    "backtest_long.py": "fcafd83c408d575b",
+    "backtest_new_rules.py": "a82fd12382c3efec",
+    "backtest_param_sweep.py": "8014cd23a535f13f",
+    "backtest_runner_trail.py": "aab9a9d158aa1c69",
+    "backtest_walkforward.py": "b09e570fd64d5663",
+    "bt_exp_adaptive_giveback.py": "9da52a920cbd7032",
+    "bt_exp_adaptive_giveback_rerun.py": "479c58d7e806ac6d",
+    "bt_exp_fresh.py": "61ae3817a41c5dd7",
+    "bt_exp_joint_exits.py": "fb4dadf5b39d25b8",
+    "bt_exp_live_truth.py": "6bc5a8f92b0ce5fe",
+    "bt_exp_per_setup_contrib.py": "8d38f9875de22ba8",
+    "bt_exp_per_setup_contrib_v2.py": "d6e0a7038e29c1a4",
+    "bt_exp_regime_split.py": "c49f742dceb41e42",
+    "bt_exp_regime_split2.py": "0c8dda7069b18cc2",
+    "bt_exp_stop_tight.py": "5aaaf6581924213f",
+    "bt_exp_stop_walkforward.py": "6ddbc428f40c9022",
+    "bt_exp_strike_bakeoff.py": "e51e7c7d94538ea5",
+    "bt_exp_strike_bakeoff_v2.py": "0674ce5bc4a8eb99",
+    "cards.py": "d2672ffce8043a9c",
+    "charts.py": "0ad06a90703450be",
+    "coach.py": "069052921a0e06da",
+    "config.py": "daeb472de76f6b69",
+    "data_feed.py": "4dac75720cb143ce",
+    "forward_ledger.py": "2ce62c30d8bde320",
+    "fvg.py": "ec370361da78c0d9",
+    "gen_docs.py": "af4f6320ebcf9b20",
+    "instance_lock.py": "bb8fd82991f3ef20",
+    "intake.py": "c48cda4ba604e36b",
+    "learn.py": "1521fd7f5050cb48",
+    "live_params.py": "80fb6fa061a32b62",
+    "market_calendar.py": "7b3a7dd50396ca53",
+    "market_tools.py": "a3d35f7970ad46bc",
+    "market_tools_check.py": "00d20d01f84d2851",
+    "news.py": "ed2bd6368a99dbbb",
+    "positions.py": "5bf4824971c29dc9",
+    "quote_check.py": "dbcca48fce1acac4",
+    "quotes.py": "6eb4060ccebbf57f",
+    "recap.py": "9030e7b288890499",
+    "release_manifest.py": "0aaab84533d98acf",
+    "replay_day.py": "ed3bae704e0c0a4d",
+    "rescore_round6_session.py": "268c1fed6fd15184",
+    "risk_gate.py": "cfbffbd765e8dd12",
+    "scanner.py": "adaaa2f5080c3b7d",
+    "scoreboard.py": "69e15b7dff3b44e9",
+    "self_improve.py": "b99ae998d7f2a8d0",
+    "send_all_samples.py": "51b401fb1483c64e",
+    "sniper_book.py": "7d4ec5845c61dac2",
+    "strategy.py": "95905dbc3300f73a",
+    "strategy_spec.py": "c7d2865979a8bf99",
+    "study_wins.py": "87700dec7f0eafde",
+    "telegram.py": "c380f90c3d85954c",
+    "test_adduser.py": "18251b1e48e44158",
+    "test_charts.py": "c6195c475802aa9e",
+    "test_exit_styles.py": "ca27ded5d2b2ee12",
+    "test_grading_integrity.py": "1713529ebd9737a8",
+    "test_instance_lease.py": "88c23ff7896a0041",
+    "test_ledger_integrity.py": "5bfe72cdfbc5ee7e",
+    "test_market_calendar.py": "dca8509d4fb1aaa8",
+    "test_no_em_dash.py": "186f0a7cb2878ad9",
+    "test_no_hardcoded_stats.py": "f998773bb3931835",
+    "test_packet_provenance.py": "dbb08a25adff4c7a",
+    "test_pipeline.py": "74cfaee91aa2c508",
+    "test_review_import.py": "86463d6aac0ed905",
+    "test_review_packet_gate.py": "9d691b7c7915d94d",
+    "test_review_regressions.py": "9616bd7f8cc60454",
+    "test_session_fixes.py": "aa5984b6262b5c51",
+    "test_symbols.py": "27d2bd34c4ac0add",
+    "truth_check.py": "d50bb4d92f1110f3",
+    "window_study.py": "0d4c578ea5591b08"
+  },
+  "report_lineage": {
+    "background": {
+      "reports/backtest_new_rules.json": {
+        "sha256_16": "f0bde8383896203c",
+        "tracked": true
+      },
+      "reports/backtest_results.json": {
+        "sha256_16": "b60e7e773adbd855",
+        "tracked": true
+      },
+      "reports/chart_backtest_round6.json": {
+        "sha256_16": "707c0ceb2c6e25f9",
+        "tracked": true
+      }
+    },
+    "note": "a summary artifact is NOT produced by renaming one of these. If one is generated, its parent hash goes here (Astra 10.2).",
+    "required": {
+      "path": "reports/chart_backtest_round6_session.json",
+      "sha256_16": "5304ebcd2b0c9bde",
+      "tracked": true,
+      "why": "the live sniper policy is the session-constrained round-6 config, so the session re-scoring is the report that describes what the bot actually does"
+    }
+  },
+  "runtime": {
+    "declared_requirements": [
+      "pandas>=2.0",
+      "matplotlib>=3.8",
+      "yfinance>=1.4",
+      "curl_cffi>=0.7",
+      "requests>=2.31",
+      "tzdata>=2024.1"
+    ],
+    "deploy_target_os": "Linux",
+    "generated_on_os": "Windows",
+    "implementation": "CPython",
+    "installed_versions": {
+      "curl_cffi": "0.15.0",
+      "matplotlib": "3.10.9",
+      "pandas": "3.0.3",
+      "requests": "2.34.2",
+      "tzdata": "2026.2",
+      "yfinance": "1.4.1"
+    },
+    "python": "3.11.9"
+  },
+  "schema_version": 1,
+  "source": {
+    "branch": "master",
+    "clean": false,
+    "commit": "dea9be70d5c6e9a58aee02baa4cc549ee36eeddd",
+    "git_available": true,
+    "parent": "7be213f3f4512bc2e0a717427d6838040a83e883",
+    "uncommitted": [
+      "M  .claude/QUICK_START.md",
+      "A  release_manifest.json",
+      "A  release_manifest.py",
+      "R  test_replay.py -> replay_day.py",
+      "M  self_improve.py",
+      "M  send_all_samples.py",
+      "M  telegram.py",
+      "M  test_no_em_dash.py",
+      "A  test_packet_provenance.py",
+      "M  test_pipeline.py",
+      "M  test_review_regressions.py"
+    ]
+  },
+  "test_inventory": {
+    "gate_source": "self_improve.run_checks",
+    "note": "inventory only. Pass/fail belongs to a run with its own exit code (Astra 10.3: suites are not test cases).",
+    "suite_count": 16,
+    "suites": [
+      {
+        "declared_cases": 380,
+        "exists": true,
+        "file": "test_pipeline.py",
+        "sha256_16": "74cfaee91aa2c508"
+      },
+      {
+        "declared_cases": 18,
+        "exists": true,
+        "file": "test_adduser.py",
+        "sha256_16": "18251b1e48e44158"
+      },
+      {
+        "declared_cases": null,
+        "exists": true,
+        "file": "test_no_hardcoded_stats.py",
+        "sha256_16": "f998773bb3931835"
+      },
+      {
+        "declared_cases": 99,
+        "exists": true,
+        "file": "test_session_fixes.py",
+        "sha256_16": "aa5984b6262b5c51"
+      },
+      {
+        "declared_cases": 121,
+        "exists": true,
+        "file": "test_market_calendar.py",
+        "sha256_16": "dca8509d4fb1aaa8"
+      },
+      {
+        "declared_cases": 69,
+        "exists": true,
+        "file": "test_review_regressions.py",
+        "sha256_16": "9616bd7f8cc60454"
+      },
+      {
+        "declared_cases": 29,
+        "exists": true,
+        "file": "test_ledger_integrity.py",
+        "sha256_16": "5bfe72cdfbc5ee7e"
+      },
+      {
+        "declared_cases": 68,
+        "exists": true,
+        "file": "test_review_import.py",
+        "sha256_16": "86463d6aac0ed905"
+      },
+      {
+        "declared_cases": 38,
+        "exists": true,
+        "file": "test_grading_integrity.py",
+        "sha256_16": "1713529ebd9737a8"
+      },
+      {
+        "declared_cases": 87,
+        "exists": true,
+        "file": "test_instance_lease.py",
+        "sha256_16": "88c23ff7896a0041"
+      },
+      {
+        "declared_cases": null,
+        "exists": true,
+        "file": "test_no_em_dash.py",
+        "sha256_16": "186f0a7cb2878ad9"
+      },
+      {
+        "declared_cases": null,
+        "exists": true,
+        "file": "test_review_packet_gate.py",
+        "sha256_16": "9d691b7c7915d94d"
+      },
+      {
+        "declared_cases": 25,
+        "exists": true,
+        "file": "test_packet_provenance.py",
+        "sha256_16": "dbb08a25adff4c7a"
+      },
+      {
+        "declared_cases": 75,
+        "exists": true,
+        "file": "test_charts.py",
+        "sha256_16": "c6195c475802aa9e"
+      },
+      {
+        "declared_cases": null,
+        "exists": true,
+        "file": "test_exit_styles.py",
+        "sha256_16": "ca27ded5d2b2ee12"
+      },
+      {
+        "declared_cases": 6,
+        "exists": true,
+        "file": "test_symbols.py",
+        "sha256_16": "27d2bd34c4ac0add"
+      }
+    ]
+  },
+  "tracked_file_count": 149
+}

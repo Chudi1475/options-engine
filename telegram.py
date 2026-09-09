@@ -127,6 +127,24 @@ def standby() -> tuple:
     return _standby
 
 
+# A test that wants to exercise the POLLING logic itself (the 409 handling, the
+# update parser) has to opt in here, after stubbing the transport. The default
+# is off, so forgetting to opt in makes a test silently safe rather than
+# silently live, which is the direction that matters: the whole reason this flag
+# exists is that get_messages was reaching the real endpoint from the offline
+# suite. Kept as a one element list so a test can flip it without a global.
+_test_poll_ok = [False]
+
+
+def allow_test_poll(on: bool):
+    """Let this test drive get_messages against ITS OWN stubbed transport.
+
+    Only meaningful under BOT_TEST_MODE. Set it True around the polling tests
+    and False again in their finally block; anything else that forgets stays
+    guarded."""
+    _test_poll_ok[0] = bool(on)
+
+
 def test_mode() -> bool:
     """True when BOT_TEST_MODE is set. Every outbound Telegram call becomes a
     no-op, and the message is printed instead.
@@ -333,6 +351,18 @@ def get_messages(timeout: int = 0):
     it — replay is the safe direction here."""
     global _conflict
     offset = int(config.state_get("tg_offset", 0))
+    if test_mode() and not _test_poll_ok[0]:
+        # The RECEIVE half of the wire guard, which was missing. Every send
+        # path checked test_mode; this one checked only the lease, so an
+        # offline test run polled the live token for real. Two consequences,
+        # both observed on 2026-09-08: Telegram allows one getUpdates consumer
+        # per token, so the cloud bot took a 409 and texted the owner about a
+        # stray instance that was really just the suite running on the desktop.
+        # And worse, a poll ACKNOWLEDGES updates through the offset, so a
+        # command typed while a local suite was running could be swallowed here
+        # and never answered by the copy that was actually on duty. A test may
+        # not text a real person, and it may not take their mail either.
+        return [], offset
     if _standby[0]:
         # THE line that removes the 409 at its source. Telegram allows one
         # getUpdates consumer per token, so the copy that lost the lease must
@@ -385,6 +415,11 @@ def ack_offset(max_id: int):
 
 def print_chat_ids():
     """--setup helper: show everyone who has messaged the bot."""
+    if test_mode():
+        # same wire rule as get_messages: this is a real getUpdates poll and it
+        # would fight the live consumer for the token
+        print("[TEST MODE] would poll getUpdates for chat ids")
+        return
     r = requests.get(f"https://api.telegram.org/bot{_token()}/getUpdates", timeout=10)
     r.raise_for_status()
     seen = {}

@@ -184,7 +184,9 @@ def run_checks(files: list) -> bool:
                      "test_market_calendar.py", "test_review_regressions.py",
                      "test_ledger_integrity.py", "test_review_import.py",
                      "test_grading_integrity.py", "test_instance_lease.py",
-                     "test_no_em_dash.py", "test_review_packet_gate.py"):
+                     "test_no_em_dash.py", "test_review_packet_gate.py",
+                     "test_packet_provenance.py", "test_charts.py",
+                     "test_exit_styles.py", "test_symbols.py"):
             r = subprocess.run([PYEXE, test], cwd=REPO, timeout=600,
                                capture_output=True, text=True, errors="replace")
             if r.returncode != 0:
