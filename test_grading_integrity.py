@@ -41,14 +41,18 @@ G1    One old row parked grading forever. A row whose day has aged past the
       boundary is derived from the SAME number the download period is built
       from so the two can never drift apart.
 
-G2    Grading moved to its own key at the close, which is right, but 16:12 is
-      not final for a row that is still trading. Two symbols in the roster are
-      24h FX and the download asks for prepost, and fill_outcomes only ever
-      walks rows whose outcome is still None, so whatever the close-time pass
-      wrote was frozen. A winner that resolves in the evening was dropped
-      while a loser that stopped at lunch was kept, which biases the recorded
-      win rate down. Finality is now decided per row, and a row that is not
-      final yet is left for the next pass. Late beats wrong.
+G2    Grading moved to its own key at the close, which is right, but a pass
+      must not freeze a row before that row's observation window ends:
+      fill_outcomes only ever walks rows whose outcome is still None, so
+      whatever it writes is frozen. Finality is decided per row, and a row that
+      is not final yet is left for the next pass. Late beats wrong.
+
+      Astra A21 later REVERSED where that window ends. G2 originally shipped
+      23:59 of the row's own day, so a 20:00 ET forex move counted, while the
+      live book settles every position at the session close. That made the two
+      records incomparable. The window is the DECLARED horizon now, and
+      section 12 below is written against the corrected rule.
+      test_grading_jobs.py carries the whole W03 contract.
 
 G3    The scoreboard decided a day's era from the mere PRESENCE of a selected
       key on any row of that date. On the deploy day every date holds both
@@ -821,19 +825,34 @@ guard("G1: a short frame alone does not retire a row that is still in reach",
 
 
 # --------------------------------------------------------------------------
-# 12. G2: the equity close is not the end of the day for a row that is still
-#     trading. EURUSD=X and JPY=X are in the sniper roster and run 24h, and
-#     the download asks for prepost, so bars keep printing after 16:00.
-#     fill_outcomes only ever walks rows whose outcome is still None, so
-#     whatever the 16:12 pass wrote was frozen for good.
+# 12. G2, AS ASTRA A21 REVERSED IT.
+#
+#     The finding G2 originally fixed is real and still holds: a row must never
+#     be frozen before the end of its observation window, because fill_outcomes
+#     only ever walks rows whose outcome is still None and whatever it writes
+#     is frozen for good.
+#
+#     What A21 reversed is WHERE that window ends. G2 shipped 23:59 of the
+#     row's own day, so a EUR/USD move at 20:00 ET resolved a tier. The live
+#     book is flat from 16:00: sniper_book settles every open sniper position
+#     at the session close and books it as a session end. Grading research rows
+#     to midnight measured a trade the bot cannot hold and then compared it to
+#     the live book as though the two were the same thing.
+#
+#     The window is now the DECLARED horizon, the session close, and the
+#     deferral rule is tested against that instead. The rest of the W03
+#     contract, the per-instrument declaration and the denominator conventions,
+#     is in test_grading_jobs.py.
 # --------------------------------------------------------------------------
+MIDSESSION = datetime(2026, 9, 8, 15, 0, tzinfo=ET)   # before the close
+
 reset()
 cand(9, 50, 1.1020, 1.1008)                  # EURUSD=X, a 24h FX symbol
-_fx_yf = install_yf(FakeYF(default=fx_day(), as_of=CLOSE))
+_fx_yf = install_yf(FakeYF(default=fx_day(), as_of=MIDSESSION))
 
 
-def _g2_not_frozen_at_the_close():
-    res = grade(CLOSE)
+def _g2_not_frozen_before_the_horizon():
+    res = grade(MIDSESSION)
     if not identity_holds(res):
         return False, f"identity broken: {res}"
     return (res["eligible"] == 1 and res["graded"] == 0
@@ -841,24 +860,25 @@ def _g2_not_frozen_at_the_close():
             and res["complete"] is True), str(res)
 
 
-guard("G2: a row whose own day is still open is deferred, not graded early",
-      _g2_not_frozen_at_the_close)
+guard("G2: a row whose declared horizon has not passed is deferred, not "
+      "graded early", _g2_not_frozen_before_the_horizon)
 check("G2: the deferred row is left ungraded on disk, so a later pass sees it",
       len(ungraded()) == 1, f"ungraded={len(ungraded())}")
 
-_fx_yf.as_of = None              # the evening has printed
+_fx_yf.as_of = None              # the whole evening has printed
 
 
-def _g2_graded_when_knowable():
+def _g2_graded_at_the_horizon():
     res = grade()
-    hit = (rows()[0].get("outcome") or {}).get("hit") or {}
+    oc = rows()[0].get("outcome") or {}
+    hit = oc.get("hit") or {}
     return (res["graded"] == 1 and res["pending"] == 0
-            and res["complete"] is True and hit.get("t04") is True), \
-        f"{res} hit={hit}"
+            and res["complete"] is True and hit.get("t04") is None
+            and oc.get("terminal") == "horizon"), f"{res} oc={oc}"
 
 
-guard("G2: the next pass grades it once the day has closed, and the late win "
-      "counts as a win", _g2_graded_when_knowable)
+guard("A21: the pass after the close grades it, and the 20:00 move is a "
+      "session-end exit rather than a win", _g2_graded_at_the_horizon)
 
 reset()
 cand(9, 50, 1.1020, 1.1008)
@@ -879,35 +899,36 @@ guard("G2: a walk that already terminated is graded on the day it happened",
 
 
 # 12b. the same row through the REAL scheduler, at the clock the freeze
-#      actually happened on
+#      actually happened on. 16:12 is now PAST the declared horizon, so the
+#      row is settled and the pass is entitled to grade it. That is the point
+#      of A21: the 16:12 pass and the live book see the same trade.
 reset()
 cand(9, 50, 1.1020, 1.1008)
 _fx_sched = install_yf(FakeYF(default=fx_day(), as_of=CLOSE))
 _svc = fresh_service()
 tick(_svc, 12, base=datetime(2026, 9, 8, 16, 0, tzinfo=ET))   # 16:12 ET
 
-check("G2: the 16:12 pass does not freeze a row whose day is still open",
-      len(ungraded()) == 1, f"ungraded={len(ungraded())}")
-check("G2: a deferred row is not a failure, so the day is not parked",
+check("A21: the 16:12 pass grades a row whose declared horizon has passed",
+      len(ungraded()) == 0, f"ungraded={len(ungraded())}")
+check("G2: a settled row is not a failure, so the day is not parked",
       config.state_get("forward_grade_attention") is None,
       f"park={config.state_get('forward_grade_attention')!r}")
 check("G2: the pass still accounts for the session it ran in",
       config.state_get("forward_graded") == str(_SIGNAL_DAY),
       f"forward_graded={config.state_get('forward_graded')!r}")
 
-_fx_sched.as_of = None
-tick(_svc, 0)                    # the next session's pass, whole day in frame
-check("G2: the next session's pass picks the deferred row up",
-      len(ungraded()) == 0, f"ungraded={len(ungraded())}")
+
+def _g2_sched_not_a_win():
+    """The whole A21 reversal, through the scheduler this time: the live book
+    settled at 16:00, so a target taken out at 20:00 is not the bot's win."""
+    oc = rows()[0].get("outcome") or {}
+    hit = oc.get("hit") or {}
+    return (hit.get("t04") is None and oc.get("terminal") == "horizon"
+            and oc.get("horizon_et") == "2026-09-08 16:00"), f"oc={oc}"
 
 
-def _g2_sched_win():
-    hit = (rows()[0].get("outcome") or {}).get("hit") or {}
-    return hit.get("t04") is True, f"hit={hit}"
-
-
-guard("G2: the target taken out after the close is recorded as the win it was",
-      _g2_sched_win)
+guard("A21: a target taken out after the close is a session-end exit, not a "
+      "win", _g2_sched_not_a_win)
 
 check("G2: the grading key no longer claims the bars are final at the close",
       "The bars are final at" not in _src_scanner,

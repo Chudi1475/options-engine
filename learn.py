@@ -83,6 +83,11 @@ EVIDENCE_CLASSES = ("deterministic", "model_hypothesis", "owner", "unclassified"
 # Never a guess: an unmapped row is reported, not attached to a trade.
 UNMAPPED = "__unmapped__"
 
+# marker for a mapping key TWO different reviews answer to. It is not a
+# review, it is the proof that this key cannot name one, and the migration
+# treats it exactly like no match at all.
+AMBIGUOUS = object()
+
 
 # ------------------- deep per-trade review (full history) -------------------
 
@@ -831,8 +836,15 @@ def _stamp_provenance(entry: dict) -> dict:
     return e
 
 
-def _append_lesson(entry: dict):
-    """Persist one lessons.jsonl row. Nightly and coach rows UPSERT by
+def _append_lesson(entry: dict) -> bool:
+    """Persist one lessons.jsonl row, and say whether it landed.
+
+    The bool is what the repair path needs: a lock it could not take or an
+    append the disk refused used to return silently, and repair_lessons then
+    counted a lesson it had not written, marked it recorded for the rest of
+    that pass, and printed the count into the import's completion line.
+
+    Nightly and coach rows UPSERT by
     (session, kind): re-running an already-reviewed session (a --date
     backfill, a crash-restart re-fire between send and dedup-mark) replaces
     the previous row instead of stacking a duplicate the digest would count
@@ -870,7 +882,7 @@ def _append_lesson(entry: dict):
         if not lk.held:
             print(f"learn: lessons.jsonl is held by another writer ({lk.why}); "
                   "this lesson was not recorded")
-            return
+            return False
         if kind != "deep" and session and LESSONS_LOG.exists():
             # read as TEXT on purpose: a line the parser cannot read is copied
             # through verbatim rather than re-encoded or dropped, and an
@@ -900,7 +912,14 @@ def _append_lesson(entry: dict):
                     if not out.ok:  # rewrite failed: the append still lands
                         print("learn: lesson upsert rewrite failed "
                               f"({out.status} {out.error}); appending")
-        storage_io.append_jsonl(LESSONS_LOG, entry)
+        landed = storage_io.append_jsonl(LESSONS_LOG, entry)
+        if not landed.ok:
+            # the same rule as everywhere else in this file: a row the disk
+            # never took is not a row, and the caller has to hear so
+            print(f"learn: could NOT append to {LESSONS_LOG.name}: "
+                  f"{landed.status} {landed.error}; this lesson was not "
+                  "recorded")
+        return bool(landed.ok)
 
 
 def _all_lessons() -> list:
@@ -1339,13 +1358,19 @@ def _reviewed_index() -> dict:
 def _verdict_sign(text):
     """+1, -1 or None for what a claimed verdict asserts about the outcome.
     Wording-tolerant on purpose: the canonical verdict carries an emoji, an
-    offline reviewer may type WIN or LOSS."""
+    offline reviewer may type WIN or LOSS.
+
+    WHOLE WORDS, not substrings. This matched "win" and "right" anywhere in
+    the string, and an offline reviewer types this field by hand: "wrong, the
+    swing never came" contains w-i-n, read as a claimed WIN, and the importer
+    then refused the entire batch for a verdict that contradicted nothing. The
+    loss direction had the same shape through "unwind"."""
     t = " ".join(str(text or "").lower().split())
     if not t or "not graded" in t or "still open" in t:
         return None
-    if "right" in t or "win" in t:
+    if re.search(r"\b(right|win|won|wins|winner)\b", t):
         return 1
-    if "wrong" in t or "loss" in t or "lost" in t or "lose" in t:
+    if re.search(r"\b(wrong|loss|lost|lose|loser)\b", t):
         return -1
     return None
 
@@ -1373,10 +1398,19 @@ def _lesson_already_recorded(review_id: str) -> bool:
 def _recorded_lesson_index(lessons):
     """Read the lessons log ONCE and index it two ways.
 
-    keys   : {(source_review_id, review_revision)} for rows that carry an id.
-    legacy : rows with no usable id, indexed by the review string and by
-             (session, normalised lesson text), which are the two things a
-             derived row can be matched on without guessing."""
+    keys     : {(source_review_id, review_revision)} for rows that carry an id.
+    legacy   : rows with no usable id, indexed by the review string and by
+               (session, normalised lesson text), which are the two things a
+               derived row can be matched on without guessing.
+    consumed : {row index: the review id that claimed it} during THIS pass. One
+               legacy row was produced by ONE review, so it may satisfy that
+               review and no other. Without this, two trades on the same day
+               with the same ticker and the same 'why' both matched the single
+               legacy row, both counted as legacy_matched, and the second
+               review's lesson was never derived, never written and never
+               reached the digest. Keyed by review id, not by (id, revision),
+               so a later revision of the SAME review keeps matching its own
+               legacy row exactly as before."""
     keys, legacy_review, legacy_text = set(), {}, {}
     for i, e in enumerate(lessons):
         rid = e.get("source_review_id")
@@ -1393,22 +1427,30 @@ def _recorded_lesson_index(lessons):
             key = (session, " ".join(str(lesson).lower().split()))
             if key[1]:
                 legacy_text.setdefault(key, []).append(i)
-    return {"keys": keys, "by_review": legacy_review, "by_text": legacy_text}
+    return {"keys": keys, "by_review": legacy_review, "by_text": legacy_text,
+            "consumed": {}}
 
 
 def _legacy_row_for(review_row, lesson_text, index):
     """The index of the legacy lessons row this review already produced, or
     None. Exact matches only: the reconstructed review string first, then the
-    exact lesson text within the same session. Never a fuzzy guess."""
+    exact lesson text within the same session. Never a fuzzy guess.
+
+    A row already claimed by a DIFFERENT review in this pass is skipped. One
+    legacy row is one review's work, so letting it answer for two reviews
+    silently drops the second one's lesson. A row this same review already
+    claimed still matches, so nothing about re-reading one review changes."""
+    consumed = index.setdefault("consumed", {})
+    rid = str(review_row.get("id") or "")
     review = " ".join(_derived_review_line(review_row).split())
-    hit = index["by_review"].get(review)
-    if hit:
-        return hit[0]
+    for i in index["by_review"].get(review) or ():
+        if consumed.get(i, rid) == rid:
+            return i
     key = (str(review_row.get("date") or ""),
            " ".join(str(lesson_text).lower().split()))
-    hit = index["by_text"].get(key)
-    if hit:
-        return hit[0]
+    for i in index["by_text"].get(key) or ():
+        if consumed.get(i, rid) == rid:
+            return i
     return None
 
 
@@ -1657,6 +1699,12 @@ def import_reviews(path: str, reviewer: str = "offline") -> int:
     return import_reviews_result(path, reviewer)["written"]
 
 
+SUPERSEDE_FAILED = -1   # not a count: "the rewrite did not happen". Zero means
+                        # there was nothing to supersede, which is the ordinary
+                        # case, and collapsing the two let a correction whose
+                        # write failed report itself as a clean success.
+
+
 def _supersede_lessons(review_id: str, revision: int) -> int:
     """Mark every earlier lesson row for this review inactive and point it at
     the revision that replaced it. The text STAYS in lessons.jsonl for audit;
@@ -1664,20 +1712,26 @@ def _supersede_lessons(review_id: str, revision: int) -> int:
     transaction, and a line the parser cannot read is copied through
     untouched. This had no error handling at all: the WinError 5 that hits
     this machine about one run in ten raised straight out of the nightly
-    review."""
+    review.
+
+    Returns the number of rows superseded, or SUPERSEDE_FAILED when the file
+    could not be locked, read or rewritten. The caller has to be able to tell
+    those apart: a 0 that really meant "the disk refused" left the superseded
+    text ACTIVE in the digest beside its own correction, and the run still
+    reported itself ok."""
     if not LESSONS_LOG.exists():
         return 0
     with storage_io.file_lock(LESSONS_LOG) as lk:
         if not lk.held:
             print("learn: lessons.jsonl is held by another writer "
                   f"({lk.why}); nothing was superseded")
-            return 0
+            return SUPERSEDE_FAILED
         try:
             lines = LESSONS_LOG.read_text(encoding="utf-8-sig").splitlines()
         except OSError as e:
             print(f"learn: lessons.jsonl could not be read ({e}); nothing "
                   "was superseded and nothing was published over it")
-            return 0
+            return SUPERSEDE_FAILED
         kept, changed = [], 0
         for line in lines:
             try:
@@ -1701,7 +1755,7 @@ def _supersede_lessons(review_id: str, revision: int) -> int:
                 # revision superseded lessons that are still active
                 print(f"learn: could NOT persist {LESSONS_LOG.name}: "
                       f"{out.status} {out.error}; nothing was superseded")
-                return 0
+                return SUPERSEDE_FAILED
         return changed
 
 
@@ -1754,13 +1808,27 @@ def repair_lessons(reviews_file) -> dict:
         if legacy_at is not None:
             # this review already produced that row, back when the rows
             # carried no id. Adopting it is --migrate-legacy's job; the one
-            # thing this path must never do is write a second copy.
+            # thing this path must never do is write a second copy. The row is
+            # marked consumed so the NEXT review with the same reconstructed
+            # line has to derive its own lesson instead of inheriting this one.
+            index.setdefault("consumed", {})[legacy_at] = str(rid)
             result["legacy_matched"] += 1
             result["skipped"] += 1
             continue
         try:
-            result["superseded"] += _supersede_lessons(str(rid), rev)
-            _append_lesson({
+            n = _supersede_lessons(str(rid), rev)
+            if n == SUPERSEDE_FAILED:
+                # publishing the correction on top of an earlier revision that
+                # is still active puts BOTH in the digest, which is worse than
+                # a missing correction. Leave the whole unit for the retry:
+                # nothing here is written, so nothing is half applied.
+                result["ok"] = False
+                result["errors"].append(
+                    f"{_review_key(rid, rev)}: earlier revisions could not be "
+                    "superseded, so the correction was not recorded either")
+                continue
+            result["superseded"] += n
+            landed = _append_lesson({
                 "session": r.get("date", ""),
                 "graded_at": r.get("reviewed_at", ""),
                 "wins": 0, "losses": 0, "trades": [],
@@ -1776,6 +1844,14 @@ def repair_lessons(reviews_file) -> dict:
         except Exception as e:
             result["ok"] = False
             result["errors"].append(f"{_review_key(rid, rev)}: {e}")
+            continue
+        if not landed:
+            # NOT recorded, so not counted and NOT marked done: marking it
+            # would make the rest of this pass, and the completion line, claim
+            # a lesson that is not on the disk. The retry re-derives it.
+            result["ok"] = False
+            result["errors"].append(
+                f"{_review_key(rid, rev)}: the lesson could not be written")
             continue
         index["keys"].add((str(rid), rev))
         result["derived"] += 1
@@ -1797,20 +1873,27 @@ def _derive_lessons_for(reviews_file) -> int:
 
 def migrate_legacy_lessons(reviews_file=None) -> dict:
     """One-time, deliberate repair of lessons written before the rows carried
-    a source_review_id. Returns {ok, mapped, unmapped, rows, backup, errors}.
+    a source_review_id. Returns
+    {ok, mapped, unmapped, ambiguous, rows, backup, errors}.
 
     A legacy row is matched to its review by exact equality of the
     reconstructed review string, and failing that by exact lesson text within
     the same session. Nothing else. A row that matches neither is stamped
     __unmapped__ and reported, never attached to a trade on a guess.
 
+    A row that matches TWO reviews equally well is the same thing: a guess.
+    Two trades on one day with the same ticker and the same 'why' produce the
+    same reconstructed line, and setdefault silently gave the row to whichever
+    review happened to be read first. Ambiguous now means unmapped, and it is
+    counted separately so the operator can see it happened.
+
     A copy of the file is written first, the rewrite is an atomic publish,
     and a line the parser cannot read is copied through untouched. The
     read, the mapping and the rewrite are all inside ONE lock: this
     republishes the whole file, so a lesson appended while the mapping ran
     would otherwise be destroyed by it."""
-    result = {"ok": True, "mapped": 0, "unmapped": 0, "rows": 0,
-              "backup": "", "errors": []}
+    result = {"ok": True, "mapped": 0, "unmapped": 0, "ambiguous": 0,
+              "rows": 0, "backup": "", "errors": []}
     reviews_file = reviews_file if reviews_file is not None else REVIEWS_FILE
     if not LESSONS_LOG.exists():
         return result
@@ -1830,17 +1913,27 @@ def migrate_legacy_lessons(reviews_file=None) -> dict:
             return result
 
         by_review, by_text = {}, {}
+
+        def _claim(table, key, rid, rev, r):
+            """First review wins a key; a SECOND review with a different id
+            poisons it. AMBIGUOUS is not a mapping, it is the absence of one."""
+            prev = table.get(key)
+            if prev is None:
+                table[key] = (str(rid), rev, r)
+            elif prev is not AMBIGUOUS and prev[0] != str(rid):
+                table[key] = AMBIGUOUS
+
         for r in rows:
             rid = r.get("id")
             if not rid:
                 continue
             rev = _review_revision(r) or 1
-            by_review.setdefault(" ".join(_derived_review_line(r).split()),
-                                 (str(rid), rev, r))
+            _claim(by_review, " ".join(_derived_review_line(r).split()),
+                   rid, rev, r)
             lesson = " ".join(str(r.get("lesson") or "").lower().split())
             if lesson:
-                by_text.setdefault((str(r.get("date") or ""), lesson),
-                                   (str(rid), rev, r))
+                _claim(by_text, (str(r.get("date") or ""), lesson),
+                       rid, rev, r)
 
         kept = []
         for line in lines:
@@ -1861,7 +1954,14 @@ def migrate_legacy_lessons(reviews_file=None) -> dict:
                                        " ".join(str(lesson).lower().split())))
                     if hit:
                         break
-            if hit is None:
+            # an ambiguous review line is NOT rescued by the weaker text key:
+            # a row two reviews both explain is a row this code cannot
+            # attribute, and a second guess is still a guess
+            if hit is AMBIGUOUS or hit is None:
+                if hit is AMBIGUOUS:
+                    result["ambiguous"] += 1
+                    row["unmapped_reason"] = ("two reviews match this row "
+                                              "equally well")
                 row["source_review_id"] = UNMAPPED
                 row["migrated_from"] = "legacy"
                 result["unmapped"] += 1

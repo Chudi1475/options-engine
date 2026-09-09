@@ -1,0 +1,218 @@
+[
+ {
+  "n": 1,
+  "sev": "high",
+  "file": "C:\\Users\\Chudi\\options-engine\\scanner.py",
+  "claim": "REPRODUCED. Every record-1 row the live scanner writes carries decision_id: null, including the selected:true row for a real trade, and the null carries a reason that is factually false. Service.record_candidate has no decision_id parameter at all (co_varnames = self, ticker, direction, bar_end, codes, values, now, selected, position_id, gate_passed, candidate_id, ctx), so trade_recorder.record_candidate always takes decision_id=None and appends the code no_decision_id, which explain() renders as 'the strategy made no commitment on this observation, so there is no decision to name'. On the selected row the strategy HAD committed: pos.decision_id exists and is handed to record_event 48 lines later (scanner.py:3336). RECORDER_SCHEMA sec.1 'Three ids, three different jobs. decision_id is immutable and separate' is therefore unimplemented on the only path that runs in production. It has no r",
+  "scenario": "Ran: Service.__new__(Service) with dry=False and a stubbed _rec_ctx, then svc.record_candidate('SPY','call','2026-09-09T13:50:00+00:00',[],{...},now,selected=True,gate_passed=True,position_id='20260909-095000-SPY-C640'); drain_once(); read_records('candidates') -> {'candidate_id':'cnd6d869ae1792015','decision_id':None,'selected':True,'position_id':'20260909-095000-SPY-C640','missing_reason':'no_decision_id'}. A study replaying record 1 cannot tell an observation apart from a commitment, which is the exact conflation A05 and RECORDER_SCHEMA sec.1 exist to prevent.",
+  "req": "RECORDER_SCHEMA sec.1 / spec sec.5 record 1: decision_id is a required field, immutable and separate from candidate_id; unknown is null WITH A REASON, and the reason must be true."
+ },
+ {
+  "n": 2,
+  "sev": "high",
+  "file": "C:\\Users\\Chudi\\options-engine\\trade_recorder.py",
+  "claim": "REPRODUCED. The 'durable loss counter' is not durable. _COUNTS is rebuilt from _zero_counts() at import and _reset_for_test; _resume_state() reloads contracts, candidates and observations but never the counters. coverage() computes completeness from _COUNTS only, and _persist_coverage does a full storage_io.write_json replace of coverage.json. So a restart zeroes dropped_samples / write_failures / gaps / provider_errors / samples_missing and the next write republishes coverage.json saying completeness 'complete'. The module's own docstring at line 503 claims the opposite: 'The loss counter has to survive the process that lost the samples.'",
+  "scenario": "Ran: filled _Q to QUEUE_MAX, then 25 more _enqueue calls -> coverage.json dropped_samples=25, completeness='degraded', report_text 'completeness degraded, 25 lost to a full queue'. Then _reset_for_test(keep_files=True) (the module's own model of 'new process, same volume'), record_health(...), drain_once(), _persist_coverage(force=True) -> coverage.json dropped_samples=0, completeness='complete', report_text 'completeness complete'. In production: a Railway redeploy or OOM after a saturated morning erases the session's loss count and /health tells the owner the record is complete.",
+  "req": "Spec sec.5 and RECORDER_SCHEMA 'Recorder behavior constraints': saturation must increment a DURABLE or externally logged loss counter and downgrade evidence completeness. W06 acceptance: 'completeness and lost-sample counts are measurable'."
+ },
+ {
+  "n": 3,
+  "sev": "high",
+  "file": "C:\\Users\\Chudi\\options-engine\\scanner.py",
+  "claim": "Two disjoint candidate_id namespaces are written into the same record set. record_candidate/record_sample/the ENTRY record-3 event use rec_candidate, the recorder's id ('cnd' + 14 hex, trade_recorder.py:565). The EXIT record-3 events (scanner.py:3650) use getattr(pos,'candidate_id'), which is event_journal.candidate_id_for -> 'c' + 15 hex (event_journal.py:238). fill_journal.note_signal (scanner.py:3259) uses the same event_journal id, so record 5 does too. The monitor sample fallback path (_record_monitor_sample) also falls back to pos.candidate_id when the observation registry is missing.",
+  "scenario": "For one SPY trade the volume contains: candidates row candidate_id='cnd6d869ae...'; events row event_type='entry' candidate_id='cnd6d869ae...'; events rows event_type='sell_half'/'stop' candidate_id='c9f3a...'; fills/signals rows candidate_id='c9f3a...'. A study joining record 3 exits or record 5 fills back to record 1 on candidate_id resolves zero rows for every exit and every fill, so the exit evidence and the manual fills cannot be attached to the decision that produced them. W06p's only scanner check is the substring test '\"record_event\" in scanner_src' (test_trade_recorder.py:1143), which cannot see this.",
+  "req": "Spec sec.3 'Durable events and sending' and RECORDER_SCHEMA sec.1/3/5: one stable candidate_id allocated at observation creation and referenced by the quote, exit and fill records. Spec sec.11: every committed alert intent links to one position and candidate."
+ },
+ {
+  "n": 4,
+  "sev": "high",
+  "file": "C:\\Users\\Chudi\\options-engine\\scanner.py",
+  "claim": "REPRODUCED. The fill lane's denominator omits the busier alert lane. fill_journal.note_signal is called from exactly one place, _note_fill_signal inside the momentum open_position. The sniper lane (scanner.py:3975, sniper_entry/sniper_exit intents) never writes a signal row, yet fill_candidates admits sniper_entry and sniper_exit as reply targets, so a recipient CAN log a fill against a sniper alert and it is accepted. coverage()'s signals, signals_unknown and recipients_unreported therefore exclude every sniper alert.",
+  "scenario": "Ran: note_signal for one momentum alert to 3 recipients, then handle_message('bought 1 @ 3.10') resolved against a sniper_entry candidate -> status 'accepted'; coverage() = {'signals':1,'signals_reported':0,'signals_unknown':1,'execution_experiences':1,'recipients_alerted':3,'recipients_unreported':3}. report_text (which scanner.py:1861 appends to /health) prints 'Fills (optional lane): 0/1 signals reported, 1 execution experiences, 3 recipients silent' - one execution experience against zero reported signals, and every sniper alert's silence is invisible. The live book is 53 sniper tickets; this is where the unknowns actually are.",
+  "req": "Spec sec.5 / RECORDER_SCHEMA sec.5: 'No reply means unknown, not no trade.' W07 acceptance: 'no response remains unknown' requires a complete signal denominator."
+ },
+ {
+  "n": 5,
+  "sev": "medium",
+  "file": "C:\\Users\\Chudi\\options-engine\\fill_journal.py",
+  "claim": "REPRODUCED. An unreported fee is written as 0.0, not null with a reason, and that zero is then published as a net cash result. record_fill does \"fees\": (float(fees) if fees is not None else 0.0) and derives fees_cents from it; there is no fees_reason field (the row's only *_reason key is executed_at_reason). _user_reconciliation folds fees_cents into round_trip_cash_cents and cards.fills_card prints it as 'round trip X dollars net of your fees'. The module contradicts itself: _supersede's comment says 'zero fees is a CLAIM and nobody made it'.",
+  "scenario": "Ran: 'bought 2 @ 1.35' then 'sold 2 @ 2.05', neither message mentioning fees -> row fees=0.0, fees_cents=0, no reason field; reconcile() -> {'fees_cents':0,'round_trip_cash_cents':14000}; /fills renders 'round trip +140.00 dollars net of your fees' for a trade whose fees the user never stated. Real 2-leg option commissions of roughly $1.30 make the published figure wrong by about 2% of the result, with nothing on the row saying the cost was never reported.",
+  "req": "RECORDER_SCHEMA 'Rules that apply to every record': unknown is null WITH A REASON, never zero. W07 acceptance: 'Integer quantities and costs must reconcile.'"
+ },
+ {
+  "n": 6,
+  "sev": "medium",
+  "file": "C:\\Users\\Chudi\\options-engine\\quotes.py",
+  "claim": "REPRODUCED. Every record-2 row the batched sampler writes carries underlying_price: null and underlying_at_utc: null with no reason for those two fields. chain_snapshot hardcodes underlying_price/underlying_at_utc to None on every return, and sample_once only borrows a value from _UNDER, which is populated solely by _record_monitor_sample for tickers with a position still under monitoring. sample_once sets missing_reason = None if the chain cell exists, so nothing explains the missing underlying. trade_recorder.REASON_CODES already defines 'no_underlying_price' but the sampler never uses it, and chain_snapshot's own missing_reason string is never read by sample_once.",
+  "scenario": "Ran sample_once with a chain_fn returning full bid/ask rows and no underlying price -> the chosen row is {'underlying_price': None, 'underlying_at_utc': None, 'missing_reason': 'no_provider_timestamp', 'quality_flags': []}. This is the common case for the A15 window: after the position closes, monitoring stops and _UNDER goes stale or absent, so every control sample and every post-exit chosen sample through the common horizon has an unexplained null underlying, and moneyness at those samples cannot be reconstructed.",
+  "req": "RECORDER_SCHEMA sec.2 / spec sec.5 record 2: underlying_price and underlying_at_utc are required fields, and unknown is null with a reason."
+ },
+ {
+  "n": 7,
+  "sev": "medium",
+  "file": "C:\\Users\\Chudi\\options-engine\\astra\\POLICY_CHANGES.md",
+  "claim": "The policy-change matrix declares 'It covers W00, W05, W01, W02 and W04 (rows M8 to M13). W03 and W06 through W11 will add rows', while this batch ships W03, W06 and W07 with at least four unlisted behavior changes: (1) cards.py:467 appends FILL_HINT to every entry card, so the alert text all three recipients receive changed; (2) scanner handle_item now offers every authorized plain-text message to fill_journal.looks_like_report BEFORE the assistant, so a message that used to reach the brain can be consumed by the fill lane; (3) forward_ledger's grading horizon moved from 23:59 of the row's own day to the session close, which changes the graded outcome of rows not yet walked; (4) forward_grade_session/forward_grade_open_at moved the grading key from WEEKLY_AT to that session's close + 5 minutes.",
+  "scenario": "A reviewer following the release checklist step 5 uses POLICY_CHANGES.md as the list of intended differences. Replaying a fixed input stream through old and candidate produces at minimum a diff in every entry card body and a diff in every newly graded forward row, and neither has a row naming it, its file and line, its regression and its behavior class. The matrix's own status line asserts these packages have no rows yet, so the differences read as unexplained.",
+  "req": "Spec sec.11: required export 'policy-change matrix ... For every change give the actual current file and line, regression, behavior class and acceptance measurement.' Spec sec.10 step 5: 'Every difference needs an ID, causal explanation and approved classification.'"
+ },
+ {
+  "n": 8,
+  "sev": "medium",
+  "file": "C:\\Users\\Chudi\\options-engine\\forward_ledger.py",
+  "claim": "NOT REPRODUCED (no ledger on this machine; data/forward_ledger.json does not exist locally, the volume is on Railway). scoreboard() stamps a single top-level 'horizon' block claiming policy HORIZON_POLICY ('session_close_v1') and HORIZON_BASIS for the whole cohort. Rows graded before this change were walked to start.replace(hour=23, minute=59) and their outcome dicts carry no horizon_policy/horizon_at at all; _cohort() and the per-tier aggregation do not filter or partition on it. So the published scoreboard can attribute a session-close horizon to rows that were graded to midnight.",
+  "scenario": "A ledger holding rows graded before this deploy (walked to 23:59, so an FX row could be resolved by a 20:00 ET move) and rows graded after (walked to 16:00) is published as one table with horizon.policy 'session_close_v1'. That is the cohort-labelling error A09 and A21 both name: two grading rules pooled under one declared rule. Verify against the production ledger by counting graded rows whose outcome lacks 'horizon_policy'.",
+  "req": "A21 'Specify the instrument and strategy horizon before grading'; spec sec.6 'Preserve original grades and publish revised versions rather than overwriting history'; A09 'Explicitly name the cohort in every table.'"
+ },
+ {
+  "n": 9,
+  "sev": "low",
+  "file": "C:\\Users\\Chudi\\options-engine\\scanner.py",
+  "claim": "REPRODUCED. The three branches that record a reject with no bar (already_decided_today, no_bars, data_error) all pass direction=None and bar_end=None, so trade_recorder's key 'strategy|symbol|direction|session_date|input_bar_end_utc' collapses them onto ONE candidate_id per symbol per session, and each transition between them writes a REVISION of that single candidate. Their cluster_id is sha('date|None|None'), identical across every watchlist symbol.",
+  "scenario": "Ran svc.record_candidate for no_bars, then data_error, then already_decided_today at three different times of one session -> 3 rows, all candidate_id 'cndc9190d3bc4be89', revisions 0/1/2, all cluster_id 'clu56c4ceed012e'. Three unrelated non-observations are recorded as one opportunity revised twice, candidate_revisions is inflated by feed flapping rather than by decision-input changes, and the bar-less rejects of SPX, SPY, TSLA and QCOM share a single cluster. Note the momentum scan path itself IS correct: four rechecks of one unchanged completed bar produced exactly one row (bars come from _completed(), so close and bar_end are bar-stable).",
+  "req": "Spec sec.5 / RECORDER_SCHEMA sec.1: 'The unit is each completed input-bar opportunity, per strategy, symbol and direction, plus meaningful revisions of its decision inputs', and cluster_id is the unit the preregistered study analyses on."
+ },
+ {
+  "n": 10,
+  "sev": "low",
+  "file": "C:\\Users\\Chudi\\options-engine\\trade_recorder.py",
+  "claim": "Duplicate-sample detection is structurally inert on the only feed in production. record_sample only flags 'repeat_provider_timestamp'/'identical_to_previous' and increments duplicate_samples when provider_at_utc is not None and equals the previous one. Every production caller passes provider_at_utc=None: _start_observation (scanner.py:3305), _record_monitor_sample (scanner.py:3417), and sample_once via chain_snapshot, which hardcodes provider_at_utc: None (quotes.py:137) because a Yahoo chain row carries no quote timestamp. So duplicate_samples can never leave zero in production.",
+  "scenario": "Ran sample_once against a chain stub with provider_at_utc None; 19 samples written including two rows for each control contract at the identical instant, and coverage() reported duplicate_samples 0. The W06 acceptance fault 'duplicate/out-of-order sample' is exercised in test_trade_recorder only with synthetic provider timestamps, so the counter that would show a feed re-serving one quote is dead on the deployed configuration. (The received_at_utc out-of-order check is unaffected and does work.)",
+  "req": "Spec sec.4 W06 required regression: 'duplicate/out-of-order sample'; RECORDER_SCHEMA sec.2 quality_flags as real evidence about the cadence actually obtained."
+ },
+ {
+  "n": 11,
+  "sev": "low",
+  "file": "C:\\Users\\Chudi\\options-engine\\trade_recorder.py",
+  "claim": "REPRODUCED. When the chain read raises, sample_once writes provider='unknown' and feed='unknown' - string placeholders where the provider is in fact known (the sampler is bound to quotes.chain_snapshot, provider 'yfinance', feed 'yahoo option chain') - and stamps received_at_utc = now_iso for a call from which nothing was ever received.",
+  "scenario": "Ran sample_once with a chain_fn raising RuntimeError('yahoo 429') -> {'provider':'unknown','feed':'unknown','received_at_utc':'2026-09-09T14:00:00+00:00','requested_at_utc':'2026-09-09T14:00:00+00:00','missing_reason':'chain_read_failed no_provider_timestamp no_two_sided_quote'}. A later query filtering samples by provider misses every outage row for yfinance, and received_at_utc equal to requested_at_utc on a failed read is the collapse of the three-clock design the schema built specifically to stop.",
+  "req": "RECORDER_SCHEMA 'Rules that apply to every record': unknown is null with a reason, never an invented timestamp; RECORDER_SCHEMA sec.2 'Three clocks, deliberately.'"
+ },
+ {
+  "n": 12,
+  "sev": "low",
+  "file": "C:\\Users\\Chudi\\options-engine\\trade_recorder.py",
+  "claim": "REPRODUCED. On the pass that resolves the controls, each control contract is written twice at the same instant: once with contract_role 'selection_pool' from the pool loop, then again with its real role from the recomputed rows loop, both carrying the same bid/ask and the same received_at_utc. path_summary(candidate_id, contract_id) filters on contract_id and candidate_id only, so it counts both rows.",
+  "scenario": "Ran one sample_once with 8 listed strikes per right: 19 sample rows, and SPY260909C00641000 carries roles {'selection_pool','strike_control'} while SPY260909P00639000 carries {'selection_pool','direction_control'} in the same pass. path_summary for a control therefore reports one extra sample and a 0-second gap in its median cadence_s, understating the observed cadence a study uses to judge coverage.",
+  "req": "RECORDER_SCHEMA sec.2 'What the path promise actually is': the path is every observed sample at the cadence actually polled; the read-back must not overstate it."
+ },
+ {
+  "n": 13,
+  "sev": "high",
+  "file": "C:\\Users\\Chudi\\options-engine\\trade_recorder.py",
+  "claim": "_save_observations() is the only write in the recorder that discards its WriteResult. A refused observations.json write silently loses the entire observation registry (chosen contract plus both predeclared controls) while coverage keeps reporting write_failures=0, gaps=0, completeness=\"complete\". It is a silent drop, which is exactly what the observer contract forbids.",
+  "scenario": "REPRODUCED end to end (scratchpad m7.py, DATA_DIR isolated, BOT_TEST_MODE=1). storage_io._stage patched to raise OSError(28, 'No space left on device') for the observations path only, then the entry path is exercised: register_contract(SPY C 650 exp 2026-09-09) -> observe(contract_role='chosen', candidate 'cnd1', position 'p1', horizon 2026-09-09T20:00:00+00:00) -> drain_once(). Result printed: `observations.json on disk: False` / `trade_recorder coverage: write_failures=0 gaps=0 completeness=complete` / `report_text(): Recorder: 0 samples, 1 contract watched, completeness complete, 0.00 MB used.` storage_io's own global counter did move to 1, but storage_io.counters() is referenced nowhere ",
+  "req": "RECORDER_SCHEMA.md record 6 and 'Recorder behavior constraints': dropped_samples and the gap fields are the coverage denominator, 'A gap that is not recorded is a gap that silently becomes we observed everything'. Spec section 5: record the entire observed path through a common end time even after the current trade closes, and record gaps. Astra A15."
+ },
+ {
+  "n": 14,
+  "sev": "high",
+  "file": "C:\\Users\\Chudi\\options-engine\\trade_recorder.py",
+  "claim": "The durable half of the saturation loss counter is written only by the writer thread, so it is structurally unreachable in the one condition that actually saturates a 4000-slot queue: a writer that cannot write. After 1755 lost samples the on-volume coverage.json still reads dropped_samples: 0, completeness: \"complete\", and the record-6 health row that would carry the loss is itself enqueued and therefore also dropped.",
+  "scenario": "REPRODUCED (scratchpad m3.py). Healthy phase first: one record_sample, writer drains, on-disk coverage.json = {dropped_samples: 0, samples_recorded: 1, completeness: 'complete'}. Then storage_io.append_text and write_json are wrapped to block on an Event that never sets (a wedged network-backed volume, a hung NFS/Railway mount, or a 1s lock budget lost repeatedly). QUEUE_MAX+3000 monitoring samples then arrive, followed by record_health(ownership_state='ACTIVE'). Printed result: `in-memory dropped_samples: 1755 completeness: degraded` but `ON-DISK coverage after the loss: {'dropped_samples': 0, 'samples_recorded': 1, 'completeness': 'complete'}` and `health rows on disk: NONE`. The process i",
+  "req": "Spec section 5 and RECORDER_SCHEMA.md 'Recorder behavior constraints' 1 and 2: saturation must increment a durable or externally logged loss counter AND downgrade evidence completeness. The durable record does not downgrade; it says complete."
+ },
+ {
+  "n": 15,
+  "sev": "medium",
+  "file": "C:\\Users\\Chudi\\options-engine\\quotes.py",
+  "claim": "Putting the sampler on its own thread does not isolate it from the monitoring loop. yfinance's YfData is a process-wide singleton, and on any response with status >= 400 _make_request clears the cookie and crumb and re-fetches them while holding YfData._cookie_lock across up to two 30s network GETs. A sampler chain read that gets a 429 or 401 therefore blocks the monitoring loop's quotes.get_option_quote on a process-global lock. The docstring at quotes.py:125-127 asserts the opposite safety property.",
+  "scenario": "Verified by reading the installed yfinance 1.4.1 (.venv/Lib/site-packages/yfinance/data.py): _make_request line 447-455, on status >= 400, calls _set_cookie_strategy() which sets self._cookie = None and self._crumb = None (lines 143-144), then _get_cookie_and_crumb(timeout) which does `with self._cookie_lock:` (line 365) around _get_cookie_and_crumb_basic -> _get_cookie_basic (GET https://fc.yahoo.com, timeout=30, line 208) and _get_crumb_basic (GET .../v1/test/getcrumb, timeout=30, line 236). The csrf fallback is worse: a consent-page GET plus a POST under the same lock. Serialization REPRODUCED (scratchpad m4.py, no network): `YfData is a process-wide singleton shared by every caller: True",
+  "req": "Spec section 4 W06 acceptance: 'recorder cannot block monitoring'. RECORDER_SCHEMA.md 'Recorder behavior constraints' 3: it must never silently block exit monitoring."
+ },
+ {
+  "n": 16,
+  "sev": "medium",
+  "file": "C:\\Users\\Chudi\\options-engine\\trade_recorder.py",
+  "claim": "The documented coverage throttle never fires. `due = (force or snapshot != _PERSIST[1] or (_now_s() - _PERSIST[0]) >= COVERAGE_PERSIST_S)` is an OR, and _write_batch bumps _COUNTS['bytes_written'] before calling it, so the snapshot differs on every successful batch and the 30s window is dead code. The result is a full atomic replace of coverage.json per batch on the writer thread, which is the thread whose backlog is the only thing between the producers and dropped samples.",
+  "scenario": "MEASURED (scratchpad m1.py): storage_io.write_json wrapped to count coverage.json targets; 10 record_sample calls spaced 0.7s apart with the real writer running produced `coverage.json full-file writes for 10 samples over ~7s: 11` against `COVERAGE_PERSIST_S = 30.0`. In production the writer wakes on drain_once(block_s=0.5) and forms a batch whenever rows exist, so with POLL_SECONDS=15 and two open positions plus the 60s sampler this is order 2000 full-file replaces per 6.5h session. Each one is a lock-sidecar open plus msvcrt/flock acquire, a shutil.disk_usage call (storage_io._publish:631), a staged tmp write, an os.replace and an unlock (storage_io._publish:617-658) on a 500 MB network-ba",
+  "req": "Spec section 4: 'a 500 MB volume cannot be treated as unlimited retention'. RECORDER_SCHEMA.md 'Capacity is estimated, not assumed'. Batch constraint 8: comment the WHY plainly, naming the hazard."
+ },
+ {
+  "n": 17,
+  "sev": "low",
+  "file": "C:\\Users\\Chudi\\options-engine\\quotes.py",
+  "claim": "chain_snapshot costs two HTTP round trips per call, not the one its docstring claims, and it throws away the underlying price that the same response already carried. `yf.Ticker(sym)` is constructed fresh each call so _expirations is empty, and yfinance's option_chain(date) therefore fetches the undated options endpoint first and the dated one second. The response's quote block (returned as chain.underlying) is never read, so the recorder falls back to a borrowed monitor price or writes underlying_price: None on record 2.",
+  "scenario": "MEASURED (scratchpad m5.py, YfData().get stubbed, no network): one chain_snapshot('SPY', exp) produced `HTTP requests made by ONE chain_snapshot call: 2` -> https://query2.finance.yahoo.com/v7/finance/options/SPY then .../options/SPY?date=1789000000, and `underlying_price recorded by chain_snapshot: None` even though the stubbed payload carried quote.regularMarketPrice = 650.0. Verified against yfinance/ticker.py:83-94 (`if not self._expirations: self._download_options()` then `_download_options(date)`) and :53 (`self._underlying = r['optionChain']['result'][0].get('quote', {})`). Consequence 1: double the rate-limit pressure, which feeds finding 3. Consequence 2: in trade_recorder.sample_on",
+  "req": "RECORDER_SCHEMA.md record 2 (underlying_price, underlying_at_utc) and its first rule, 'Unknown is null, with a reason'. Spec section 5: 'batch additional contracts when supported' (the batching claim is off by 2x)."
+ },
+ {
+  "n": 18,
+  "sev": "high",
+  "file": "C:\\Users\\Chudi\\options-engine\\forward_ledger.py",
+  "claim": "scoreboard() and nightly_summary() stamp the new session_close_v1 horizon on every row, including rows already graded under the old 23:59 walk, which are never regraded. A21 says an evening print is outside the declared horizon and is \"not evidence\"; those rows are published as if they were session-close evidence.",
+  "scenario": "REPRODUCED. Ledger holding one legacy row (EURUSD=X 2026-09-02, outcome {'hit':{'t04':True,'t1':True}, 'graded_at':'2026-09-02 23:59'}, no horizon_policy key, the t04 win coming from a 20:00 ET FX print) plus one row graded after the change (2026-09-08, terminal 'horizon', horizon_policy session_close_v1) plus one retired row. `forward_ledger.scoreboard()` returns n=2, tiers.t04 = {n:1, wins:1, win_pct:100.0} and horizon.policy = 'session_close_v1' with basis \"Quotes printed after it are outside the declared strategy horizon and are not evidence\". `nightly_summary()` prints \"Sniper forward record: 2 live signals graded so far / 0.4R: wins 1 of 1 (100 of 100) / ... 1 of 2 reached neither leve",
+  "req": "Spec section 6 shared grading contract: \"Preserve original grades and publish revised versions rather than overwriting history\"; A21 declared instrument and strategy horizon; PREREGISTRATION section 8.1 complete and trustworthy record"
+ },
+ {
+  "n": 19,
+  "sev": "high",
+  "file": "C:\\Users\\Chudi\\options-engine\\scanner.py",
+  "claim": "A carried mark that is literally a Black-Scholes number is recorded with is_model=false and price_basis \"last_known_price\". is_model is derived from this cycle's `source` string, not from what produced the number being carried.",
+  "scenario": "REPRODUCED. Cycle N on a 0DTE position: chain bid-less, sigma>0, so mark=est=0.72 with source \"estimated from the stock move\" -> sample records price_basis black_scholes_estimate, is_model true, and pos.last_mark=0.72. Cycle N+1: the vol download is throttled so est=0.0 (scanner.py:3469 documents this) and the chain is still bid-less, so scanner.py:3518 falls back to mark=pos.last_mark=0.72 with source \"last known price (no live quote)\". _record_monitor_sample then writes {mark: 0.72, price_basis: \"last_known_price\", is_model: false}. A study filtering is_model==False to isolate real market observations picks up a Black-Scholes price. The same happens when pos.last_mark is None and the fallb",
+  "req": "RECORDER_SCHEMA record 2: \"is_model and price_basis separate a Black-Scholes estimate from a real quote. This is the field that would have prevented the overstatement in A07: six of the deep losses carried modeled marks and nothing in the record said so at a glance\"; spec section 6 \"Store the model output separately from the quoted value and the value actually used\""
+ },
+ {
+  "n": 20,
+  "sev": "medium",
+  "file": "C:\\Users\\Chudi\\options-engine\\fill_journal.py",
+  "claim": "A fill reported without fees is written as fees 0.0 / fees_cents 0 with no reason field, and the resulting round trip is published to the owner as \"net of your fees\". The module's own _supersede comment states the opposite rule: \"zero fees is a CLAIM and nobody made it\".",
+  "scenario": "REPRODUCED. handle_message(u1, 'bought 2 @ 1.35') then ('sold 2 @ 2.05'), neither mentioning fees. Both rows land as {'fees': 0.0, 'fees_cents': 0} and the only *_reason key on the row is executed_at_reason. reconcile('p1')['by_user']['u1']['round_trip_cash_cents'] == 14000, and cards.fills_card renders \"SPY: bought 2, sold 2, open 0, round trip +140.00 dollars net of your fees\". The figure is gross and is labelled net. Contrast the W07k regression, which only exercises the path where fees ARE stated, so nothing in the suite covers the default. A later study reading fills-*.jsonl cannot tell an unreported fee from a user who explicitly said \"fees 0\".",
+  "req": "RECORDER_SCHEMA rule 1: \"Unknown is null, with a reason. Never zero, never false\"; PREREGISTRATION section 3 cost convention (\"Fees and spread are applied to every leg\") and section 9 sensitivity to execution assumptions"
+ },
+ {
+  "n": 21,
+  "sev": "medium",
+  "file": "C:\\Users\\Chudi\\options-engine\\forward_ledger.py",
+  "claim": "scoreboard() publishes a win rate with retired and still-ungraded cohort rows silently removed and no count of either anywhere in the returned dict or the nightly text. The batch upgraded this dict to name its denominator convention and horizon but left out the coverage denominator itself.",
+  "scenario": "REPRODUCED. Ledger with three cohort rows: one graded t04 win, one retired via _retired_outcome, one with outcome None. scoreboard() returns n=1, tiers.t04 = {n:1, wins:1, win_pct:100.0, unresolved_at_horizon:0} and top-level keys are exactly ['convention','convention_note','horizon','n','sibling','tiers'] - no retired count, no ungraded count. nightly_summary() prints \"Sniper forward record: 1 live signals graded so far\". Two of three candidates left the number and the reader is told nothing. Retiring a row is correct (it is evidence of nothing) but it moves the published rate, which is the exact hazard _cohort's own docstring says _retired_outcome promises it cannot do.",
+  "req": "PREREGISTRATION section 8.1 \"A complete and trustworthy record: coverage measured, unresolved statuses counted, orphans zero or named\"; spec section 6 \"ambiguity and coverage accompany means\""
+ },
+ {
+  "n": 22,
+  "sev": "medium",
+  "file": "C:\\Users\\Chudi\\options-engine\\trade_recorder.py",
+  "claim": "path_summary, the only read-back API that produces a path high and low, pools modeled marks and quote mids into observed_max_mark / observed_min_mark with no is_model breakdown, and returns complete: true. Its caveat covers only sampling cadence, not price basis.",
+  "scenario": "REPRODUCED. Two samples on one contract: (a) bid 1.00 / ask 1.10, price_basis quote_mid, is_model false, mark 1.05; (b) bid None / ask None, price_basis black_scholes_estimate, is_model true, mark 9.99. path_summary('c1', cid) returns observed_max_mark 9.99, observed_last_mark 9.99, observed_missing_samples 0, complete true. A study computing MFE for the A15 comparison reads a +851 percent high off a Black-Scholes number with nothing in the returned dict saying so, which is the A07 overstatement one level down. is_model is on the underlying rows but the summary that anyone will actually quote drops it.",
+  "req": "RECORDER_SCHEMA record 2 is_model / price_basis rationale (A07); spec section 6 \"Store the model output separately from the quoted value\"; PREREGISTRATION section 10 limits on what the record can claim"
+ },
+ {
+  "n": 23,
+  "sev": "medium",
+  "file": "C:\\Users\\Chudi\\options-engine\\.gitignore",
+  "claim": "The batch gitignores api_cost.jsonl for landing in the repo when DATA_DIR is unset, but the two new record stores that land in exactly the same place, recorder/ and fills/, are not ignored. fills/ holds the owner's actual broker fill prices and quantities.",
+  "scenario": "REPRODUCED. config.DATA_DIR defaults to REPO_DIR (config.py:87), so with DATA_DIR unset trade_recorder.recorder_dir() resolves to C:\\Users\\Chudi\\options-engine\\recorder and fill_journal.fills_dir() to C:\\Users\\Chudi\\options-engine\\fills, and both mkdir on first call. `git check-ignore -v recorder/samples-2026-09-09.jsonl fills/fills-2026-09-09.jsonl` exits 1 with no output: neither path is ignored. Running the documented one-liner at the top of trade_recorder.py, or `python scanner.py` locally, creates untracked unignored files under both, and fills-*.jsonl rows carry fill_price, quantity, premium_cents, symbol, position_id and user_ref. A `git add -A` then commits the live fill record, whic",
+  "req": "RECORDER_SCHEMA rule \"No recipient identifiers, ever\" and \"No prompt content and no secrets\" in spirit; spec section 5 record 5 handling of the manual fill journal"
+ },
+ {
+  "n": 24,
+  "sev": "high",
+  "file": "C:\\Users\\Chudi\\options-engine\\forward_ledger.py",
+  "claim": "The new declared horizon makes every candidate recorded inside the session's LAST five-minute bar permanently ungradable, and it is classified as RETRYABLE missing_data, so the day's grading job can never reach job_complete and is parked as needs-attention. This is a regression: the code at HEAD graded the same row.",
+  "scenario": "fvg.sniper_window_open is `>=09:50 and < session_close`, and Service.sniper_poll_wait_s aligns polls to bar close + 20s, so the last in-window sniper poll of every session is at 15:55:2x; market_tools.read_any calls forward_ledger.record_candidate on that read whenever a ticket exists, writing a row with time_et='15:55:22'. In fill_outcomes the slice at line 975 is `df[(df.index > start) & (df.index < day_end)]` with day_end=16:00, and Yahoo stamps 5m bars at their OPEN, so the 15:55 bar (15:55:00) fails `> 15:55:22` and no later bar is < 16:00. bars is empty, line 988 takes the `bars.empty` branch, missing_data += 1, which _grading_result counts as retryable. REPRODUCED (repro_1555.py): a s",
+  "req": "W03 acceptance: 'Every due ID ends in a counted status' (it ends in a status that is counted as retryable but is in fact permanent) and 'no cohort silently evicted'."
+ },
+ {
+  "n": 25,
+  "sev": "high",
+  "file": "C:\\Users\\Chudi\\options-engine\\forward_ledger.py",
+  "claim": "scoreboard() and nightly_summary() label the entire published record `horizon.policy = session_close_v1` and say rows 'reached neither level by the session close', but fill_outcomes only ever grades rows whose outcome is None, so every row already graded on the live volume keeps its 23:59 grade. There is no per-row policy check, no regrade, no revised-version publication and no count of how many rows were graded under which horizon.",
+  "scenario": "fill_outcomes line 888 selects `todo = [r for r in records if r.get('outcome') is None]`, so pre-existing graded rows are never re-walked. scoreboard() at lines 1177-1194 builds `records` from every non-retired row with an outcome and then stamps out['horizon'] = {'policy': HORIZON_POLICY, 'basis': HORIZON_BASIS, ...} over all of them; _tier_conventions (1128) and the sibling block (1200-1216) read the same mixed population. REPRODUCED (repro_mixed.py): a two-row ledger, one row carrying the old outcome shape {'stopped','mfe_r','hit','graded_at'} with t04=True (a 0.4R taken out at 20:00 ET under the previous 23:59 rule, hours after the live book had settled flat) and one row graded under the",
+  "req": "A21 ('Specify the instrument and strategy horizon before grading') and section 6 ('Preserve original grades and publish revised versions rather than overwriting history'); section 4 W03 'no cohort silently evicted' / measurement provenance."
+ },
+ {
+  "n": 26,
+  "sev": "medium",
+  "file": "C:\\Users\\Chudi\\options-engine\\forward_ledger.py",
+  "claim": "The stated basis for the declared horizon -- 'the forward ledger and the live book grade the same trade' and 'sniper_book walks the same last bar' -- is false. The live sniper book's terminal observation is a print at or after 16:00:00, and for the two FX symbols it can be the completed 16:00-16:05 bar; the ledger excludes everything at or after 16:00:00. The two graders disagree on exactly the session-end-exit cohort A21 and the grader reconciliation are about, and the disagreement removes wins from the ledger only.",
+  "scenario": "Service.sniper_watch_mode returns 'step' for session_close <= now < close+15min, so _scan_snipers_once/_step_sniper run at 16:00:2x and 16:05:2x. (a) REPRODUCED (repro_poll2.py): sniper_book.step('EURUSD=X', price=target+0.0002, now=16:00:20, bars=None) returns {'exit_reason':'target','r':0.4,'exit_time':'16:00:20','exit_via':'poll'} -- sniper_book.py lines ~396-410 test tgt_hit against the live print BEFORE the `elif settle` branch. (b) REPRODUCED (repro_lastbar.py): fvg.SNIPER_RTH_SYMBOLS = {'^GSPC','TSLA','SPY'} (fvg.py:50), so market_tools._sniper_bars (market_tools.py:621-624) applies no 09:30-16:00 filter to EURUSD=X; at now=16:05:20 it hands the live book bars ending at 2026-09-08 16:",
+  "req": "A21: 'Do not extend the forward horizon ... and call the two comparable. Specify the instrument and strategy horizon before grading.' W08/section 6: 'Both live-book research and forward-ledger research must call the same pure evaluator or use fixtures proving exact agreement.'"
+ },
+ {
+  "n": 27,
+  "sev": "low",
+  "file": "C:\\Users\\Chudi\\options-engine\\test_grading_jobs.py",
+  "claim": "The only regression guarding that a caller remains scheduled after the session loop exits is a whole-file substring search that run_session's own call already satisfies. Deleting the daemon's grading caller -- the one caller reachable between 16:12 and the next morning, in the only mode Railway runs -- leaves the entire gate green.",
+  "scenario": "test_grading_jobs.py:1042-1043 (_j7_daemon_still_calls_it) asserts `'self.maybe_grade_forward(now)' in _src_scanner` over the whole file, and test_review_regressions.py:255-257 ('P03: the daemon calls the grading job') does the same. J7f already proves the string exists inside run_session (scanner.py:4742), so J7g and P03 can never fail while run_session keeps its call. Every J5/J6 test invokes scanner.Service.maybe_grade_forward directly via tick(); none drives daemon(). REPRODUCED by evaluating the predicates against a mutated copy of scanner.py with only the daemon caller (scanner.py:4862, `self.maybe_grade_forward(now)  # deterministic, free, and`) removed: J7g -> True, P03 -> True, J7f ",
+  "req": "Section 4 W03 'Retrying six times is ineffective if no caller remains scheduled to perform those retries', and W00 'A new test file that the release command never executes cannot establish a fix' (a test that cannot fail establishes nothing either)."
+ }
+]

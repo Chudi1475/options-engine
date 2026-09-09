@@ -233,15 +233,39 @@ per strategy, symbol and direction.
 
 ## M12. Per-call AI cost is not logged
 
-**Absent:** model, tokens, estimated versus billed cost, latency and failure
-category per call.
+**Mostly closed by W04.** `config.api_note_call` now writes one row per call to
+`api_cost.jsonl`: schema version, UTC timestamp, purpose, model, requested
+`max_tokens`, the input and output tokens the response returned, estimated
+versus billed cost, monotonic latency and failure category. Every failure
+category `assistant._post_anthropic` can produce is recorded, including the
+ones where no request ever left the process, and those carry `counted: false`
+so the daily cap keeps meaning exactly what it meant before. No prompt content,
+no key, no recipient: the payload is deliberately never passed to the writer.
+Regression: `test_probe_dispatch.py` W04-J through W04-J6.
 
-**Why:** only a per-purpose daily count exists.
+**Still absent, three ways:**
 
-**Cost:** spend cannot be attributed, and there is no dollar cap on human chat.
+1. **Billed cost.** The API response returns no dollar figure, so `billed_usd`
+   can only ever be null here. It stays on the row with its reason because
+   Astra asked for estimated VERSUS billed, and a field that disappears reads
+   as agreement between the two. Closing it needs the vendor's invoice or usage
+   API, which is a separate credential.
+2. **Estimated cost, until a price is configured.** There is no built-in price
+   table on purpose: a hand-typed price goes stale silently and this repo does
+   not carry numbers that trace to nothing. `API_PRICE_IN_PER_MTOK` and
+   `API_PRICE_OUT_PER_MTOK` turn the estimate on; without them the row says why
+   it has no estimate and still carries the model and the tokens, so the call
+   can be priced correctly later.
+3. **`risk_gate.py`'s direct call.** It posts to the API itself rather than
+   through the assistant's choke point, so its row carries a null model and
+   null token counts with reasons. That file is outside W04's declared file
+   list. It is the most expensive scheduled call there is (300 tokens plus web
+   search), so this is the largest remaining unattributed spend.
 
-**Closes when:** a row is written at the existing `api_note_call` choke point.
-Constraint: **no prompt content**, ever.
+**Also open:** `api_cost.jsonl` has no retention policy, the same gap as M14.
+
+**Cost of what remains:** the dollar total is an estimate, not an invoice, and
+one caller's spend is attributable only by purpose.
 
 ---
 

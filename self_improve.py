@@ -206,7 +206,36 @@ def run_checks(files: list) -> bool:
                      # storage_io: the dry run wire, the news_seen brick, the
                      # missing ACTIVE exit edges, the unscheduled replay and a
                      # delivered card with no tracked position behind it.
-                     "test_batchA_regressions.py"):
+                     "test_batchA_regressions.py",
+                     # W03, deterministic grading jobs: the declared instrument
+                     # and strategy horizon Astra A21 reversed, the named
+                     # denominator conventions, job versus measurement
+                     # completion, the per id partition, and the retries that
+                     # had no caller left to perform them.
+                     "test_grading_jobs.py",
+                     # W04, review isolation: the legacy lessons row two
+                     # reviews both claimed, the correction whose supersede
+                     # never landed, the lesson counted as derived after the
+                     # disk refused it, and an honest loss verdict refused for
+                     # containing the letters w i n.
+                     "test_import_recovery.py",
+                     # W04, billing isolation: the /brain that answered
+                     # "already checking" when no worker existed, the verdict
+                     # reported for a request that never left the process, and
+                     # the M12 per call cost row.
+                     "test_probe_dispatch.py",
+                     # W06, the observation recorder: the A15 censoring where
+                     # the chosen exit stops the record early, the direction
+                     # versus strike controls A12 separates, a missing
+                     # timestamp, a duplicate or out of order sample, a full
+                     # storage queue and a restart mid observation.
+                     "test_trade_recorder.py",
+                     # W07, the optional manual fill journal: the duplicate
+                     # reply, the ambiguous candidate, the partial close, the
+                     # over close, the late correction, the silence that stays
+                     # unknown rather than becoming no trade, and two users
+                     # reporting one signal.
+                     "test_fill_journal.py"):
             r = subprocess.run([PYEXE, test], cwd=REPO, timeout=600,
                                capture_output=True, text=True, errors="replace")
             if r.returncode != 0:

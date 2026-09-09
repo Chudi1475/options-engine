@@ -13,15 +13,25 @@ bound above the 71.4% breakeven for 0.4R all-out.
 Nothing here changes live behavior. It watches, records, grades, and tells
 the owner when the evidence clears the bar. Fully guarded: a ledger hiccup
 must never break a read or an alert.
+
+Two things are DECLARED here before any grading happens, because a measurement
+whose rules are inferred afterwards is not a measurement:
+
+- the instrument and the strategy horizon (Astra A21). The horizon is the
+  session close, which is the clock the live book settles on. See
+  declared_horizon.
+- the denominator convention. Both published readings go out, each labelled.
+  See CONVENTIONS.
 """
 
 import contextlib
 import json
 import math
-from datetime import datetime
+from datetime import date as _date, datetime
 from zoneinfo import ZoneInfo
 
 import config
+import market_calendar
 import storage_io
 
 ET = ZoneInfo("America/New_York")
@@ -85,6 +95,121 @@ def _locked():
 # stayed retryable forever.
 GRADE_LOOKBACK_DAYS = 5
 GRADE_PERIOD = f"{GRADE_LOOKBACK_DAYS}d"
+
+# ---------------------------------------------------------------------------
+# The DECLARED instrument and strategy horizon. Astra A21.
+# ---------------------------------------------------------------------------
+# A21, verbatim: "Extend the forward horizon only if the declared strategy
+# horizon does. Do not extend the forward horizon to the evening while the live
+# book closes at 16:00 and call the two comparable. Specify the instrument and
+# strategy horizon before grading."
+#
+# The hazard this fixes, named plainly: an earlier round let the outcome walk
+# run to 23:59 of the row's own day so a EUR/USD move at 20:00 ET would resolve
+# a tier. The LIVE book does not trade there. sniper_book settles every open
+# sniper position at that day's session close (SETTLE_ET, and _settle_at for a
+# half day) and books it as a session-end exit. Grading research rows to
+# midnight while the live book was flat from 16:00 measures a different trade
+# and then compares the two as though they were the same one.
+#
+# So the horizon is declared HERE, per instrument, before any grading happens,
+# and it is the session close. Two of the five sniper symbols quote 24 hours a
+# day, which is exactly why the declaration has to be explicit rather than
+# inherited from whatever bars the provider happens to return.
+STRATEGY_ID = "fvg_sniper"
+STRATEGY_VERSION = "round6_session"
+HORIZON_POLICY = "session_close_v1"
+HORIZON_BASIS = (
+    "the ET session close of the row's own day (13:00 on a half day). This is "
+    "the clock the live sniper book settles on (sniper_book.SETTLE_ET), so the "
+    "forward ledger and the live book grade the same trade. Quotes printed "
+    "after it are outside the declared strategy horizon and are not evidence.")
+
+# class: what kind of instrument it is. quotes: when it actually prints, which
+# is NOT the same thing as when the strategy is allowed to hold it.
+INSTRUMENTS = {
+    "EURUSD=X": {"class": "fx_spot", "quotes": "24h"},
+    "JPY=X": {"class": "fx_spot", "quotes": "24h"},
+    "^GSPC": {"class": "index_spot", "quotes": "us_session"},
+    "SPY": {"class": "etf_spot", "quotes": "us_session"},
+    "TSLA": {"class": "equity_spot", "quotes": "us_session"},
+}
+_UNDECLARED = {"class": "undeclared", "quotes": "unknown"}
+
+
+def instrument_of(symbol) -> dict:
+    """What kind of thing this symbol is. An unknown symbol is reported as
+    undeclared rather than being quietly assumed to behave like the others: a
+    row the roster no longer contains still has to grade, and a reader has to
+    be able to see that its class was never declared."""
+    return dict(INSTRUMENTS.get(symbol, _UNDECLARED))
+
+
+def _as_date(day):
+    """A date from a date, a datetime, or a 'YYYY-MM-DD' string."""
+    if isinstance(day, datetime):
+        return day.date()
+    if isinstance(day, _date):
+        return day
+    return datetime.strptime(str(day)[:10], "%Y-%m-%d").date()
+
+
+def declared_horizon(symbol, day) -> dict:
+    """The end of the observation window for one row, declared before grading.
+
+    Returns the horizon AND the reason for it, so a graded row carries its own
+    provenance and nobody has to reconstruct which rule produced it."""
+    d = _as_date(day)
+    inst = instrument_of(symbol)
+    at = datetime.combine(d, market_calendar.session_close(d), tzinfo=ET)
+    return {
+        "symbol": symbol,
+        "instrument": inst["class"],
+        "quotes": inst["quotes"],
+        "at": at,
+        "et": f"{at:%Y-%m-%d %H:%M}",
+        # the same instant with its offset preserved, so a reader in another
+        # timezone can reconstruct it without knowing the ledger's ET habit.
+        # RECORDER_SCHEMA's timestamp rule; the ET string stays because every
+        # other field on these rows is ET wall clock and mixing silently is
+        # worse than carrying both.
+        "iso": at.isoformat(),
+        "policy": HORIZON_POLICY,
+        "basis": HORIZON_BASIS,
+        "session_day": bool(market_calendar.is_trading_day(d)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# The denominator convention, stated rather than implied
+# ---------------------------------------------------------------------------
+# astra/grader_reconciliation.json: the live book was published as
+# targets / (targets + stops) with session-end exits EXCLUDED, and the backtest
+# as targets / every row with session-end exits IN the denominator. The two were
+# then compared as if they were one number, and the real gap is larger than the
+# published one. Session-end exits are also not flat: out of sample they average
+# minus 0.516R.
+#
+# Both readings are published from here on, each carrying its own formula, so no
+# reader has to guess which one a figure came from.
+CONVENTIONS = {
+    "resolved_only": {
+        "formula": "targets / (targets + stops)",
+        "session_end_in_denominator": False,
+        "note": "the binary reading the 71.4 percent breakeven for 0.4R "
+                "belongs to. A row that reached neither level by its declared "
+                "horizon is not counted at all.",
+    },
+    "all_rows": {
+        "formula": "targets / every graded row of the cohort",
+        "session_end_in_denominator": True,
+        "note": "the backtest's own reading. A row that reached neither level "
+                "by its declared horizon counts in the denominator and not in "
+                "the numerator. Those exits are not flat: out of sample they "
+                "average minus 0.516R (astra/grader_reconciliation.json).",
+    },
+}
+HEADLINE_CONVENTION = "resolved_only"
 
 # pre-committed promotion rule for the round-6 sibling (edge_lessons round 6):
 SIBLING_MIN_TRADES = 60
@@ -447,10 +572,21 @@ def unlinked_selected() -> list:
     return out
 
 
-def _walk_outcome(rec: dict, bars) -> dict:
-    """Walk the day's bars after entry time: which level hit first, per tier.
-    Same-bar stop+target = stop first (the honest, conservative call the
-    round-4 artifact hunt taught us). Returns the outcome dict."""
+def _walk_outcome(rec: dict, bars, horizon: dict = None) -> dict:
+    """Walk the bars after entry time, up to the DECLARED horizon: which level
+    hit first, per tier. Same-bar stop+target = stop first (the honest,
+    conservative call the round-4 artifact hunt taught us). Returns the
+    outcome dict.
+
+    The walk itself is untouched. What changed around it is which bars it is
+    handed (the caller slices to the declared horizon, A21) and that the
+    outcome now says how the observation ENDED and what horizon it was graded
+    to, so a reader never has to reconstruct either.
+
+    `terminal` is the same three-way the live book records: 'stop', 'target'
+    (every tier resolved before the horizon) or 'horizon' (the declared
+    horizon arrived with a tier still open). 'horizon' is the row the live book
+    calls a session-end exit, and those are NOT flat: see CONVENTIONS."""
     sign = 1 if rec["direction"] == "BUY" else -1
     entry, stop = rec["entry"], rec["stop"]
     risk = rec["risk"]
@@ -476,17 +612,39 @@ def _walk_outcome(rec: dict, bars) -> dict:
             break
         if all(v is not None for v in hit.values()):
             break
-    # anything not resolved by the close: mark by where price ended vs entry
+    if stopped:
+        terminal = "stop"
+    elif hit and all(v is not None for v in hit.values()):
+        terminal = "target"
+    else:
+        # the declared horizon arrived with a tier still open. The live book
+        # would have closed this flat at the last price and called it a session
+        # end, so that is what it is, and it is not a win.
+        terminal = "horizon"
+    h = horizon or {}
     return {"stopped": stopped, "mfe_r": round(mfe_r, 3),
-            "hit": hit, "graded_at": f"{datetime.now(ET):%Y-%m-%d %H:%M}"}
+            "hit": hit, "terminal": terminal,
+            "instrument": h.get("instrument"),
+            "horizon_et": h.get("et"),
+            "horizon_at": h.get("iso"),
+            "horizon_policy": h.get("policy"),
+            "horizon_basis": h.get("basis"),
+            "graded_at": f"{datetime.now(ET):%Y-%m-%d %H:%M}"}
 
 
-def _window_end(start: datetime) -> datetime:
-    """The last minute of the row's OWN day: the edge the outcome walk stops
-    at. Defined once because two callers depend on it now, the bar slice and
-    the question of whether the outcome can be called final yet, and two
-    copies of this boundary drifting apart would freeze rows early again."""
-    return start.replace(hour=23, minute=59)
+def _row_horizon(rec: dict, start: datetime) -> dict:
+    """The edge the outcome walk stops at, for ONE row, with its provenance.
+
+    Defined once because three callers depend on it: the bar slice, the
+    question of whether the outcome can be called final yet, and the
+    can-the-provider-still-reach-this-day check. Two copies of this boundary
+    drifting apart is how rows get frozen early.
+
+    It used to be 23:59 of the row's own day, computed inline as
+    start.replace(hour=23, minute=59). Astra A21: that extended the forward
+    horizon into the evening while the live book was flat from 16:00, which
+    made the two incomparable. See declared_horizon."""
+    return declared_horizon(rec.get("symbol"), start.date())
 
 
 def _outcome_is_final(oc: dict, window_end: datetime,
@@ -499,13 +657,15 @@ def _outcome_is_final(oc: dict, window_end: datetime,
     is not early, it is finished. Anything else is only settled once the row's
     own window has closed.
 
-    This is the whole 16:12 problem. Two symbols in the sniper roster are 24h
-    FX and the download asks for prepost, so bars keep printing long after the
-    equity close, and fill_outcomes only ever walks rows whose outcome is
-    still None. Whatever the close-time pass wrote was frozen for good: a
-    winner that resolved in the evening was dropped as undecided while a loser
-    that stopped at lunch was kept, which quietly biases the recorded win rate
-    down. A row graded late is fine. A row graded early is wrong."""
+    `window_end` is the row's DECLARED horizon, not midnight. A pass that runs
+    before the session closes still has to defer, because fill_outcomes only
+    ever walks rows whose outcome is None and whatever it writes is frozen for
+    good. A row graded late is fine. A row graded early is wrong.
+
+    What is NOT a reason to defer, since Astra A21: bars printing after the
+    declared horizon. Two symbols in the roster are 24h FX and the download
+    asks for prepost, so bars keep arriving all evening, but the live book was
+    flat at the close and the ledger grades the same trade it does."""
     if oc.get("stopped"):
         return True
     hit = oc.get("hit") or {}
@@ -564,32 +724,69 @@ def _is_retired(r: dict) -> bool:
     return bool(isinstance(oc, dict) and oc.get("retired"))
 
 
+# the one status vocabulary a due id can end a pass in. Astra's acceptance bar
+# is "every due ID ends in a counted status", so the buckets are named once and
+# the counts below are derived FROM the per-id map rather than tallied beside it.
+STATUS_GRADED = "graded"
+STATUS_PENDING = "pending"
+STATUS_MISSING = "missing_data"
+STATUS_FAILED_WRITE = "failed_write"
+STATUS_PERMANENT = "permanent_parse"
+STATUS_RETIRED = "retired"
+_STATUS_COUNT_FIELD = {
+    STATUS_GRADED: "graded",
+    STATUS_PENDING: "pending",
+    STATUS_MISSING: "missing_data",
+    STATUS_FAILED_WRITE: "failed_writes",
+    STATUS_PERMANENT: "permanent_failures",
+    STATUS_RETIRED: "permanent_failures",
+}
+
+
 def _grading_result(eligible=0, graded=0, unresolved=0, pending=0,
                     missing_data=0, failed_writes=0, permanent_failures=0,
-                    retired=0, read_ok=True) -> dict:
+                    retired=0, read_ok=True, statuses=None) -> dict:
     """Build one pass's counts, audit them, hand them back.
 
-    The two derived fields are computed HERE and nowhere else. A caller that
-    could set complete by hand is precisely how a pass that graded nothing got
+    The derived fields are computed HERE and nowhere else. A caller that could
+    set complete by hand is precisely how a pass that graded nothing got
     recorded as a finished day, so there is no way to pass one in:
 
-        retryable_failures = missing_data + failed_writes + (unreadable ledger)
-        complete           = read_ok and retryable_failures == 0
+        retryable_failures  = missing_data + failed_writes + (unreadable ledger)
+        job_complete        = read_ok and retryable_failures == 0
+        measurement_missing = permanent_failures + pending
+        measurement_complete= job_complete and measurement_missing == 0
 
-    complete is true with permanent_failures above zero on purpose. A row that
-    cannot be parsed today cannot be parsed tomorrow either, so counting it as
-    a reason to retry would hold the day open forever. `retired` partitions
-    permanent_failures: those are the rows whose day the download can no
-    longer reach.
+    TWO completions, not one. Astra section 4: "distinguish job_complete from
+    measurement_complete. A permanently unavailable row can be durably
+    classified so it does not block every future job, while its outcome remains
+    missing for research." A retired row is finished as WORK and absent as
+    EVIDENCE, and collapsing those two into one flag is how a day either blocks
+    forever or quietly claims a measurement it never made.
 
-    complete is also true with `pending` above zero, and that one is worth
-    saying out loud. A row whose own day has not closed yet has not failed at
-    all. Holding the day open for it would burn the entire retry budget
-    between the close and midnight and park a perfectly healthy day as
-    needs-attention, and the scheduler will not even look again before the
-    next session's gate. The next pass walks every ungraded row of every past
-    date, so a deferred row is graded then. Late, not wrong."""
+    `complete` stays, byte for byte what it always meant, because it is the
+    field the scheduler claims a day on. It is now an alias of job_complete.
+
+    job_complete is true with permanent_failures above zero on purpose. A row
+    that cannot be parsed today cannot be parsed tomorrow either, so counting
+    it as a reason to retry would hold the day open forever. `retired`
+    partitions permanent_failures: those are the rows whose day the download
+    can no longer reach.
+
+    job_complete is also true with `pending` above zero, and that one is worth
+    saying out loud. A row whose declared horizon has not passed yet has not
+    failed at all. Holding the day open for it would burn the entire retry
+    budget and park a perfectly healthy day as needs-attention. The next pass
+    walks every ungraded row of every past date, so a deferred row is graded
+    then. Late, not wrong. It is still MISSING as a measurement, which is
+    exactly what measurement_complete says.
+
+    `statuses` is the per-id partition: every due id, exactly once. When it is
+    supplied the counts are checked against it, and `partition_ok` says whether
+    they agreed, so the counts can never drift away from the ids they describe."""
     retryable = missing_data + failed_writes + (0 if read_ok else 1)
+    job_complete = bool(read_ok) and retryable == 0
+    measurement_missing = permanent_failures + pending
     res = {
         "eligible": eligible,
         "graded": graded,
@@ -601,8 +798,27 @@ def _grading_result(eligible=0, graded=0, unresolved=0, pending=0,
         "permanent_failures": permanent_failures,
         "retired": retired,
         "read_ok": bool(read_ok),
-        "complete": bool(read_ok) and retryable == 0,
+        "complete": job_complete,
+        "job_complete": job_complete,
+        "measurement_missing": measurement_missing,
+        "measurement_complete": job_complete and measurement_missing == 0,
+        "horizon_policy": HORIZON_POLICY,
     }
+    tally = {}
+    for st in (statuses or {}).values():
+        field = _STATUS_COUNT_FIELD.get(st)
+        if field:
+            tally[field] = tally.get(field, 0) + 1
+    res["partition_ok"] = (
+        statuses is not None
+        and len(statuses) == eligible
+        and all(tally.get(f, 0) == res[f] for f in
+                ("graded", "pending", "missing_data", "failed_writes",
+                 "permanent_failures")))
+    res["statuses"] = dict(statuses or {})
+    # the partition goes in the audit line too, not just the counts. Astra's
+    # acceptance bar is that every due id ends in a counted status, and a claim
+    # nobody can check afterwards is not evidence of it.
     _audit(res)
     return res
 
@@ -661,7 +877,13 @@ def fill_outcomes(now_et: datetime = None) -> dict:
     `unresolved` partitions `graded` rather than joining that sum: a finished
     row whose tier never resolved is still a finished row. `retired`
     partitions `permanent_failures` the same way. `complete` is the only field
-    a scheduler may claim a day on, and it is derived."""
+    a scheduler may claim a day on, and it is derived.
+
+    Every due id is ALSO returned by name, in `statuses`, exactly once. Astra's
+    acceptance bar for this package is "every due ID ends in a counted status",
+    and a set of counts cannot show that: it can reconcile perfectly while one
+    id was dropped and another double counted. `partition_ok` is the check that
+    the counts and the ids agree."""
     now = now_et or datetime.now(ET)
     with _locked():
         records, read_ok = _read_all_status()
@@ -669,8 +891,15 @@ def fill_outcomes(now_et: datetime = None) -> dict:
         return _grading_result(read_ok=False)
     todo = [r for r in records if r.get("outcome") is None]
     eligible = len(todo)
+    # the partition, allocated once per due id up front and mutated in place.
+    # One dict, so an id cannot silently be counted in two buckets: assigning a
+    # second status to an id overwrites the first rather than adding a row.
+    statuses = {}
+    for r in todo:
+        key = _row_key(r) or f"unkeyed:{id(r):x}"
+        statuses[key] = STATUS_MISSING   # until a pass says otherwise
     if not eligible:
-        return _grading_result()
+        return _grading_result(statuses={})
     try:
         import pandas as pd  # noqa: F401
         import yfinance as yf
@@ -678,7 +907,8 @@ def fill_outcomes(now_et: datetime = None) -> dict:
         # retryable: the container can come back with the dependency present,
         # and nothing about these rows is wrong
         print(f"forward_ledger: grading needs pandas and yfinance ({e})")
-        return _grading_result(eligible=eligible, missing_data=eligible)
+        return _grading_result(eligible=eligible, missing_data=eligible,
+                               statuses=statuses)
 
     permanent_failures = 0
     missing_data = 0
@@ -689,6 +919,7 @@ def fill_outcomes(now_et: datetime = None) -> dict:
             walkable.append((r, _gradable(r)))
         except (ValueError, TypeError, KeyError) as e:
             permanent_failures += 1
+            statuses[_row_key(r) or f"unkeyed:{id(r):x}"] = STATUS_PERMANENT
             print(f"forward_ledger: row {r.get('event_id') or '?'} can never "
                   f"be graded ({e}); counted permanent, not retried")
 
@@ -717,7 +948,8 @@ def fill_outcomes(now_et: datetime = None) -> dict:
             continue
         frame_start = _frame_start(df)
         for r, start in recs:
-            day_end = _window_end(start)
+            horizon = _row_horizon(r, start)
+            day_end = horizon["at"]
             if _out_of_reach(day_end, frame_start, now):
                 # the day has fallen out of the download window, which only
                 # moves forward, so no future pass can reach it either. this
@@ -729,13 +961,18 @@ def fill_outcomes(now_et: datetime = None) -> dict:
                     f"no bars available: {r.get('date')} is older than the "
                     f"{GRADE_PERIOD} the grader can download", now)
                 permanent_failures += 1
+                statuses[_row_key(r)] = STATUS_RETIRED
                 print(f"forward_ledger: {symbol} {r.get('date')} "
                       f"{r.get('time_et')} is past the {GRADE_PERIOD} "
                       "download window; retiring it as ungradable instead of "
                       "retrying it forever")
                 continue
             try:
-                bars = df[(df.index > start) & (df.index <= day_end)]
+                # STRICTLY BEFORE the horizon, not up to and including it. Yahoo
+                # stamps a 5m bar at its OPEN, so the last bar of a 16:00 session
+                # is the one stamped 15:55 and a bar stamped 16:00 covers trading
+                # the live book never held. sniper_book walks the same last bar.
+                bars = df[(df.index > start) & (df.index < day_end)]
             except Exception as e:
                 # the ONE statement in this loop that used to sit outside every
                 # try. a frame the vendor hands back with a naive or non
@@ -754,7 +991,7 @@ def fill_outcomes(now_et: datetime = None) -> dict:
                 missing_data += 1
                 continue
             try:
-                oc = _walk_outcome(r, bars)
+                oc = _walk_outcome(r, bars, horizon)
             except Exception as e:
                 # the row itself already validated, so this is unexpected and
                 # therefore retryable, not permanent
@@ -764,9 +1001,10 @@ def fill_outcomes(now_et: datetime = None) -> dict:
                 continue
             if not _outcome_is_final(oc, day_end, now):
                 # the walk ran out of bars with tiers still open and the row's
-                # day is still running. writing this would freeze it, because
-                # nothing ever re-walks a row that has an outcome. leave it.
+                # declared horizon has not passed. writing this would freeze it,
+                # because nothing ever re-walks a row that has an outcome.
                 pending += 1
+                statuses[_row_key(r)] = STATUS_PENDING
                 continue
             outcomes[_row_key(r)] = oc
             walked += 1
@@ -779,6 +1017,7 @@ def fill_outcomes(now_et: datetime = None) -> dict:
     # update. The lock is NOT held across the download, or the sniper watch
     # would block for the whole grading pass.
     applied = []
+    applied_keys = set()               # WHICH ids this pass actually stamped
     stamped = []                       # retirements, published the same trip
     with _locked():
         live = _read_all()
@@ -790,6 +1029,7 @@ def fill_outcomes(now_et: datetime = None) -> dict:
             if oc:
                 r["outcome"] = oc
                 applied.append(r)
+                applied_keys.add(key)
                 continue
             marker = retired.get(key)
             if marker:
@@ -802,6 +1042,14 @@ def fill_outcomes(now_et: datetime = None) -> dict:
     graded = len(applied) if wrote else 0
     failed_writes = walked - graded
     unresolved = 0
+    # graded is the id set this pass STAMPED AND PUBLISHED. Everything else it
+    # walked is a failed write: the bytes did not land, or another writer had
+    # already taken the row, and either way this pass did not durably grade it.
+    # This is the "no successful grade before durable write" half of the
+    # acceptance bar, expressed per id rather than as a count.
+    for key in outcomes:
+        statuses[key] = (STATUS_GRADED if (wrote and key in applied_keys)
+                         else STATUS_FAILED_WRITE)
     if wrote:
         for r in applied:
             hit = (r.get("outcome") or {}).get("hit") or {}
@@ -815,7 +1063,7 @@ def fill_outcomes(now_et: datetime = None) -> dict:
                            missing_data=missing_data,
                            failed_writes=failed_writes,
                            permanent_failures=permanent_failures,
-                           retired=len(retired))
+                           retired=len(retired), statuses=statuses)
 
 
 def _cohort(records: list) -> list:
@@ -877,8 +1125,39 @@ def _cohort(records: list) -> list:
     return out
 
 
+def _tier_conventions(records: list, tier: str) -> dict:
+    """The SAME tier counted both published ways, each labelled.
+
+    astra/grader_reconciliation.json is the reason this exists: the live book
+    was quoted on targets over (targets + stops) and the backtest on targets
+    over every row, and the two were compared as if they were one number. On
+    the backtest's own convention the live shortfall was larger, not smaller.
+    Publishing one of them and leaving the reader to infer which is how that
+    happened, so both go out, each carrying its own formula."""
+    resolved = [r for r in records if r["outcome"]["hit"].get(tier) is not None]
+    wins = sum(1 for r in resolved if r["outcome"]["hit"][tier])
+    n_res, n_all = len(resolved), len(records)
+    out = {}
+    for name, n in (("resolved_only", n_res), ("all_rows", n_all)):
+        spec = CONVENTIONS[name]
+        out[name] = {
+            "formula": spec["formula"],
+            "session_end_in_denominator": spec["session_end_in_denominator"],
+            "note": spec["note"],
+            "n": n, "wins": wins,
+            "pct": round(100 * wins / n, 1) if n else None,
+            "wilson_lb": round(wilson_lb(wins, n), 1) if n else None,
+        }
+    return out
+
+
 def scoreboard() -> dict:
-    """Aggregate the forward record per tier + the sibling promotion check."""
+    """Aggregate the forward record per tier + the sibling promotion check.
+
+    Every number here names its denominator convention and the horizon its
+    rows were graded to. Astra A21 and the grader reconciliation both come down
+    to the same thing: a rate is not a fact until you say what it divided by
+    and where it stopped watching."""
     # a retired row carries an outcome so the grader stops retrying it, but it
     # is evidence of nothing: it must reach neither a numerator nor a
     # denominator here. see _retired_outcome.
@@ -888,7 +1167,24 @@ def scoreboard() -> dict:
              "t1": "1R (needs >50 of 100 to beat 0.4R)",
              "t2": "2R (needs >33 of 100 to beat 0.4R)",
              "liq": "structure target (the big one)"}
-    out = {"n": len(records), "tiers": {}, "sibling": None}
+    out = {
+        "n": len(records), "tiers": {}, "sibling": None,
+        # the headline fields below (n, wins, win_pct, wilson_lb) are the
+        # resolved-only reading, unchanged. Saying so is the repair.
+        "convention": HEADLINE_CONVENTION,
+        "convention_note":
+            "the headline win_pct is "
+            f"{CONVENTIONS[HEADLINE_CONVENTION]['formula']}. Both readings are "
+            "published per tier under 'conventions'; a row that reached "
+            "neither level by its declared horizon is a session-end exit, "
+            "counted in all_rows and not in resolved_only.",
+        "horizon": {
+            "policy": HORIZON_POLICY,
+            "basis": HORIZON_BASIS,
+            "strategy_id": STRATEGY_ID,
+            "strategy_version": STRATEGY_VERSION,
+        },
+    }
     for k, label in tiers.items():
         graded = [r for r in records
                   if r["outcome"]["hit"].get(k) is not None]
@@ -898,6 +1194,8 @@ def scoreboard() -> dict:
             "label": label, "n": n, "wins": wins,
             "win_pct": round(100 * wins / n, 1) if n else None,
             "wilson_lb": round(wilson_lb(wins, n), 1) if n else None,
+            "unresolved_at_horizon": len(records) - n,
+            "conventions": _tier_conventions(records, k),
         }
     sib = [r for r in records if r.get("sibling")]
     sib_graded = [r for r in sib if r["outcome"]["hit"].get("t04") is not None]
@@ -910,7 +1208,13 @@ def scoreboard() -> dict:
         "wilson_lb": round(lb, 1),
         "bar": {"min_trades": SIBLING_MIN_TRADES,
                 "wilson_lb_needed": BREAKEVEN_04R},
+        # the pre-committed promotion rule is evaluated on the convention it
+        # was committed on, resolved-only, because 71.4 percent is the
+        # zero-cost binary breakeven for 0.4R. Changing the denominator under a
+        # pre-committed bar would be re-scoping the rule after the fact.
+        "convention": HEADLINE_CONVENTION,
         "promote": n >= SIBLING_MIN_TRADES and lb > BREAKEVEN_04R,
+        "all_rows": _tier_conventions(sib, "t04")["all_rows"],
     }
     return out
 
@@ -928,6 +1232,17 @@ def nightly_summary() -> str:
         if s["n"]:
             lines.append(f"- {s['label']}: wins {s['wins']} of {s['n']}"
                          f" ({s['win_pct']:.0f} of 100)")
+    # the convention is stated in the text a human reads, not only in the json.
+    # A rate quoted with no denominator named is how the live book and the
+    # backtest ended up being compared on different ones.
+    horizon_exits = t["t04"]["unresolved_at_horizon"]
+    both = t["t04"]["conventions"]
+    lines.append(
+        f"Counted as {both['resolved_only']['formula']}, session end left out. "
+        f"{horizon_exits} of {sb['n']} reached neither level by the session "
+        "close; counting those in the denominator the way the backtest does "
+        f"makes 0.4R {both['all_rows']['wins']} of {both['all_rows']['n']}. "
+        "Those exits are not flat.")
     sib = sb["sibling"]
     if sib and sib["n"]:
         need = SIBLING_MIN_TRADES - sib["n"]

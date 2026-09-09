@@ -102,6 +102,12 @@ human to agree with it, because the failure mode it accepts is silence.
 | M5 | `/health` gains unresolved intents, unknown deliveries, orphans and the journal health condition. Recipient ids never included, only an index and an opaque ref. | Coverage must be visible. |
 | M6 | `forward_ledger.mark_selected` returns a `MarkResult` rather than a bool, still falsy exactly when the link did not land. | Replay must distinguish an orphan from a refused write from a stand-down. |
 | M7 | `config.load_state` quarantines a `state.json` with a bad **encoding** as well as bad JSON. | A `UnicodeDecodeError` previously escaped uncaught. |
+| M8 | **W04.** `/brain` no longer answers "Already checking" when the probe worker could not start. `assistant.probe_billing_dispatch` returns started, joined or not started, and each renders differently. | The old boolean meant both "you joined one in flight" and "no probe exists at all", so the immediate reply contradicted the worker's own text one message later. `test_probe_dispatch.py` W04-F. |
+| M9 | **W04.** `/brain` says "No answer came back" instead of "the API still refused" whenever no request left the process (`API_MODE=off`, the rate-limit rest, the probe interval) or nothing came back (dead socket, 500, unreadable body). `assistant.probe_billing` returns True, False or None for those three cases. | A refusal is a claim about what the vendor said. Reporting one for a call nobody made is the same fabrication the Thread.start fix removed. `test_probe_dispatch.py` W04-H, W04-H2, W04-H3. |
+| M10 | **W04, gap M12.** Every call through `config.api_note_call` writes one row to `api_cost.jsonl`: purpose, model, requested and actual tokens, estimated versus billed cost, latency and failure category. A call the vendor never billed is recorded with `counted: false` and never moves the daily tally, so the cap keeps its meaning. No prompt content, no key, no recipient. | Spec section 9. A per-purpose daily COUNT cannot attribute spend. `test_probe_dispatch.py` W04-J. |
+| M11 | **W04.** `learn.repair_lessons` no longer counts a lesson the disk refused, and a correction whose supersede rewrite failed is left whole for the retry instead of being published beside the revision it was meant to replace. | `_append_lesson` returned silently on a failed write, and `_supersede_lessons` returned 0 for both "nothing to supersede" and "the rewrite failed". `test_import_recovery.py` W04-C, W04-D. |
+| M12 | **W04.** One legacy lessons row now satisfies at most ONE review, and a legacy row that two reviews explain equally well is stamped `__unmapped__` with an `ambiguous` count instead of being attributed to whichever review was read first. | Two trades on one day with the same ticker and the same `why` collide, and the second review's lesson was silently never derived. `test_import_recovery.py` W04-A, W04-A2, W04-B. |
+| M13 | **W04.** `learn._verdict_sign` matches whole words. A verdict reading "wrong, the swing never came" is no longer read as a claimed WIN. | Substring matching refused honest batches for containing the letters w-i-n. `test_import_recovery.py` W04-E. |
 
 ---
 
@@ -112,13 +118,15 @@ human to agree with it, because the failure mode it accepts is silence.
 | Astra's table puts "replay local durable intents" in **RECOVERING**. It is implemented one step later, at the RECOVERING to ACTIVE transition. | W01 gags the wire in every non-ACTIVE state, so a resend attempted in RECOVERING would be dropped and then recorded as a delivery failure. The reconcile still happens in RECOVERING; only the delivery half moved. |
 | News, ops DMs, heartbeats, the morning card, the recap and charts stay on the **unjournaled** path. | Deliberate scope limit, so the retry behavior of every report does not change at once. Their sends have no per-recipient delivery record yet. |
 | `fsync` is available but **off by default**. | Needs a latency measurement on the Railway network-backed volume, which cannot be taken from the desktop. Current behavior therefore matches the old code exactly. |
+| **W04.** `risk_gate.py` posts to the API directly instead of through `assistant._post_anthropic`, so its cost row carries a null model and null token counts, each with a reason. | That call site is outside W04's declared file list. The row still proves the call happened, with its purpose, and the gap is recorded in `MISSING_EVIDENCE.md` M12 rather than closed by touching a file this package was not scoped to. |
+| **W04.** `api_cost.jsonl` has no retention policy and no price table. | Same reason as M14 for the journal: a number nobody has chosen is not a number this repo invents. An unpriced row carries the model and the tokens, so the vendor's own invoice can price it later. |
 
 ---
 
 ## Status of this matrix
 
-**Incomplete.** It covers W00, W05, W01 and W02. W03, W04, W06 through W11 will
-add rows, and the release checklist's step 5 (identical-input replay through old
-and candidate) is what will confirm this list is exhaustive rather than merely
-diligent. Until that replay runs, **no claim is made that these are all of the
-behavior changes.**
+**Incomplete.** It covers W00, W05, W01, W02 and W04 (rows M8 to M13). W03 and
+W06 through W11 will add rows, and the release checklist's step 5
+(identical-input replay through old and candidate) is what will confirm this
+list is exhaustive rather than merely diligent. Until that replay runs, **no
+claim is made that these are all of the behavior changes.**

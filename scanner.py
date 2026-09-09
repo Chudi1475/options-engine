@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -41,6 +42,7 @@ import yfinance as yf
 import cards
 import config
 import event_journal
+import fill_journal
 import forward_ledger
 import instance_lock
 import live_params
@@ -54,6 +56,7 @@ import sniper_book
 import storage_io
 import strategy_spec
 import telegram
+import trade_recorder
 from backtest import expiry_for, realized_vol
 from data_feed import DataFeed
 from positions import Position, PositionBook
@@ -147,26 +150,49 @@ def learn_session_due(now: datetime) -> date:
     return market_calendar.prev_trading_day(d)
 
 
+GRADE_SETTLE_MINUTES = 5   # after the close, so the last bar has printed
+
+
+def forward_grade_open_at(d: date) -> time:
+    """The clock at which every row signalled on session `d` is past its
+    DECLARED horizon and can therefore be graded.
+
+    It is that day's own close plus the minutes the last bar needs, so a half
+    day opens at 13:05 rather than 16:05. That was a real defect and not a
+    tidy-up: on the Friday after Thanksgiving the entry loop shuts at 13:12,
+    the tape stopped at 13:00, every row is settled, and the scheduler was
+    still locked out until 16:05. Worse, forward_grade_session returned the
+    PREVIOUS session for the whole of that window, so the day that had just
+    closed could not even be named as the work in front of it.
+
+    Derived from market_calendar.session_close, the same function
+    forward_ledger.declared_horizon and sniper_book._settle_at use, so the
+    three cannot drift."""
+    close = market_calendar.session_close(d)
+    return (datetime.combine(date(2000, 1, 3), close)
+            + timedelta(minutes=GRADE_SETTLE_MINUTES)).time()
+
+
 def forward_grade_session(now: datetime) -> date:
     """The session whose sniper candidates are due to be graded at this tick.
 
-    Grading gets its OWN key, opening at WEEKLY_AT, instead of riding
-    learn_session_due's randomized 21:00-23:45 target. Borrowing the paid
-    review's clock made a free deterministic measurement wait on a paid one
-    and tied the grading key to a setting that has nothing to do with grading.
+    Grading gets its OWN key, opening at that session's close, instead of
+    riding learn_session_due's randomized 21:00-23:45 target. Borrowing the
+    paid review's clock made a free deterministic measurement wait on a paid
+    one and tied the grading key to a setting that has nothing to do with
+    grading.
 
     What this key does NOT claim is that every row of the session is settled
-    at 16:05. It is not. Two symbols in the sniper roster are 24h FX and the
-    grading download asks for prepost, so a row's bars keep printing well
-    after the equity close. Whether one row can be called final is decided per
-    row inside forward_ledger, and a row that is not final yet is left for the
-    next pass instead of being frozen wrong. See _outcome_is_final there.
+    the moment it opens. Whether one row can be called final is decided per row
+    inside forward_ledger against that row's declared horizon, and a row that
+    is not final yet is left for the next pass instead of being frozen wrong.
+    See _outcome_is_final there.
 
     Off-session ticks still point back at the last real session, same as the
     review does, so a weekend tick or a post-outage restart grades the day
     that was missed rather than forgetting it."""
     d = now.date()
-    if is_session_day(d) and now.time() >= WEEKLY_AT:
+    if is_session_day(d) and now.time() >= forward_grade_open_at(d):
         return d
     return market_calendar.prev_trading_day(d)
 
@@ -767,6 +793,11 @@ class Service:
     # LOOKS, never what it grades or what alerts.
     GRADE_MAX_ATTEMPTS = 6
     GRADE_RETRY_S = 900
+    # Every piece of durable state the grading job owns, named in one place so a
+    # fixture that resets the scheduler resets ALL of it. A test that clears
+    # three of four keys is testing a machine nobody runs.
+    GRADE_STATE_KEYS = ("forward_graded", "forward_grade_attention",
+                        "forward_grade_last", "forward_grade_tries")
 
     def _job_attempt(self, job: str, key: str) -> int:
         """Record one attempt for (job, key) and return the new total.
@@ -1650,6 +1681,26 @@ class Service:
         self._health_last_stamp = t
         config.state_set("heartbeat", {"ts": now.isoformat(), "day": str(now.date())})
 
+    RECORDER_HEALTH_S = 300     # W06 record 6 cadence, monotonic
+
+    def recorder_health(self, now: datetime):
+        """Write one coverage row every few minutes.
+
+        Throttled on the MONOTONIC clock, like every other duration in this
+        bot, so a container whose wall clock jumps cannot make the recorder
+        either spam or go quiet. It runs AFTER monitor_positions in the cycle
+        and it only enqueues, so it can never sit in front of a stop."""
+        t = time_mod.monotonic()
+        if t - getattr(self, "_rec_health_at", 0.0) < self.RECORDER_HEALTH_S:
+            return
+        self._rec_health_at = t
+        try:
+            trade_recorder.record_health(
+                ownership_state=instance_lock.state(),
+                instance_id=instance_lock.instance_id())
+        except Exception as e:                                 # noqa: BLE001
+            print(f"{now:%H:%M:%S} recorder: health row not written: {e}")
+
     def check_downtime_on_start(self, now: datetime):
         """On session start, if the last alive-stamp was earlier TODAY and the
         gap spans market hours, the bot was silently down — tell the owner once.
@@ -1677,6 +1728,7 @@ class Service:
         if self.dry:
             return
         self.health_stamp(now)
+        self.recorder_health(now)
         if now.weekday() >= 5 or not (MONITOR_START <= now.time() <= time(16, 0)):
             return
         last_ok = self._last_feed_ok
@@ -1796,6 +1848,19 @@ class Service:
             lines.append(event_journal.report_text())
         except Exception as e:                                  # noqa: BLE001
             lines.append(f"Durable events: cannot be read ({e})")
+        # W06 coverage, in the owner's own health text. A completeness word
+        # nobody can see is a completeness word nobody checks.
+        try:
+            lines.append(trade_recorder.report_text())
+        except Exception as e:                                  # noqa: BLE001
+            lines.append(f"Recorder: cannot be read ({e})")
+        # W07 coverage. The silent recipients are the number that matters here:
+        # they are UNKNOWN, and a health text that showed only the reports
+        # would read as full coverage of a lane almost nobody uses.
+        try:
+            lines.append(fill_journal.report_text())
+        except Exception as e:                                  # noqa: BLE001
+            lines.append(f"Fills: cannot be read ({e})")
         jh = config.state_get("journal_health") or {}
         if jh.get("ok") is False:
             lines.append("Durable event journal UNAVAILABLE since "
@@ -1917,10 +1982,31 @@ class Service:
             if item["cmd"] == "/score":
                 import assistant
                 return assistant.score_line(item["chat_id"])
+            if item["cmd"] == "/fill":
+                # W07. Deliberately NOT in ADMIN_CMDS: three recipients get one
+                # card, and each of their fills is a separate execution
+                # experience of that one signal. An owner-only lane could only
+                # ever record one of the three.
+                #
+                # Bare /fill is somebody asking how this works, not a report
+                # missing its numbers, so it gets the interface rather than a
+                # complaint about the numbers it never claimed to have.
+                if not (item.get("args") or "").strip():
+                    return cards.fill_help_card()
+                return self.try_fill_report(item) or cards.fill_help_card()
             return self.run_command(item["cmd"], item["args"], item["chat_id"])
         if item["kind"] == "unsupported":
             return ("I can read text, photos, PDFs and CSV/TXT files, "
                     "not voice or video yet.")
+        if item["kind"] == "text":
+            # W07: a reply that REPORTS a real fill is logged rather than sent
+            # to the brain. looks_like_report is narrow on purpose. A question
+            # about the same alert card is still a question and still goes to
+            # the brain, because hijacking the chat for a record nobody asked
+            # for is a worse bug than a missing row.
+            logged = self.try_fill_report(item)
+            if logged:
+                return logged
         import assistant
         if not assistant.enabled():
             return ("I see your message, but my brain isn't plugged in yet. "
@@ -1992,6 +2078,135 @@ class Service:
                     telegram.send_photo(chat_id, img, caption=cap[:1024])
             except Exception as e:
                 print(f"fvg chart send skipped for {tk}: {e}")
+
+    # ---------- W07: the optional fill lane ----------
+
+    # How far back a reply can still be about. A correction that arrives the
+    # next morning is one of the cases Astra names, so a same-day window would
+    # refuse the exact repair the schema asks for. Bounded anyway, because an
+    # unbounded walk of every intent ever written belongs nowhere near the
+    # command path.
+    FILL_REPLY_DAYS = 5
+
+    def fill_candidates(self) -> list:
+        """Every alert a reply could be about, shaped the way fill_journal
+        resolves against.
+
+        Built from the durable journal rather than from memory, so a restart
+        does not lose the link between a card that went out and the trade
+        behind it. Wrapped whole: this is an observer, and if the journal
+        cannot be read the person simply gets told their reply could not be
+        placed, which is honest and costs nothing else."""
+        out = []
+        try:
+            cutoff = (et_now() - timedelta(days=self.FILL_REPLY_DAYS)).date()
+            states = {p.id: p.state for p in self.book.positions}
+            for intent in event_journal.all_intents():
+                if intent.kind not in ("entry", "exit", "sniper_entry",
+                                       "sniper_exit"):
+                    continue
+                try:
+                    if date.fromisoformat(intent.session_date) < cutoff:
+                        continue
+                except (TypeError, ValueError):
+                    pass          # an unparseable day is kept, never dropped
+                payload = intent.payload or {}
+                pos = payload.get("position") or {}
+                mids = {}
+                for d in intent.deliveries():
+                    if d.provider_message_id is not None:
+                        mids.setdefault(d.recipient_ref, []).append(
+                            d.provider_message_id)
+                out.append({
+                    "position_id": intent.position_id,
+                    "candidate_id": intent.candidate_id,
+                    "contract_id": self._fill_contract_id(pos),
+                    "symbol": (payload.get("ticker") or pos.get("ticker")
+                               or payload.get("symbol") or ""),
+                    "kind": ("entry" if intent.kind.endswith("entry")
+                             else "exit"),
+                    "text": intent.text or "",
+                    "state": states.get(intent.position_id, ""),
+                    "message_ids": mids,
+                })
+        except Exception as e:                                 # noqa: BLE001
+            print(f"fill lane: candidates unavailable ({e})")
+            return []
+        return out
+
+    @staticmethod
+    def _fill_contract_id(pos: dict) -> str:
+        """The OCC style name of the contract, or empty. Empty and not a guess:
+        record 5 references contract metadata, and a made up reference is worse
+        than a missing one."""
+        try:
+            return trade_recorder.contract_id_for(
+                pos["ticker"], pos["right"], pos["strike"], pos["expiry"])
+        except Exception:                                      # noqa: BLE001
+            return ""
+
+    def try_fill_report(self, item: dict):
+        """One inbound message, offered to the fill journal. Returns the reply
+        to send, or None to leave the message where it was going.
+
+        OPTIONAL, and never a nag. Nothing in this path ever starts a
+        conversation: it only answers one. A person who never replies costs
+        nothing and their rows stay unknown.
+
+        OBSERVER, per constraint 10. A fault here hands the message back to the
+        brain and never reaches the exit loop, which does not call any of
+        this."""
+        try:
+            # getattr, because several suites build a Service through __new__
+            # with no __init__, so an attribute that is not there means "not a
+            # dry run", exactly as it does for the other observers here.
+            if getattr(self, "dry", False):
+                return None       # a dry run must not write the shared journal
+            text = item.get("text") or ""
+            if item.get("kind") == "command":
+                text = f"{item.get('cmd', '')} {item.get('args', '')}".strip()
+            reply_ref = item.get("reply_to") or {}
+            is_reply = reply_ref.get("message_id") is not None
+            if not fill_journal.looks_like_report(text,
+                                                  is_reply_to_alert=is_reply):
+                return None
+            # the opaque handle, never the chat id. The journal files must not
+            # be able to name a person even if somebody reads them.
+            user = event_journal.recipient_ref(item["chat_id"])
+            d = fill_journal.handle_message(
+                user_ref=user, text=text, candidates=self.fill_candidates(),
+                message_id=item.get("message_id"),
+                reply_message_id=reply_ref.get("message_id"),
+                reply_text=reply_ref.get("text") or "",
+                now_utc=item.get("sent_at_utc"))
+            if d.get("status") == fill_journal.NOT_A_REPORT:
+                return None
+            return d.get("reply") or None
+        except Exception as e:                                 # noqa: BLE001
+            print(f"fill lane: reply not logged ({e})")
+            return None
+
+    def fills_text(self, chat_id: str = "") -> str:
+        """/fills: the caller's OWN reported fills, and the denominator.
+
+        One person's rows only. Two recipients reporting on one card are two
+        execution experiences of ONE signal, and they are also not each other's
+        business."""
+        try:
+            me = event_journal.recipient_ref(chat_id) if chat_id else ""
+            cov = fill_journal.coverage()
+            rows = []
+            for pid in sorted({r.get("position_id")
+                               for r in fill_journal.fills(user_ref=me)}):
+                mine = fill_journal.reconcile(pid)["by_user"].get(me) or {}
+                sym = ""
+                for r in fill_journal.fills(pid, me):
+                    sym = r.get("symbol") or sym
+                rows.append({"position_id": pid, "symbol": sym, "me": mine})
+            return cards.fills_card(cov, rows,
+                                    len(fill_journal.unknown_signals()))
+        except Exception as e:                                 # noqa: BLE001
+            return f"I could not read the fill journal just now: {e}"
 
     def offer_add_user(self, item: dict):
         """A stranger messaged the bot. Tell the owner(s) once, with a
@@ -2071,6 +2286,11 @@ class Service:
                     f"for today ({reason}). Effect: {effect}.")
         if cmd == "/status":
             return self.status_text()
+        if cmd == "/fills":
+            # W07, and open to everyone for the same reason /fill is: each
+            # recipient can only ever see and log their own execution of the
+            # one signal.
+            return self.fills_text(chat_id)
         if cmd == "/health":
             return self.health_text()
         if cmd == "/test":
@@ -2420,13 +2640,16 @@ class Service:
                               config.api_usage_line()])
         target = str(chat_id or telegram.primary_owner_id() or "")
 
+        told = []
+
         def _answer(ok):
             if ok is None:
-                # the check never ran (the worker could not start). saying
-                # "checked just now" here would be a fabricated result, and
-                # this bot does not report a check it did not make.
-                text = "\n".join(["I could not start the API check, so nothing "
-                                  "was asked and I have no fresh answer.",
+                # NO ANSWER: either the worker never started, or the spending
+                # policy sent nothing, or nothing came back. "Checked just
+                # now" for any of those is a fabricated result, and this bot
+                # does not report a check it did not make.
+                text = "\n".join(["No answer came back, so I have nothing "
+                                  "fresh to report and nothing was billed.",
                                   "Last known: " + assistant.brain_status_line(),
                                   "Try /brain again in a moment.",
                                   config.api_usage_line()])
@@ -2444,10 +2667,22 @@ class Service:
             err = telegram.send_to(target, text)
             if err:
                 print(f"/brain verdict send failed to {target}: {err}")
+                return
+            told.append(True)
 
-        started = assistant.probe_billing_forced(on_done=_answer)
-        return (self.PROBE_PENDING_TEXT if started
-                else "Already checking. The verdict lands here in a moment.")
+        status = assistant.probe_billing_dispatch(on_done=_answer)
+        if status == assistant.PROBE_STARTED:
+            return self.PROBE_PENDING_TEXT
+        if status == assistant.PROBE_JOINED:
+            # a probe really is in the air and this chat is parked on it, so
+            # it gets the same fresh verdict rather than the last one
+            return "Already checking. The verdict lands here in a moment."
+        # NOT STARTED: no worker exists and none was made. The old code said
+        # "already checking" here, one message before the worker's own text
+        # said no check had been made. _answer has already run on THIS thread
+        # with None, so speak again only if it had nowhere to send.
+        return (None if told else
+                "I could not start the API check, so nothing was asked.")
 
     def cmd_calendar(self):
         """/calendar: what the bot thinks the market is doing next."""
@@ -2548,40 +2783,164 @@ class Service:
     # live_params.py so Service-less surfaces compute the same effective list.
     ALLOWED_SETUPS = live_params.DEFAULT_ALLOWED_SETUPS
 
-    def gate_stats(self, setup):
+    def gate_stats(self, setup, reject_codes=None, gate_values=None):
         """The eligibility filter: backtested win rate of 70+ (rounded the
         same way every card displays it — 69.77% IS the '70%' the user sees)
         AND positive expectancy under the EXITS WE ACTUALLY TRADE (the
-        new-rules backtest when it exists, old-rules otherwise)."""
+        new-rules backtest when it exists, old-rules otherwise).
+
+        reject_codes and gate_values are W06 OUT PARAMETERS and nothing else.
+        They are filled in on the way past each existing branch so the recorder
+        can say WHY a candidate was rejected without a second copy of this
+        logic drifting away from it. No branch, no threshold and no return
+        value moves; passing neither leaves the function exactly as it was."""
+        codes = reject_codes if reject_codes is not None else []
+        vals = gate_values if gate_values is not None else {}
         if self.backtest_old is None:
             print("No backtest results: refusing to alert without real stats. "
                   "Run backtest.py.")
+            codes.append("no_backtest_report")
             return None
         key = f"{setup.ticker}:{setup.direction}"
         now = et_now()
+        vals["allow_list"] = key in self.ALLOWED_SETUPS
         if key not in self.ALLOWED_SETUPS:
             print(f"{now:%H:%M:%S} {key}: not on the alert allow-list "
                   f"{sorted(self.ALLOWED_SETUPS)}, skipped.")
+            codes.append("not_on_allow_list")
+            # the later checks were never evaluated for this candidate, and
+            # saying so is the difference between a measured reject and a
+            # guess about one (Astra section 5)
+            codes.append("win_rate_and_expectancy_not_evaluated")
             return None
         stats = self.backtest_old.get("per_setup", {}).get(key)
         if stats is None:
             print(f"{now:%H:%M:%S} {setup.ticker} {setup.direction}: setup formed "
                   "but no backtest stats for it, skipped.")
+            codes.append("no_backtest_stats_for_setup")
+            codes.append("win_rate_and_expectancy_not_evaluated")
             return None
+        # both the raw and the DISPLAYED rate, because the gate rounds and a
+        # raw 69.77 passes a rounded 70 bar. Astra section 7 asks for both to
+        # be stored rather than one standing in for the other.
+        vals["win_rate_raw"] = stats["win_rate"]
+        vals["win_rate_rounded"] = round(stats["win_rate"])
+        vals["min_winrate"] = config.MIN_WINRATE
+        vals["rounding_rule"] = "python round() on the raw win rate"
         if round(stats["win_rate"]) < config.MIN_WINRATE:
             print(f"{now:%H:%M:%S} {setup.ticker} {setup.direction}: win rate "
                   f"{stats['win_rate']:.0f}% is below {config.MIN_WINRATE:.0f}%, "
                   "skipped, not forcing it.")
+            codes.append("win_rate_below_floor")
+            codes.append("expectancy_not_evaluated")
             return None
         new_stats = (self.backtest_new or {}).get("per_setup", {}).get(key)
         exp = (new_stats or stats)["expectancy_pct"]
         rules = "our exits" if new_stats else "the old exits"
+        vals["expectancy_pct"] = exp
+        vals["expectancy_report"] = "new rules" if new_stats else "old rules"
         if exp <= 0:
             print(f"{now:%H:%M:%S} {setup.ticker} {setup.direction}: wins "
                   f"{stats['win_rate']:.0f}% of the time but LOSES money with "
                   f"{rules} in testing, skipped, not forcing it.")
+            codes.append("expectancy_not_positive")
             return None
         return stats
+
+    # ---------- W06: what the recorder needs to know about this build ----------
+
+    def recorder_context(self) -> dict:
+        """The identity every recorded decision is replayable against.
+
+        Read from the repository and the live config, never typed. policy_hash
+        covers the thresholds, the allow list, the entry window and the roster,
+        so a row recorded under one policy can never be silently pooled with a
+        row recorded under another. Cached per process because none of it moves
+        while the process runs."""
+        ctx = getattr(self, "_rec_ctx", None)
+        if ctx is not None:
+            return ctx
+        policy = json.dumps({
+            "min_winrate": config.MIN_WINRATE,
+            "tp_half_pct": config.TP_HALF_PCT,
+            "stop_pct": config.STOP_PCT,
+            "runner_giveback_pct": config.RUNNER_GIVEBACK_PCT,
+            "risk_per_trade_pct": config.RISK_PER_TRADE_PCT,
+            "correlated_risk_pct": config.CORRELATED_RISK_PCT,
+            "gap_up_skip_pct": config.GAP_UP_SKIP_PCT,
+            "allow_list": sorted(self.ALLOWED_SETUPS),
+            "entry_window": [str(self.cfg.entry_start), str(self.cfg.entry_end)],
+            "watchlist": sorted(self.cfg.watchlist),
+            "old_bracket": self.old_bracket,
+        }, sort_keys=True, default=str)
+        phash = hashlib.sha256(policy.encode("utf-8")).hexdigest()[:16]
+        commit, deployment = "", ""
+        res = storage_io.read_json(config.REPO_DIR / "release_manifest.json")
+        if res.usable and isinstance(res.value, dict):
+            commit = (res.value.get("source") or {}).get("commit") or ""
+            deployment = (res.value.get("deployed") or {}).get("deployment_id") or ""
+        ctx = {
+            "policy_hash": phash,
+            # this bot has no declared strategy version string, so the version
+            # IS the policy fingerprint. Naming it that way beats inventing a
+            # number nobody increments.
+            "strategy_version": f"momentum-{phash[:8]}",
+            "source_commit": commit,
+            "deployment_id": os.environ.get("RAILWAY_DEPLOYMENT_ID", "")
+                             or deployment,
+            "input_feed": self.feed.backend_for("SPY") + " 5m bars",
+        }
+        self._rec_ctx = ctx
+        return ctx
+
+    @staticmethod
+    def _bar_end_utc(bars):
+        """The END of the newest completed input bar, in UTC.
+
+        The bar END and not the poll clock, because Astra section 5 makes the
+        completed input bar the unit: a 15 second recheck of the same unchanged
+        bar is one candidate, and only a bar boundary can say that."""
+        try:
+            start = bars.index[-1].to_pydatetime()
+            return (start + timedelta(minutes=5)).astimezone(
+                ZoneInfo("UTC")).isoformat()
+        except Exception:                                      # noqa: BLE001
+            return None
+
+    def record_candidate(self, ticker, direction, bar_end, codes, values,
+                         now, selected=False, position_id=None,
+                         gate_passed=False, candidate_id=None):
+        """One recorded opportunity. Wrapped whole, because a recorder fault
+        may never end a trading cycle: this is an observer and it gets no vote
+        on whether the bot scans.
+
+        A dry run records NOTHING. It reads the same bars and reaches the same
+        decisions as the live copy, so letting it write would put a second copy
+        of every candidate into the one record the study counts rows in."""
+        # getattr, because test_pipeline builds a Service through __new__ with
+        # every I/O path stubbed and no __init__, so it has no .dry at all. An
+        # observer must not be the thing that raises in that object.
+        if getattr(self, "dry", False):
+            return None
+        try:
+            ctx = self.recorder_context()
+            return trade_recorder.record_candidate(
+                strategy_id="momentum", symbol=ticker, direction=direction,
+                session_date=str(now.date()),
+                decision_at_utc=now.astimezone(ZoneInfo("UTC")).isoformat(),
+                observed_at_utc=trade_recorder._utc_iso(),
+                input_bar_end_utc=bar_end, input_values=values or {},
+                gate_passed=bool(gate_passed), reject_codes=codes or [],
+                selected=bool(selected), position_id=position_id,
+                candidate_id=candidate_id,
+                strategy_version=ctx["strategy_version"],
+                policy_hash=ctx["policy_hash"],
+                source_commit=ctx["source_commit"],
+                deployment_id=ctx["deployment_id"],
+                input_feed=ctx["input_feed"])
+        except Exception as e:                                 # noqa: BLE001
+            print(f"{now:%H:%M:%S} recorder: candidate not recorded: {e}")
+            return None
 
     def gap_up_pct(self, now: datetime):
         """SPX open vs yesterday's close, computed once per day (cached).
@@ -2631,17 +2990,42 @@ class Service:
         live = {p.ticker for p in self.book.positions
                 if getattr(p, "state", "") != "closed"}
         for ticker, yfs in self.cfg.watchlist.items():
+            # W06: one scan evaluation per look, counted separately from the
+            # candidate opportunities below. Astra section 5 wants both numbers
+            # to stay available, because four rechecks of one bar are four
+            # evaluations and ONE opportunity.
+            trade_recorder.record_scan_evaluation("momentum", ticker)
             if ticker in self.skipped_today or ticker in opened or ticker in live:
+                # recorded once per session per ticker, not once per poll: the
+                # candidate key dedups on the bar and this branch has no bar
+                self.record_candidate(
+                    ticker, None, None,
+                    ["already_decided_today", "no_bar_read_on_this_branch"],
+                    {"skipped_today": ticker in self.skipped_today,
+                     "opened_today": ticker in opened,
+                     "position_open": ticker in live}, now)
                 continue
             try:
                 bars = self.get_bars(yfs, now)
                 if bars is None or bars.empty:
+                    self.record_candidate(ticker, None, None, ["no_bars"],
+                                          {"feed": yfs}, now)
                     continue
                 setup = detect_setup(ticker, bars, now, self.cfg)
             except Exception as e:
                 print(f"{now:%H:%M:%S} {ticker}: data error: {e}")
+                self.record_candidate(ticker, None, None, ["data_error"],
+                                      {"feed": yfs, "error": str(e)[:120]}, now)
                 continue
+            bar_end = self._bar_end_utc(bars)
             if setup is None:
+                # a completed bar that produced no setup is still an OBSERVED
+                # opportunity, and it is most of the denominator. The direction
+                # is null because there is no setup to have one, which is a
+                # missing value, not a zero.
+                self.record_candidate(
+                    ticker, None, bar_end, ["no_setup"],
+                    {"close": float(bars["Close"].iloc[-1])}, now)
                 continue
             # A setup whose DIRECTION isn't the one we trade for this ticker
             # (e.g. an early SPX:put on a weak open, before the tape turns up to
@@ -2649,14 +3033,31 @@ class Service:
             # momentum routinely flips to the allowed side later in the window.
             # Just wait and re-check next cycle; do NOT burn the ticker.
             if f"{setup.ticker}:{setup.direction}" not in self.ALLOWED_SETUPS:
+                self.record_candidate(
+                    ticker, setup.direction, bar_end,
+                    ["direction_not_on_allow_list",
+                     "gate_not_evaluated"],
+                    {"mom_pct": setup.mom_pct, "spot": setup.spot,
+                     "allow_list": sorted(self.ALLOWED_SETUPS)}, now)
                 continue
-            if self.gate_stats(setup) is None:
+            codes, gate_values = [], {}
+            gate_values.update({"mom_pct": setup.mom_pct, "spot": setup.spot,
+                                "strike": setup.strike,
+                                "risk_mode": self.mode})
+            if self.gate_stats(setup, codes, gate_values) is None:
                 # allowed direction, but it failed the win-rate/expectancy bar:
                 # THAT is final for the day.
+                self.record_candidate(ticker, setup.direction, bar_end, codes,
+                                      gate_values, now)
                 self.skipped_today.add(ticker)
                 continue
             try:
-                did_open = self.open_position(setup, now)
+                # bar_end and gate_values are PASSED, not stashed on self.
+                # Instance state would survive a raised open_position and the
+                # next ticker would record its decision against the previous
+                # ticker's bar.
+                did_open = self.open_position(setup, now, bar_end=bar_end,
+                                              gate_values=gate_values)
             except Exception as e:
                 print(f"{now:%H:%M:%S} {ticker}: failed to open position: {e}, "
                       "will retry next cycle")
@@ -2664,7 +3065,8 @@ class Service:
             if did_open:
                 self.skipped_today.add(ticker)
 
-    def open_position(self, setup, now: datetime):
+    def open_position(self, setup, now: datetime, bar_end=None,
+                      gate_values=None):
         right = "C" if setup.direction == "call" else "P"
         expiry_dt = expiry_for(setup.ticker, now)
         # holiday weeks move weeklies (Friday holiday -> Thursday expiry)
@@ -2680,12 +3082,24 @@ class Service:
             blocked, e_date = news.earnings_inside(setup.ticker, expiry_date)
         except Exception:
             blocked, e_date = False, None
+        gate_values = dict(gate_values or {})
         if blocked:
             print(f"{now:%H:%M:%S} {setup.ticker} {setup.direction}: earnings "
                   f"{e_date} lands inside this option's life, skipped, "
                   "not gambling on a report.")
+            self.record_candidate(
+                setup.ticker, setup.direction, bar_end,
+                ["earnings_inside_option_life"],
+                dict(gate_values, earnings_date=str(e_date),
+                     expiry=str(expiry_date)), now)
             return True  # final decision for the day
+        # the three clocks around the ONE chain read this path already makes.
+        # Captured here rather than inside quotes so no pricing code moves: the
+        # recorder needs to tell "when we asked" from "when we were answered",
+        # and a Yahoo chain row carries no quote timestamp of its own.
+        q_requested = trade_recorder._utc_iso()
         quote = quotes.get_option_quote(setup.ticker, right, setup.strike, expiry_date)
+        q_received = trade_recorder._utc_iso()
         sigma = self.sigma(setup.ticker)
         est = quotes.estimate_premium(setup.spot, setup.strike, right,
                                       expiry_dt, now, sigma)
@@ -2702,6 +3116,9 @@ class Service:
         else:
             print(f"{now:%H:%M:%S} {setup.ticker}: no usable option price yet, "
                   "will retry next cycle.")
+            self.record_candidate(
+                setup.ticker, setup.direction, bar_end, ["no_option_price"],
+                dict(gate_values, sigma=sigma, expiry=str(expiry_date)), now)
             return False
 
         risk = config.RISK_PER_TRADE_PCT
@@ -2820,7 +3237,107 @@ class Service:
         print(f"{now:%H:%M:%S} alert sent: {setup.ticker} {setup.strike:g} "
               f"{setup.direction} entry ${entry_mid:.2f} ({entry_source})"
               + (f" errors: {errors}" if errors else ""))
+        self._start_observation(pos, setup, quote, est, now, expiry_date,
+                                bar_end, gate_values, entry_source,
+                                q_requested, q_received, intent)
+        self._note_fill_signal(pos, intent, now, expiry_date)
         return True
+
+    def _note_fill_signal(self, pos, intent, now, expiry_date):
+        """W07: name this signal in the fill journal's denominator.
+
+        Without this row a session with one report and eleven silences reads as
+        one out of one. The row says who was alerted and that nobody has
+        reported yet, which is what turns "no reply is unknown, not no trade"
+        into a fact on disk instead of an absence.
+
+        Nothing is ever sent from here. Wrapped whole, and never on the
+        monitoring path: the fill journal is an observer and a fault in it may
+        not cost an alert that has already gone out."""
+        try:
+            fill_journal.note_signal(
+                position_id=pos.id, candidate_id=pos.candidate_id,
+                contract_id=trade_recorder.contract_id_for(
+                    pos.ticker, pos.right, pos.strike, expiry_date),
+                symbol=pos.ticker,
+                recipients=[d.recipient_ref for d in intent.deliveries()],
+                alerted_at_utc=now.astimezone(ZoneInfo("UTC")).isoformat())
+        except Exception as e:                                 # noqa: BLE001
+            print(f"{now:%H:%M:%S} fill lane: signal not noted for "
+                  f"{pos.id}: {e}")
+
+    def _start_observation(self, pos, setup, quote, est, now, expiry_date,
+                           bar_end, gate_values, entry_source,
+                           q_requested, q_received, intent):
+        """W06: open the record for this trade, and for the roads not taken.
+
+        The whole A15 answer starts here. The chosen contract and its two
+        predeclared controls are all observed to ONE common horizon, and the
+        registry does not care that the position closes: it keeps sampling
+        until that horizon, which is the only way "the exit was at 0.4R" can
+        ever be compared against what a later target would have got.
+
+        Wrapped whole. The recorder is an observer and a fault in it may not
+        cost an alert that has already gone out."""
+        try:
+            ctx = self.recorder_context()
+            cid = trade_recorder.register_contract(
+                underlying=pos.ticker, option_right=pos.right,
+                strike=pos.strike, expiry_date=expiry_date)
+            horizon = trade_recorder.common_horizon_utc(now.date())
+            rec_candidate = self.record_candidate(
+                pos.ticker, setup.direction, bar_end, [],
+                dict(gate_values, entry_source=entry_source,
+                     entry_mid=pos.entry_mid, expiry=str(expiry_date),
+                     risk_pct=pos.risk_pct, correlated=pos.correlated),
+                now, selected=True, gate_passed=True, position_id=pos.id)
+            trade_recorder.observe(
+                contract_id=cid, contract_role=trade_recorder.CHOSEN,
+                candidate_id=rec_candidate, position_id=pos.id,
+                observation_end_utc=horizon, underlying=pos.ticker,
+                right=pos.right, strike=pos.strike,
+                expiry_date=str(expiry_date))
+            # the entry quote itself, recorded from what this path already
+            # fetched. No second chain read anywhere in here.
+            trade_recorder.record_sample(
+                candidate_id=rec_candidate, contract_id=cid,
+                contract_role=trade_recorder.CHOSEN, provider="yfinance",
+                feed="yahoo option chain",
+                provider_at_utc=None, received_at_utc=q_received,
+                requested_at_utc=q_requested,
+                bid=(quote.bid if quote is not None and quote.bid > 0 else None),
+                ask=(quote.ask if quote is not None and quote.ask > 0 else None),
+                bid_size=None, ask_size=None, underlying_price=setup.spot,
+                underlying_at_utc=now.astimezone(ZoneInfo("UTC")).isoformat(),
+                price_basis=("quote_mid" if entry_source == "quote"
+                             else "black_scholes_estimate"),
+                is_model=(entry_source != "quote"),
+                quality_flags=["entry"], observation_end_utc=horizon,
+                mark=pos.entry_mid, position_id=pos.id,
+                extra={"model_price": est,
+                       "last_trade_at_utc": getattr(quote, "last_trade_at_utc",
+                                                    None),
+                       "intent_candidate_id": pos.candidate_id,
+                       "decision_id": pos.decision_id})
+            trade_recorder.request_controls(
+                candidate_id=rec_candidate, position_id=pos.id,
+                underlying=pos.ticker, right=pos.right, strike=pos.strike,
+                spot=setup.spot, expiry_date=str(expiry_date),
+                observation_end_utc=horizon,
+                decision_at_utc=now.astimezone(ZoneInfo("UTC")).isoformat())
+            trade_recorder.record_event(
+                position_id=pos.id, event_type="entry",
+                trigger_at_utc=now.astimezone(ZoneInfo("UTC")).isoformat(),
+                trigger_sample_id=None, trigger_basis=entry_source,
+                trigger_threshold=None, mark_used=pos.entry_mid,
+                mark_source=entry_source, leg_quantity=1,
+                deliveries=trade_recorder.deliveries_from_intent(
+                    event_journal.get(intent.journal_id) or intent),
+                candidate_id=rec_candidate, decision_id=pos.decision_id,
+                extra={"policy_hash": ctx["policy_hash"]})
+        except Exception as e:                                 # noqa: BLE001
+            print(f"{now:%H:%M:%S} recorder: observation not opened for "
+                  f"{pos.id}: {e}")
 
     # ---------- monitoring ----------
 
@@ -2832,11 +3349,94 @@ class Service:
             except Exception as e:
                 print(f"{now:%H:%M:%S} {pos.ticker}: monitor error: {e}")
         self.heartbeat += 1
+        # W06 record 6: the health row's monitor freshness. A pure in memory
+        # assignment, so the observer still costs the exit loop nothing.
+        trade_recorder.note_monitor_ok(
+            now.astimezone(ZoneInfo("UTC")).isoformat())
         if watch and self.heartbeat % 40 == 0:  # ~every 10 minutes
             states = ", ".join(
                 f"{p.ticker} {(p.last_mark_pct if p.last_mark_pct is not None else 0):+.1f}%"
                 for p in watch)
             print(f"{now:%H:%M:%S} watching: {states}")
+
+    def _record_monitor_sample(self, pos, now, quote, est, spot, mark, source,
+                               usable, requested_at, received_at):
+        """One monitoring observation, handed to the recorder for free.
+
+        Everything here was already fetched by the cycle. Nothing in this
+        method talks to a provider, waits on a lock or touches a disk, and the
+        one queue operation it does perform cannot block. Wrapped whole anyway:
+        an observer never gets to end a monitoring cycle.
+
+        Returns the sample id so an exit fired on this cycle can point at the
+        exact quote that fired it, which is what lets an exit be re derived
+        later instead of re asserted.
+
+        A dry run records nothing, for the same reason it records no candidate:
+        it is not this book."""
+        if getattr(self, "dry", False):
+            return None
+        try:
+            obs = trade_recorder.chosen_observation(pos.id)
+            flags = []
+            if obs is None:
+                # the registry did not survive, so the sample is filed under
+                # the intent's candidate id and SAYS it fell back
+                flags.append("candidate_from_position")
+            cand = (obs or {}).get("candidate_id") or getattr(
+                pos, "candidate_id", None)
+            horizon = ((obs or {}).get("observation_end_utc")
+                       or trade_recorder.common_horizon_utc(now.date()))
+            cid = trade_recorder.contract_id_for(pos.ticker, pos.right,
+                                                 pos.strike, pos.expires_on())
+            live = quote is not None and quote.bid > 0
+            if not usable:
+                flags.append("stale_fallback_mark")
+            # the sampler thread has no feed of its own and must never grow
+            # one, so the underlying it stamps on a control sample is the one
+            # THIS loop already paid for, carried across with its own timestamp
+            if spot is not None:
+                trade_recorder.note_underlying(
+                    pos.ticker, spot,
+                    now.astimezone(ZoneInfo("UTC")).isoformat())
+            if pos.state == "closed":
+                # THE A15 LINE. The position is finished and the path is not:
+                # this keeps arriving until the common horizon so a later high
+                # is on the record rather than censored by the earlier exit.
+                flags.append("after_position_close")
+            return trade_recorder.record_sample(
+                candidate_id=cand, contract_id=cid,
+                contract_role=trade_recorder.CHOSEN, provider="yfinance",
+                feed="yahoo option chain", provider_at_utc=None,
+                received_at_utc=received_at, requested_at_utc=requested_at,
+                bid=(quote.bid if live else None),
+                ask=(quote.ask if live else None),
+                bid_size=None, ask_size=None, underlying_price=spot,
+                underlying_at_utc=now.astimezone(ZoneInfo("UTC")).isoformat(),
+                # a cycle with no price at all gets a NULL basis and a null
+                # is_model, not "last known price": there was no price, and
+                # calling the absence a basis is the invented value the whole
+                # schema forbids
+                price_basis=("quote_mid" if live else
+                             "black_scholes_estimate"
+                             if source.startswith("estimat")
+                             else "last_known_price" if mark is not None
+                             else None),
+                is_model=(bool(source.startswith("estimat"))
+                          if mark is not None else None),
+                quality_flags=flags,
+                missing_reason=(None if usable else
+                                ("stale_mark_carried" if mark is not None
+                                 else "no_underlying_price")),
+                observation_end_utc=horizon, mark=mark, position_id=pos.id,
+                extra={"model_price": est if est > 0 else None,
+                       "mark_source": source,
+                       "last_trade_at_utc": getattr(quote, "last_trade_at_utc",
+                                                    None)})
+        except Exception as e:                                 # noqa: BLE001
+            print(f"{now:%H:%M:%S} recorder: sample not recorded for "
+                  f"{pos.id}: {e}")
+            return None
 
     def monitor_one(self, pos: Position, now: datetime):
         yfs = self.yfs_for(pos.ticker)
@@ -2850,6 +3450,13 @@ class Service:
             spot = last_close  # garbage-tick guard: a 'live' price 10% away
                                # from the last completed bar is not believable
         if spot is None:
+            # a cycle the bot could not price at all. Recorded rather than
+            # returned from in silence: an unrecorded missed cycle is the exact
+            # thing that later reads as "we observed everything", and this one
+            # costs a queue put and no I/O.
+            self._record_monitor_sample(
+                pos, now, None, 0.0, None, None, "no underlying price", False,
+                trade_recorder._utc_iso(), trade_recorder._utc_iso())
             return
         sigma = self.sigma(pos.ticker)
         # the contract dies when the MARKET shuts, not at a fixed 16:00. On a
@@ -2893,8 +3500,10 @@ class Service:
         # mid would read -30% on day one just from the vol-model gap.)
         est_pct = ((est / pos.est_entry - 1) * 100
                    if est > 0 and pos.est_entry > 0 else None)
+        q_requested = trade_recorder._utc_iso()
         quote = quotes.get_option_quote(pos.ticker, pos.right, pos.strike,
                                         pos.expires_on())
+        q_received = trade_recorder._utc_iso()
         # mark preference: real bid/ask > fresh estimate > stale last trade
         if quote is not None and quote.bid > 0:
             mark, source, usable = quote.mid, quote.source, True
@@ -2917,6 +3526,16 @@ class Service:
         mark_is_est = source.startswith("estimat")
         entry_is_est = (pos.entry_source != "quote")
         comparable = usable and (mark_is_est == entry_is_est)
+
+        # W06: hand the observation this cycle ALREADY made to the recorder.
+        # No chain read is added here and none ever may be: this is the loop
+        # that walks a live stop, and the recorder is an observer. The call
+        # builds a dict and does one put_nowait, and it is recorded BEFORE the
+        # early return below, because a cycle the bot could not act on is
+        # exactly the kind of gap that otherwise disappears from the record.
+        sample_id = self._record_monitor_sample(
+            pos, now, quote, est, spot, mark, source, usable, q_requested,
+            q_received)
 
         near_expiry = (pos.expires_on() == now.date()
                        and now.time() >= poslib.warn_t(now.date()))
@@ -2990,6 +3609,52 @@ class Service:
             live = event_journal.get(intent.journal_id) or intent
             if all(d.resolved for d in live.deliveries()):
                 event_journal.resolve(intent.journal_id)
+        # W06 record 3, written LAST: by here the exit has been journaled,
+        # the book has been saved and the card has had its send attempt, so
+        # the delivery status recorded beside the trigger is the real one
+        # rather than a hopeful one. Nothing above waits on this.
+        self._record_exit_events(pos, now, events, source, sample_id, journaled)
+
+    def _record_exit_events(self, pos, now, events, source, sample_id,
+                            journaled):
+        """The exit, the exact quote that fired it, and where the card went.
+
+        selected and delivery_confirmed are different facts and they stay
+        different here: the trigger comes from positions.step, the delivery
+        comes from the journal, and neither is inferred from the other (A05).
+        A leg with no durable intent is recorded with an empty delivery list
+        and a stated reason, not with an invented confirmation."""
+        if not events or getattr(self, "dry", False):
+            return
+        try:
+            by_leg = {}
+            for text, intent in journaled:
+                live = event_journal.get(intent.journal_id) or intent
+                by_leg[(live.payload or {}).get("leg")] = live
+            thresholds = {"sell_half": config.TP_HALF_PCT,
+                          "stop": config.STOP_PCT,
+                          "runner_trail": config.RUNNER_GIVEBACK_PCT}
+            for ev in events:
+                intent = by_leg.get(ev["type"])
+                trade_recorder.record_event(
+                    position_id=pos.id, event_type=ev["type"],
+                    trigger_at_utc=now.astimezone(ZoneInfo("UTC")).isoformat(),
+                    trigger_sample_id=sample_id,
+                    trigger_basis=("quote_mid" if not source.startswith("estimat")
+                                   else "black_scholes_estimate"),
+                    trigger_threshold=thresholds.get(ev["type"]),
+                    mark_used=ev.get("mark"), mark_source=source,
+                    leg_quantity=1,
+                    deliveries=(trade_recorder.deliveries_from_intent(intent)
+                                if intent is not None else []),
+                    candidate_id=getattr(pos, "candidate_id", None),
+                    decision_id=getattr(pos, "decision_id", None),
+                    extra={"pct": ev.get("pct"),
+                           "position_state_after": pos.state,
+                           "journal_available": intent is not None})
+        except Exception as e:                                 # noqa: BLE001
+            print(f"{now:%H:%M:%S} recorder: exit not recorded for "
+                  f"{pos.id}: {e}")
 
     # ---------- sniper watch (own thread, US session) ----------
     # The verified pattern used to fire ONLY when someone happened to text
@@ -3727,60 +4392,142 @@ class Service:
         except Exception as e:
             print(f"{now:%H:%M:%S} learn failed (attempt {n} recorded, will retry): {e}")
 
+    def _grade_job(self, now: datetime):
+        """The grading job this tick should work on, or None.
+
+        THE DEFECT THIS EXISTS TO KILL. Astra W03: "Retrying six times is
+        ineffective if no caller remains scheduled to perform those retries."
+        The old code opened with `if now.time() < WEEKLY_AT: return`, which is a
+        wall-clock gate applied on EVERY tick, not just when deciding what is
+        newly due. So between midnight and 16:05 no tick could retry anything,
+        and forward_grade_session then rolled the key at the next close. A pass
+        that failed at 23:50 spent one of its six attempts and the other five
+        were never performed by anybody: the day was neither graded nor parked,
+        it simply stopped existing as work.
+
+        An OPEN job therefore outlives the clock. Whichever caller ticks next,
+        at any hour, on any day, in or out of session, picks it up and works it
+        until it is done or its budget is spent. A job only ever ends in a
+        counted status.
+
+        A new job is opened only when nothing is open, and only for a session
+        whose declared horizon has passed (forward_grade_open_at)."""
+        rec = config.state_get("forward_grade_last")
+        # Settled is checked FIRST, always. A record from the build before the
+        # job shipped is {key, at} with no status, and adopting one blindly
+        # would re-open a day state.json already records as graded: every
+        # upgraded container would run one extra pass, and an incomplete one
+        # would then park a day that was finished.
+        if isinstance(rec, dict) and rec.get("key") \
+                and not self._grade_key_settled(rec["key"]):
+            if rec.get("status") == "open":
+                return dict(rec)
+            if "status" not in rec:
+                # a legacy record for a day that is NOT settled describes an
+                # attempt that really was made, so adopt its budget and its
+                # spacing rather than restarting either from zero.
+                tries = config.state_get("forward_grade_tries", {}) or {}
+                n = tries.get(rec["key"], 0) if isinstance(tries, dict) else 0
+                nxt = None
+                try:
+                    nxt = (datetime.fromisoformat(rec["at"])
+                           + timedelta(seconds=self.GRADE_RETRY_S)).isoformat()
+                except (ValueError, TypeError, KeyError):
+                    pass
+                return {"key": rec["key"], "attempt": n,
+                        "attempt_id": f"forward_grade:{rec['key']}#{n}",
+                        "opened_at": rec.get("at"), "at": rec.get("at"),
+                        "next_eligible_at": nxt, "status": "open"}
+        due = str(forward_grade_session(now))
+        if self._grade_key_settled(due):
+            return None         # graded, or handed to a human. Either way done
+        # Nothing else may refuse. A job record that says done or attention
+        # while state.json records NEITHER is a half written transaction, and
+        # for a free deterministic measurement the safe side of that is to run
+        # again: the pass is idempotent, and completing it writes the missing
+        # accounting. Refusing on the record alone would leave the day
+        # permanently unaccounted for, which is the failure this package
+        # exists to remove.
+        return {"key": due, "attempt": 0,
+                "attempt_id": f"forward_grade:{due}#0",
+                "opened_at": now.isoformat(), "at": None,
+                "next_eligible_at": None, "status": "open"}
+
+    @staticmethod
+    def _grade_key_settled(key: str) -> bool:
+        """Has this session already been accounted for, either way?
+
+        Graded is settled. Parked as needs-attention is settled too: a human
+        has it, and re-attempting behind their back is the 45 second spin the
+        park exists to stop."""
+        if config.state_get("forward_graded") == key:
+            return True
+        park = config.state_get("forward_grade_attention")
+        return isinstance(park, dict) and park.get("key") == key
+
     def maybe_grade_forward(self, now: datetime):
         """Grade the day's sniper candidates against the day's bars.
 
         This is DELIBERATELY not inside maybe_learn. Grading is deterministic:
         it walks bars and decides which level was touched first, and it costs
         nothing. It used to live inside learn.run, so switching the paid
-        nightly review off (LEARN_ENABLED=false) silently switched off the
-        evidence collection too, and the forward ledger stopped earning the
-        record that is supposed to settle the 0.4R question. Capping spend must
-        never cost measurement.
+        nightly review off silently switched off the evidence collection too,
+        and the forward ledger stopped earning the record that is supposed to
+        settle the 0.4R question. Capping spend must never cost measurement.
+        Nothing in this method may consult an AI switch, and nothing does.
 
-        Own dedup key and bounded attempts, same shape as the other jobs, so a
-        restart cannot double-grade and a bad day cannot retry forever.
+        The job's identity, its attempt number and its NEXT ELIGIBLE RETRY TIME
+        are persisted before the work starts (Astra W03: "persist the attempt
+        identity and next eligible retry time"), so a restart between attempts
+        resumes the same job at the next attempt instead of re-spending the
+        budget or losing it.
 
         The day is claimed on the ledger's own RECONCILIATION, never on the
         mere fact that the call returned. fill_outcomes used to hand back a
         bare int, so an unreadable ledger, a missing dependency, a download
         that raised and a lost write all looked exactly like a finished day,
         and this job wrote forward_graded on the line after the call, before
-        it had even looked at the answer. The early return above then made the
-        retry it was designed to allow unreachable.
+        it had even looked at the answer.
+
+        It claims the day on JOB completion, not on measurement completion. A
+        row the download can never reach again is durably retired and does not
+        hold every future job open; its outcome stays missing for research and
+        the counts say so. Astra section 4.
 
         Exhausting the budget is parked as needs-attention instead of being
         written with the byte-identical state a real success writes, and a
-        parked day stops re-attempting, so removing that write cannot turn
-        exhaustion into a 45 second spin all evening.
+        parked day stops re-attempting.
 
-        A row the grader DEFERRED (its own day is still trading, so freezing
-        an answer now would freeze a wrong one) is not a failure and does not
-        hold the key open. It cannot: the budget is six looks fifteen minutes
-        apart and the gate above will not reopen before the next session, so
-        waiting for midnight here would park a healthy day every single
-        evening. The next session's pass walks every ungraded row of every
-        past date and picks it up, well inside the download window."""
-        if self.dry or now.time() < WEEKLY_AT:
+        A row the grader DEFERRED (its declared horizon has not passed, so
+        freezing an answer now would freeze a wrong one) is not a failure and
+        does not hold the key open. The next pass walks every ungraded row of
+        every past date and picks it up, well inside the download window."""
+        if self.dry:
             return
-        key = str(forward_grade_session(now))
-        if config.state_get("forward_graded") == key:
+        job = self._grade_job(now)
+        if job is None:
             return
-        park = config.state_get("forward_grade_attention")
-        if isinstance(park, dict) and park.get("key") == key:
-            return              # already handed to a human; stop re-attempting
-        last = config.state_get("forward_grade_last")
-        if isinstance(last, dict) and last.get("key") == key:
+        key = job["key"]
+        nxt = job.get("next_eligible_at")
+        if nxt:
             try:
-                since = (now - datetime.fromisoformat(
-                    last["at"])).total_seconds()
-            except (ValueError, TypeError, KeyError):
-                since = None    # unreadable stamp: treat it as no spacing
-            if since is not None and since < self.GRADE_RETRY_S:
-                return
+                if now < datetime.fromisoformat(nxt):
+                    return      # the retry is owed, but not yet
+            except (ValueError, TypeError):
+                pass            # unreadable stamp: treat it as due now
+        # _job_attempt is the shared counter every scheduled job uses, and it
+        # is the source of truth for n so the record and the counter can never
+        # disagree about how much budget is left.
         n = self._job_attempt("forward_grade", key)
-        config.state_set("forward_grade_last",
-                         {"key": key, "at": now.isoformat()})
+        job.update({
+            "attempt": n,
+            "attempt_id": f"forward_grade:{key}#{n}",
+            "at": now.isoformat(),
+            "next_eligible_at": (now + timedelta(
+                seconds=self.GRADE_RETRY_S)).isoformat(),
+            "status": "open",
+        })
+        config.state_set("forward_grade_last", job)
         res = None
         try:
             import forward_ledger
@@ -3795,28 +4542,43 @@ class Service:
         # isinstance, not truthiness: a dict is ALWAYS truthy, so `if res:`
         # would read an all-zero failed pass as a success, and anything that
         # is not the counts contract must never be able to claim the day.
-        if isinstance(res, dict) and res.get("complete"):
+        # job_complete falls back to complete so an older result shape, or a
+        # test stub written against it, still reads correctly.
+        finished = isinstance(res, dict) and bool(
+            res.get("job_complete", res.get("complete")))
+        job["counts"] = {k: v for k, v in (res or {}).items()
+                         if k != "statuses"}
+        if finished:
             config.state_set("forward_graded", key)
-            # .get on the two newer counts: a stub or an older result shape
-            # must not turn a finished pass into an exception here.
+            job["status"] = "done"
+            job["next_eligible_at"] = None
+            config.state_set("forward_grade_last", job)
+            # .get on the newer counts: a stub or an older result shape must
+            # not turn a finished pass into an exception here.
             print(f"{now:%H:%M:%S} forward grading complete for {key}: graded "
                   f"{res['graded']} of {res['eligible']} eligible "
                   f"(unresolved {res['unresolved']}, deferred "
-                  f"{res.get('pending', 0)} until their day closes, retired "
+                  f"{res.get('pending', 0)} until their horizon, retired "
                   f"{res.get('retired', 0)}, permanent "
-                  f"{res['permanent_failures']})")
+                  f"{res['permanent_failures']}, measurement complete "
+                  f"{res.get('measurement_complete')})")
             return
         if n >= self.GRADE_MAX_ATTEMPTS:
             reason = _grade_attention_reason(res, n)
+            job["status"] = "attention"
+            job["next_eligible_at"] = None
+            config.state_set("forward_grade_last", job)
             config.state_set("forward_grade_attention",
                              {"key": key, "reason": reason,
-                              "at": now.isoformat(), "counts": res or {}})
+                              "at": now.isoformat(),
+                              "attempt_id": job["attempt_id"],
+                              "counts": job["counts"]})
             print(f"{now:%H:%M:%S} forward grading NEEDS ATTENTION for {key}: "
                   f"{reason}")
         else:
             print(f"{now:%H:%M:%S} forward grading incomplete for {key} "
-                  f"(attempt {n} of {self.GRADE_MAX_ATTEMPTS}), will "
-                  f"retry: {res}")
+                  f"(attempt {n} of {self.GRADE_MAX_ATTEMPTS}), retry due "
+                  f"{job['next_eligible_at']}: {job['counts']}")
 
     def maybe_holiday_notice(self, now: datetime):
         """Text everyone the evening before the market is shut, so the silence
@@ -3951,6 +4713,7 @@ class Service:
         keep_awake(True)
         self.start_news_watch()  # instant breaking-news alerts, own thread
         self.start_sniper_watch()  # verified-pattern watch, own thread
+        self.start_recorder()      # W06 observation recorder, own two threads
         try:
             while True:
                 now = et_now()
@@ -3966,6 +4729,17 @@ class Service:
                     self.maybe_request_digest(now)
                     self.maybe_weekly(now)
                     self.health_eod(now)  # owner-only 'all clear' for the day
+                    # Hand the closed session to the grading job before this
+                    # loop exits. Two reasons, both Astra W03. A one-shot
+                    # `python scanner.py` has no daemon loop behind it, so
+                    # without this it collects evidence all day and grades none
+                    # of it. And an OPEN job left over from last night gets its
+                    # owed retry here instead of waiting for the daemon.
+                    # Deliberately on this branch only: monitoring has stopped
+                    # for the day, so a download that takes a minute cannot
+                    # delay a stop. The grader is an observer and never gets to
+                    # sit in front of an exit.
+                    self.maybe_grade_forward(now)
                     print("Session over for today.")
                     return
                 t0 = time_mod.monotonic()
@@ -4011,7 +4785,32 @@ class Service:
                             print(f"{now:%H:%M:%S} command peek error: {e}")
         finally:
             self.stop_news_watch()
+            self.stop_recorder()
             keep_awake(False)
+
+    def start_recorder(self):
+        """W06: the writer and the batched path sampler, both on their own
+        threads.
+
+        Two threads and not zero, because the alternative is a chain read on
+        the monitoring loop, and that loop walks live stops. The writer drains
+        a bounded queue; the sampler is what pays for the control contracts and
+        for the chosen contract AFTER its own trade closes, which is the whole
+        A15 answer. A dry run records nothing: it is not this book."""
+        if self.dry:
+            return
+        try:
+            trade_recorder.start()
+            trade_recorder.start_sampler(quotes.chain_snapshot)
+        except Exception as e:                                 # noqa: BLE001
+            print(f"recorder: could not start, continuing without it: {e}")
+
+    def stop_recorder(self):
+        try:
+            trade_recorder.stop_sampler()
+            trade_recorder.stop()
+        except Exception as e:                                 # noqa: BLE001
+            print(f"recorder: could not stop cleanly: {e}")
 
     def daemon(self):
         # gagged before the first ownership answer. the window between process

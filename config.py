@@ -206,22 +206,127 @@ def api_allows(purpose: str = "chat"):
     return True, ""
 
 
-def api_note_call(purpose: str = "chat") -> None:
-    """Count one paid call. Called after the request goes out, so a refusal
-    never counts, and never raises: billing bookkeeping must not be able to
-    break a reply."""
+# Astra section 9 and gap M12: a per-purpose daily COUNT cannot attribute
+# spend. One row per call at this choke point, carrying purpose, model,
+# requested and actual tokens, estimated versus billed cost, latency and
+# failure category. Never a prompt, never a key, never a recipient: the row
+# describes the CALL, not what was said in it.
+API_COST_FILE = DATA_DIR / "api_cost.jsonl"
+API_COST_SCHEMA = 1
+
+
+def _api_price_per_mtok(which: str):
+    """USD per million tokens from the environment, or None.
+
+    There is deliberately NO built-in price table. A hand-typed price goes
+    stale silently and this repo does not carry numbers that trace to nothing,
+    so an unpriced call estimates nothing and says why. The model and the
+    token counts still land on the row, so a later reconciliation can price it
+    from the vendor's own invoice."""
+    raw = os.environ.get(f"API_PRICE_{which}_PER_MTOK", "").strip()
+    if not raw:
+        return None
     try:
-        key = purpose if purpose in ("chat", "probe") else "scheduled"
+        v = float(raw)
+    except ValueError:
+        return None
+    return v if v >= 0 else None
 
-        def bump(cur):
-            rec = cur if isinstance(cur, dict) else {}
-            if rec.get("date") != _et_today():
-                rec = {"date": _et_today(), "chat": 0, "scheduled": 0,
-                       "probe": 0}
-            rec[key] = int(rec.get(key) or 0) + 1
-            return rec
 
-        state_update(API_CALLS_KEY, bump)
+def _api_cost_row(purpose, counted, model, requested_max_tokens, usage,
+                  latency_ms, failure) -> dict:
+    """Build one cost row. Unknown is null WITH A REASON, never zero and never
+    an invented number: a row reporting 0 tokens for a call whose usage nobody
+    returned is a fabricated measurement, and this log exists to be evidence."""
+    from datetime import datetime, timezone
+    row = {
+        "schema_version": API_COST_SCHEMA,
+        "at_utc": datetime.now(timezone.utc).isoformat(),
+        "purpose": str(purpose or "")[:32],
+        "counted": bool(counted),
+        "model": None,
+        "requested_max_tokens": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "estimated_usd": None,
+        "billed_usd": None,
+        # the vendor's response carries no dollar figure, so this field can
+        # only be null here. It stays ON the row because Astra asked for
+        # estimated VERSUS billed, and a field that silently disappears reads
+        # as agreement between the two.
+        "billed_reason": "the API response does not return a billed cost",
+        "latency_ms": None,
+        "failure_category": failure or None,
+    }
+    if model:
+        row["model"] = str(model)[:64]
+    else:
+        row["model_reason"] = "the caller did not declare a model"
+    if isinstance(requested_max_tokens, (int, float)) \
+            and not isinstance(requested_max_tokens, bool):
+        row["requested_max_tokens"] = int(requested_max_tokens)
+    else:
+        row["requested_reason"] = "no max_tokens was declared for this call"
+    got = usage if isinstance(usage, dict) else {}
+    tin, tout = got.get("input_tokens"), got.get("output_tokens")
+    if isinstance(tin, (int, float)) and isinstance(tout, (int, float)):
+        row["input_tokens"], row["output_tokens"] = int(tin), int(tout)
+    else:
+        row["tokens_reason"] = "the response returned no usage block"
+    if isinstance(latency_ms, (int, float)) and not isinstance(latency_ms, bool):
+        row["latency_ms"] = round(float(latency_ms), 1)
+    else:
+        row["latency_reason"] = "the caller did not time this call"
+    p_in, p_out = _api_price_per_mtok("IN"), _api_price_per_mtok("OUT")
+    if row["input_tokens"] is None:
+        row["estimate_reason"] = "no token counts to price"
+    elif p_in is None or p_out is None:
+        row["estimate_reason"] = ("no price configured (set "
+                                  "API_PRICE_IN_PER_MTOK and "
+                                  "API_PRICE_OUT_PER_MTOK)")
+    else:
+        row["estimated_usd"] = round(
+            row["input_tokens"] / 1e6 * p_in
+            + row["output_tokens"] / 1e6 * p_out, 6)
+        row["estimate_basis"] = f"in={p_in}/Mtok out={p_out}/Mtok"
+    return row
+
+
+def api_note_call(purpose: str = "chat", *, counted: bool = True,
+                  model=None, requested_max_tokens=None, usage=None,
+                  latency_ms=None, failure=None) -> None:
+    """Count one paid call and write its cost row.
+
+    Called after the request goes out, so a refusal never counts, and never
+    raises: billing bookkeeping must not be able to break a reply.
+
+    counted=False writes the row WITHOUT touching the daily tally. A call the
+    vendor never billed (a policy refusal, a dead socket, a 500) is evidence
+    worth keeping, but counting it would quietly redefine what the daily cap
+    means, and that cap is a spending guard."""
+    try:
+        if counted:
+            key = purpose if purpose in ("chat", "probe") else "scheduled"
+
+            def bump(cur):
+                rec = cur if isinstance(cur, dict) else {}
+                if rec.get("date") != _et_today():
+                    rec = {"date": _et_today(), "chat": 0, "scheduled": 0,
+                           "probe": 0}
+                rec[key] = int(rec.get(key) or 0) + 1
+                return rec
+
+            state_update(API_CALLS_KEY, bump)
+    except Exception:
+        pass
+    try:
+        # the row is an OBSERVER: a failed append must never reach the reply
+        # path, and it is not durable, because an fsync per API call would put
+        # a disk flush in front of a human waiting on an answer
+        storage_io.append_jsonl(
+            API_COST_FILE,
+            _api_cost_row(purpose, counted, model, requested_max_tokens,
+                          usage, latency_ms, failure))
     except Exception:
         pass
 

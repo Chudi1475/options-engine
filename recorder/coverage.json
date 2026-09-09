@@ -1,0 +1,21 @@
+{
+ "scan_evaluations": 0,
+ "candidate_opportunities": 0,
+ "candidate_revisions": 0,
+ "samples_recorded": 2,
+ "samples_missing": 0,
+ "duplicate_samples": 0,
+ "out_of_order_samples": 0,
+ "dropped_samples": 0,
+ "write_failures": 0,
+ "provider_errors": 0,
+ "gaps": 0,
+ "events_recorded": 0,
+ "bytes_written": 2102,
+ "completeness": "complete",
+ "bytes_used": 2105,
+ "observations_live": 0,
+ "queue_depth": 0,
+ "last_sample_at_utc": "2026-09-09T14:00:16+00:00",
+ "updated_at_utc": "2026-09-09T11:47:54.035311+00:00"
+}

@@ -7,6 +7,7 @@ state.json so commands aren't replayed after a restart.
 
 import os
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 import requests
 
@@ -557,11 +558,45 @@ def send(text: str) -> list:
     return [f.result() for f in futures if f.result()]
 
 
+def _sent_at_utc(ts):
+    """When Telegram says the message was sent, in UTC, or None.
+
+    This is the REPORT time and it is never an execution time.
+    astra/RECORDER_SCHEMA.md record 5 is explicit: a missing fill time stays
+    missing, it does not become the message time. The two are carried in
+    different fields so nothing downstream can confuse them."""
+    try:
+        return datetime.fromtimestamp(int(ts), timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _reply_ref(msg: dict):
+    """The card this message is a reply to, or None.
+
+    W07 needs both halves. The message id is the exact link, and the replied
+    to TEXT is the fallback, because Telegram message ids are per chat: a
+    second recipient's reply to their own copy of a card carries an id this
+    process never saw, and only the body identifies it for them."""
+    r = msg.get("reply_to_message") or {}
+    if not r:
+        return None
+    return {"message_id": r.get("message_id"),
+            "text": (r.get("text") or r.get("caption") or "").strip(),
+            "from_bot": bool((r.get("from") or {}).get("is_bot"))}
+
+
 def _parse_update(upd: dict, authorized: set):
     """One Telegram update -> a message item, or None if it's not a message.
     Kinds: command, text, photo, document, unsupported, unknown (a sender
     not on the authorized list — surfaced so the owner can offer to add
-    them, but their message content is NOT processed)."""
+    them, but their message content is NOT processed).
+
+    Authorized items also carry the inbound message_id, the reply link and the
+    send time. Without the message id a replayed update becomes a second
+    reported trade (get_messages acks AFTER processing, so a crash replays);
+    without the reply link a bare "2 @ 1.35" cannot name WHICH alert it is
+    about. Both are additive: no existing key changed."""
     msg = upd.get("message") or {}
     chat = msg.get("chat", {})
     cid = str(chat.get("id", ""))
@@ -570,28 +605,34 @@ def _parse_update(upd: dict, authorized: set):
     if cid not in authorized:
         name = (f"{chat.get('first_name', '')} {chat.get('last_name', '')}".strip()
                 or chat.get("username") or "someone")
+        # a stranger's item stays exactly as bare as it was: no content, no
+        # reply link, nothing that could be acted on
         return {"chat_id": cid, "kind": "unknown", "name": name}
+    base = {"chat_id": cid,
+            "message_id": msg.get("message_id"),
+            "sent_at_utc": _sent_at_utc(msg.get("date")),
+            "reply_to": _reply_ref(msg)}
     text = (msg.get("text") or "").strip()
     if text.startswith("/"):
         parts = text.split(None, 1)
-        return {"chat_id": cid, "kind": "command",
-                "cmd": parts[0].lower().split("@")[0],
-                "args": parts[1].strip() if len(parts) > 1 else ""}
+        return dict(base, kind="command",
+                    cmd=parts[0].lower().split("@")[0],
+                    args=parts[1].strip() if len(parts) > 1 else "")
     if msg.get("photo"):  # Telegram orders sizes small->large; take the best
-        return {"chat_id": cid, "kind": "photo",
-                "file_id": msg["photo"][-1]["file_id"],
-                "mime": "image/jpeg",
-                "text": (msg.get("caption") or "").strip()}
+        return dict(base, kind="photo",
+                    file_id=msg["photo"][-1]["file_id"],
+                    mime="image/jpeg",
+                    text=(msg.get("caption") or "").strip())
     if msg.get("document"):
         d = msg["document"]
-        return {"chat_id": cid, "kind": "document", "file_id": d["file_id"],
-                "file_name": d.get("file_name", "file"),
-                "mime": d.get("mime_type", "application/octet-stream"),
-                "text": (msg.get("caption") or "").strip()}
+        return dict(base, kind="document", file_id=d["file_id"],
+                    file_name=d.get("file_name", "file"),
+                    mime=d.get("mime_type", "application/octet-stream"),
+                    text=(msg.get("caption") or "").strip())
     if text:
-        return {"chat_id": cid, "kind": "text", "text": text}
+        return dict(base, kind="text", text=text)
     if any(msg.get(k) for k in ("voice", "audio", "video", "video_note", "sticker")):
-        return {"chat_id": cid, "kind": "unsupported"}
+        return dict(base, kind="unsupported")
     return None
 
 

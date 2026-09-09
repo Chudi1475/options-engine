@@ -52,7 +52,20 @@ GUARDED = ("scanner.py", "cards.py", "assistant.py", "news.py", "risk_gate.py",
            # scanner appends straight into /health, which the owner reads on
            # his phone. Same case as storage_io: it never imports telegram, on
            # purpose, so the SENDERS scan cannot find it.
-           "event_journal.py")
+           "event_journal.py",
+           # trade_recorder's report_text is the coverage line scanner appends
+           # straight into /health, and its console lines are what the owner
+           # sees when the recorder queue saturates. Third module in the same
+           # category: it never imports telegram, deliberately, so the SENDERS
+           # scan cannot pull it in and it has to be listed by hand.
+           "trade_recorder.py",
+           # fill_journal writes every word of the fill lane's replies: the
+           # ack, the ambiguity question, the over close refusal and the
+           # coverage line scanner appends into /health. It never imports
+           # telegram BY DESIGN (a module that can text somebody is a module
+           # that can nag somebody), so the SENDERS scan cannot pull it in and
+           # it has to be listed by hand.
+           "fill_journal.py")
 
 EM_DASH = "—"
 

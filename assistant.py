@@ -176,6 +176,10 @@ def _end_billing_hold():
 
 _PROBE_INFLIGHT = threading.Lock()
 
+# What the last call through _post_anthropic did, per thread. Declared here,
+# above its first reader, because probe_billing reads it. See last_call_meta.
+_CALL_META = threading.local()
+
 
 def probe_billing_async(force: bool = False) -> bool:
     """Start a billing probe on a BACKGROUND thread and return immediately.
@@ -247,9 +251,26 @@ def _finish_forced(ok):
             print(f"forced probe callback failed: {e}")
 
 
+PROBE_STARTED = "started"        # this call put a probe in the air
+PROBE_JOINED = "joined"          # one was already in the air; we are parked on it
+PROBE_NOT_STARTED = "not_started"  # no probe exists and none was made
+
+
 def probe_billing_forced(on_done=None) -> bool:
+    """probe_billing_dispatch, reduced to "did THIS call start the probe".
+
+    Kept because that boolean is what the older callers and regressions read.
+    A caller that has to TELL somebody what happened must use the dispatch
+    function instead: False here means both "you joined one already running"
+    and "no probe exists at all", and answering a human from that ambiguity is
+    how /brain came to say "already checking" when nothing was checking."""
+    return probe_billing_dispatch(on_done) == PROBE_STARTED
+
+
+def probe_billing_dispatch(on_done=None) -> str:
     """Run a FORCED billing probe on a background thread and hand the verdict
-    to on_done(ok: bool) when it lands.
+    to on_done(ok) when it lands, where ok is True, False or None for "no
+    check was made". Returns PROBE_STARTED, PROBE_JOINED or PROBE_NOT_STARTED.
 
     This is the /brain path. The Telegram command dispatcher is the same
     thread that walks open positions for the half, the give-back trail and
@@ -262,18 +283,19 @@ def probe_billing_forced(on_done=None) -> bool:
 
     Single flight: a second /brain while one is still in the air starts no
     second probe and spends no second token. Its on_done is attached to the
-    one already running, so BOTH chats get the same fresh verdict. Returns
-    True when THIS call started the probe, False when it joined one."""
+    one already running, so BOTH chats get the same fresh verdict, and the
+    joined caller is told it joined rather than being handed the last
+    verdict."""
     global _FORCED_RUNNING
     with _FORCED_LOCK:
         if on_done is not None:
             _FORCED_WAITERS.append(on_done)
         if _FORCED_RUNNING:
-            return False
+            return PROBE_JOINED
         _FORCED_RUNNING = True
 
     def _run():
-        ok = False
+        ok = None
         try:
             # wait out an automatic probe rather than doubling the call. the
             # wait happens HERE, on the worker, never on the caller's thread.
@@ -284,8 +306,12 @@ def probe_billing_forced(on_done=None) -> bool:
                 if got:
                     _PROBE_INFLIGHT.release()
         except Exception as e:
+            # the probe blew up, so nothing came back. Reading the hold here
+            # and handing THAT back would report a verdict for a check that
+            # did not complete, which is the fabrication this whole path
+            # exists to avoid.
             print(f"forced billing probe failed: {e}")
-            ok = billing_hold() is None
+            ok = None
         finally:
             # clear the claim and drain every waiter with the SAME verdict, so
             # a /brain that joined mid-flight still gets an answer.
@@ -313,14 +339,25 @@ def probe_billing_forced(on_done=None) -> bool:
         _owner_note("Could not start the API check just now, so nothing was "
                     "asked. Nothing about a trade waits on it. Try /brain "
                     "again in a moment.")
-        return False
-    return True
+        return PROBE_NOT_STARTED
+    return PROBE_STARTED
 
 
-def probe_billing(force: bool = False) -> bool:
+def probe_billing(force: bool = False):
     """Ask the API whether the balance is back, with the smallest call that
-    exists: one token, cheapest model, no system prompt. True when the brain
-    is live again.
+    exists: one token, cheapest model, no system prompt.
+
+    Three answers, not two:
+      True   the API answered, the brain is live again
+      False  the API itself refused, so the balance really is still empty
+      None   NO ANSWER. Nothing left this process (API_MODE=off, the daily
+             policy, the rate-limit rest) or nothing came back (dead socket,
+             a 500, an unreadable body). Nothing about the balance is known.
+
+    That third case used to be False as well, and /brain rendered False as
+    "checked just now and the API still refused", which is a claim about a
+    request that was never sent. Same class of fabrication the Thread.start
+    fix removed, different path.
 
     Without this, a billing hold only ended when some OTHER call happened to
     succeed. With the nightly review switched off and nobody chatting, nothing
@@ -329,6 +366,8 @@ def probe_billing(force: bool = False) -> bool:
     daemon now runs this on the probe interval instead."""
     if not enabled() or billing_hold() is None:
         return billing_hold() is None
+    _CALL_META.last = None   # so a stale verdict from an earlier call on this
+                             # thread can never be read as this call's result
     # force is for an operator typing /brain: it skips the 6-hour interval so
     # the answer is a real check, not a replay of the last verdict.
     body, err = _post_anthropic(
@@ -339,8 +378,16 @@ def probe_billing(force: bool = False) -> bool:
         timeout=15, purpose="probe", force=force)
     # _post_anthropic clears the hold itself on a 200 and re-arms it on
     # another billing refusal, so there is nothing to do with the result here
-    # beyond reporting it.
-    return body is not None
+    # beyond reporting it honestly.
+    if body is not None:
+        return True
+    meta = last_call_meta()
+    if meta is None:
+        # the choke point was replaced (a stub in a test, or a future caller
+        # that does not stamp metadata). Fall back to the old reading rather
+        # than inventing a verdict from nothing.
+        return False
+    return False if meta.get("outcome") == "refused" else None
 
 
 def brain_status_line() -> str:
@@ -401,6 +448,41 @@ def _looks_like_usage_limit(status: int, err_type: str, err_msg: str,
     return False
 
 
+def last_call_meta():
+    """What the last _post_anthropic call ON THIS THREAD actually did:
+    {"outcome": ..., "failure": ...} where outcome is
+
+        "ok"        the API answered and we read it
+        "refused"   the API itself stated a refusal (billing, usage window)
+        "no_answer" we asked and learned nothing (dead socket, 5xx, a 200 we
+                    could not parse)
+        "not_sent"  no request ever left this process (spending policy, the
+                    rate-limit rest, the probe interval)
+
+    Thread local because the probe worker, the reply worker and the news
+    worker share this choke point at the same time, and None when a test has
+    replaced _post_anthropic with a stub.
+
+    This exists so a caller can tell a REFUSAL from a request that was never
+    sent. Collapsing those into one boolean is how /brain came to report
+    "checked just now and the API still refused" about a call nobody made."""
+    return getattr(_CALL_META, "last", None)
+
+
+def _record_call(purpose, outcome, failure=None, counted=False, model=None,
+                 requested=None, usage=None, latency_ms=None):
+    """Stamp this thread's call metadata and write the M12 cost row.
+
+    Never raises: config.api_note_call swallows its own faults, and the
+    metadata assignment cannot fail. The row carries the CALL, never the
+    prompt: `payload` is deliberately not passed in here at all, so there is
+    no path by which message content could reach the log."""
+    _CALL_META.last = {"outcome": outcome, "failure": failure}
+    config.api_note_call(purpose, counted=counted, model=model,
+                         requested_max_tokens=requested, usage=usage,
+                         latency_ms=latency_ms, failure=failure)
+
+
 def _post_anthropic(payload: dict, timeout: int, purpose: str = "chat",
                     force: bool = False):
     """Single choke point for every Claude call. Returns (body_dict, None) on
@@ -416,12 +498,21 @@ def _post_anthropic(payload: dict, timeout: int, purpose: str = "chat",
     the bot decided to spend on its own. Callers that do not say default to
     "chat", so a new caller can never accidentally get the cheaper-looking
     permissive path; it gets the one a human is entitled to."""
+    import time as _t
+    model = str(payload.get("model") or "") or None
+    requested = payload.get("max_tokens")
     allowed, why = config.api_allows(purpose)
     if not allowed:
+        # NOT SENT. The spending policy refused before any socket existed, so
+        # nothing about the vendor was learned and no caller may say otherwise.
+        _record_call(purpose, "not_sent", "policy_refused", model=model,
+                     requested=requested)
         return None, why
     left = cooldown_left_s()
     if left:
         h, m = divmod(left // 60, 60)
+        _record_call(purpose, "not_sent", "rate_limit_rest", model=model,
+                     requested=requested)
         return None, (f"brain is resting after a rate limit. Back in "
                       f"{h}h{m:02d}m (around {_resume_text()}).")
     hold = billing_hold()
@@ -431,6 +522,8 @@ def _post_anthropic(payload: dict, timeout: int, purpose: str = "chat",
         except (TypeError, ValueError):
             since_probe = BILLING_PROBE_S
         if since_probe < BILLING_PROBE_S and not force:
+            _record_call(purpose, "not_sent", "billing_hold", model=model,
+                         requested=requested)
             return None, OFFLINE_TEXT
         # Claim the probe slot BEFORE the request, not only when the API
         # refuses for money again. Otherwise any other outcome (a timeout, a
@@ -446,9 +539,11 @@ def _post_anthropic(payload: dict, timeout: int, purpose: str = "chat",
                     config.state_set(_BILLING_KEY, cur)
         except Exception:
             pass
-    import time as _t
     last_err = "unknown error"
     for attempt in range(3):
+        # monotonic, per the recorder schema: a container clock that jumps
+        # must not turn a 200 ms call into a negative latency
+        began = _t.monotonic()
         try:
             r = _api_session.post(
                 API_URL,
@@ -457,17 +552,32 @@ def _post_anthropic(payload: dict, timeout: int, purpose: str = "chat",
                 json=payload, timeout=timeout)
         except requests.RequestException as e:
             last_err = f"couldn't connect: {e}"
+            _record_call(purpose, "no_answer", "connection_error", model=model,
+                         requested=requested,
+                         latency_ms=(_t.monotonic() - began) * 1000)
             _t.sleep(min(2 ** attempt, 5))
             continue
+        took_ms = (_t.monotonic() - began) * 1000
         if r.status_code == 200:
             try:
                 body = r.json()
             except ValueError:
-                config.api_note_call(purpose)  # it billed even if we can't read it
+                # it billed even if we can't read it, so it counts. But an
+                # unreadable body is not an answer: nothing was learned about
+                # the balance and no caller may report one.
+                _record_call(purpose, "no_answer", "unreadable_body",
+                             counted=True, model=model, requested=requested,
+                             latency_ms=took_ms)
                 return None, "the model sent back something unreadable"
             if hold:
                 _end_billing_hold()
-            config.api_note_call(purpose)
+            _record_call(purpose, "ok", None, counted=True,
+                         model=(body.get("model") if isinstance(body, dict)
+                                else None) or model,
+                         requested=requested,
+                         usage=(body.get("usage")
+                                if isinstance(body, dict) else None),
+                         latency_ms=took_ms)
             return body, None
         try:
             err = r.json().get("error", {})
@@ -476,6 +586,10 @@ def _post_anthropic(payload: dict, timeout: int, purpose: str = "chat",
             err_type, err_msg = "", r.text[:200]
         retry_after = r.headers.get("retry-after")
         if _looks_like_billing(r.status_code, err_type, err_msg):
+            # REFUSED: the vendor itself said no. This is the one failure a
+            # caller is entitled to report as a refusal.
+            _record_call(purpose, "refused", "billing", model=model,
+                         requested=requested, latency_ms=took_ms)
             _start_billing_hold(err_msg or f"HTTP {r.status_code}")
             return None, OFFLINE_TEXT
         if _looks_like_usage_limit(r.status_code, err_type, err_msg,
@@ -484,6 +598,8 @@ def _post_anthropic(payload: dict, timeout: int, purpose: str = "chat",
                 stated = float(retry_after) + 120 if retry_after else None
             except (TypeError, ValueError):
                 stated = None
+            _record_call(purpose, "refused", "usage_limit", model=model,
+                         requested=requested, latency_ms=took_ms)
             _start_cooldown(err_msg or f"HTTP {r.status_code}", stated)
             return None, ("brain is resting after a rate limit, back around "
                           f"{_resume_text()}. Everything else keeps running.")
@@ -493,8 +609,14 @@ def _post_anthropic(payload: dict, timeout: int, purpose: str = "chat",
             except (TypeError, ValueError):
                 wait = 2 ** attempt * 2
             last_err = err_msg or f"HTTP {r.status_code}"
+            _record_call(purpose, "no_answer", "http_retry", model=model,
+                         requested=requested, latency_ms=took_ms)
             _t.sleep(wait)
             continue
+        # some other HTTP status. The server answered, but it answered about
+        # the request, not about the balance, so this is still not a refusal.
+        _record_call(purpose, "no_answer", "http_error", model=model,
+                     requested=requested, latency_ms=took_ms)
         return None, err_msg or f"HTTP {r.status_code}"
     return None, last_err
 MAX_TURNS = 24          # rolling memory per chat (deeper = smoother back-and-forth)

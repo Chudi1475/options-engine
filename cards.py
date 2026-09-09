@@ -464,8 +464,68 @@ def entry_card(setup, pos, quote, stats: dict, risk_mode: str,
                      f"{config.EXPIRY_WARN_MINUTES} min before close")
     lines.append("")
     lines.append(_winrate_footer(stats))
+    lines.append(FILL_HINT)
     lines.append("Your call.")
     return "\n".join(lines)
+
+
+# W07, the optional fill lane. ONE line, on the entry card only, and it says
+# out loud that ignoring it is fine. Astra section 5: do not ask the user to
+# trade merely to create evidence, and never nag. An exit card gets no version
+# of this: the worst moment to put a bookkeeping request in front of somebody
+# is while they are closing a losing trade.
+FILL_HINT = ("Optional: reply to this card with your fill, like  2 @ 1.35, "
+             "and I log it. Same when you close. No reply is fine and I do "
+             "not ask again.")
+
+
+def fills_card(cov: dict, rows: list, unknown_n: int = 0) -> str:
+    """/fills: what one person has told me their broker actually did.
+
+    Only the caller's own rows. Two users can report on one signal and those
+    are two execution experiences of ONE signal, not two trades and not each
+    other's business."""
+    lines = ["🧾 YOUR LOGGED FILLS",
+             "Reported by you. Not the bot's modeled result, which is a "
+             "different kind of number and is never added to these."]
+    if not rows:
+        lines.append("")
+        lines.append("Nothing logged yet. Reply to any alert card with "
+                     "your fill, like  2 @ 1.35, and it lands here.")
+    for r in rows:
+        u = r.get("me") or {}
+        name = r.get("symbol") or r.get("position_id") or "trade"
+        bought, sold = u.get("bought_quantity", 0), u.get("sold_quantity", 0)
+        line = f"{name}: bought {bought}, sold {sold}, open {u.get('open_quantity', 0)}"
+        rt = u.get("round_trip_cash_cents")
+        if rt is not None:
+            line += f", round trip {rt / 100:+.2f} dollars net of your fees"
+        elif u.get("status") == "partially_closed":
+            line += ", partially closed so there is no round trip yet"
+        lines.append(line)
+    lines.append("")
+    lines.append(f"Signals alerted: {cov.get('signals', 0)}. "
+                 f"With a report: {cov.get('signals_reported', 0)}. "
+                 f"No report: {unknown_n}.")
+    lines.append("No report means unknown, not that nothing happened. This "
+                 "lane is optional.")
+    lines.append("Your call.")
+    return "\n".join(lines)
+
+
+def fill_help_card() -> str:
+    """What /fill on its own answers. The whole interface, in five lines."""
+    return "\n".join([
+        "Logging a real fill is optional and it never changes a trade.",
+        "Open:  reply to the alert card with  2 @ 1.35",
+        "Close: reply to the exit card with  sold 2 @ 2.05",
+        "Fees:  add  fees 1.30 . Time: add  at 9:47 , which I read as ET "
+        "unless you say  9:47 ct . Leave it out and I record the time as "
+        "unknown rather than guessing.",
+        "Wrong? Reply  correction bought 3 @ 1.35 . I keep the old row and "
+        "mark it superseded.",
+        "See yours with /fills. Silence costs nothing.",
+    ])
 
 
 def _paper(pos) -> str:
@@ -559,6 +619,10 @@ def help_card() -> str:
         "(e.g. /aapl /nvda /btc /eth), or just ask me for a plan on it",
         "/health - bot self-check: feed, last heartbeat, today's alerts (owner)",
         "/score - your personal win/loss record (I keep it for you)",
+        "/fill 2 @ 1.35 - log what you ACTUALLY got filled at, optional. Or "
+        "just reply to the alert card with it. /fill on its own explains it",
+        "/fills - the fills you have logged, and how many signals nobody "
+        "reported on",
         "/adduser - let another person in (owner only)",
         "/users - see who has access (owner only)",
         "/test - fire a fake signal through every alert type",

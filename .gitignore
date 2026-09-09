@@ -36,3 +36,9 @@ ASTRA_PACKET_*.md
 # on a local run DATA_DIR defaults to the repo, so these would otherwise land
 # here. The daily files carry alert text; nothing about them belongs in git.
 events/
+
+# the per-call AI cost log (W04, gap M12). Same story: runtime state that lands
+# in the repo whenever DATA_DIR is unset, which is every suite run that does not
+# isolate one. It carries no prompt and no key, but it is a measurement of this
+# machine, not source.
+api_cost.jsonl
