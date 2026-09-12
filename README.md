@@ -90,7 +90,7 @@ the record is re-scored under the live window by `rescore_round6_session.py`.
 
 ```
 python backtest.py             # 60d of 5-min bars: old exit grid + per-setup stats
-python backtest_new_rules.py   # the LIVE exit rules (half at +25%, give-back 40 off peak, -90% stop)
+python backtest_new_rules.py   # the LIVE exit rules (half at +25%, give-back 40 off peak, -50% stop)
 python backtest_long.py        # 2y hourly cousin + 5y daily proxy (labeled)
 ```
 
