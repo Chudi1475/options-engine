@@ -45,7 +45,7 @@ What it does each trading day (ET):
 - **all day**, every alert becomes a tracked position (`positions.json`,
   survives restarts). The bot texts each exit step: **SELL HALF at +25%**,
   then the runner runs until it gives back 40 points from its peak
-  (example: +60% falling to +20%), **hard stop -90%**, and a **close-before-expiry**
+  (example: +60% falling to +20%), **hard stop -50%**, and a **close-before-expiry**
   warning 15 min before the bell. Each position also runs an
   old-rules (+10/-60) shadow sim on the same prices.
 - **Friday after close**, weekly scoreboard: live win rate, EV/trade,
