@@ -75,16 +75,14 @@ def holiday_card(closures: list, today: date, back_on: date) -> str:
 
 
 def half_day_card(day: date, reason: str, today: date) -> str:
-    """The evening-before note for a 13:00 ET close. A different message from a
-    full closure on purpose: trading still happens, the day is just short, and
-    calling a half day 'closed' would be wrong."""
+    """The evening-before note for a 12:00 PM CT early market close."""
     when = market_calendar.day_reference(day, today)
     return "\n".join([
         f"📅 SHORT DAY {when.upper()}",
         "",
         f"{when.capitalize()} is {reason}, so the market closes early at "
         "12:00 PM CT.",
-        "Setups still go out. Everything just wraps up at noon instead of 3.",
+        "Setups still go out. Everything just wraps up at noon instead of the usual 3:00 PM CT.",
     ])
 
 
