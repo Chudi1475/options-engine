@@ -1,4 +1,6 @@
 <!-- GENERATED FILE. Edit docs/templates/README.md.tmpl and run `python gen_docs.py`. Numbers come from strategy_spec. -->
+## Current status
+Running in paper + limited live. Hard stop at -50%. Position state survives restarts. Live stats replace backtest stats after sufficient closed trades. Single-instance only.
 
 # options-engine
 
