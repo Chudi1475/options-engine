@@ -1,17 +1,4 @@
-"""Market data with two backends:
-
-- yfinance (default): free, ~1 minute delayed, works for everything
-  including the SPX index (^GSPC).
-- Alpaca (optional): genuinely real-time IEX data for plain stocks.
-  Activates automatically when ALPACA_API_KEY + ALPACA_API_SECRET are set
-  (free paper account at alpaca.markets). Alpaca has NO index data on any
-  tier, so ^GSPC/^VIX always stay on yfinance. Any Alpaca error falls back
-  to yfinance for that call — same bars, just slower eyes.
-
-Both backends return the same shape: today's COMPLETED 5-minute bars with
-an America/New_York index and Open/High/Low/Close columns, so the strategy
-code cannot tell them apart.
-"""
+"""Market data with two backends: yfinance and Alpaca."""
 
 import os
 from datetime import datetime, time, timedelta
@@ -37,12 +24,19 @@ def _completed(df: pd.DataFrame, now: datetime) -> pd.DataFrame:
 
 
 def yf_today_bars(yf_symbol: str, now: datetime):
+    # Fix 1: Pass group_by and explicitly flatten columns to prevent Multi-Index errors
     df = yf.download(yf_symbol, period="1d", interval="5m",
-                     progress=False, auto_adjust=False)
+                     progress=False, auto_adjust=False, group_by="ticker")
     if df is None or df.empty:
         return None
-    if hasattr(df.columns, "levels"):
-        df.columns = df.columns.get_level_values(0)
+    
+    # Clean up multi-index columns if they exist
+    if isinstance(df.columns, pd.MultiIndex):
+        if yf_symbol in df.columns.levels[0]:
+            df = df[yf_symbol] # Isolate the target ticker slice
+        else:
+            df.columns = df.columns.get_level_values(0)
+            
     df.index = df.index.tz_convert(ET)
     df = _completed(df, now)
     return df if df is not None and not df.empty else None
@@ -51,20 +45,17 @@ def yf_today_bars(yf_symbol: str, now: datetime):
 def yf_latest_price(yf_symbol: str):
     try:
         df = yf.download(yf_symbol, period="1d", interval="1m",
-                         progress=False, auto_adjust=False)
+                         progress=False, auto_adjust=False, group_by="ticker")
         if df is None or df.empty:
             return None
-        if hasattr(df.columns, "levels"):
-            df.columns = df.columns.get_level_values(0)
+        if isinstance(df.columns, pd.MultiIndex) and yf_symbol in df.columns.levels[0]:
+            df = df[yf_symbol]
         return float(df["Close"].iloc[-1])
     except Exception:
         return None
 
 
 class AlpacaREST:
-    """Minimal Alpaca market-data client (free IEX feed). Real-time prices,
-    200 REST calls/min on the free tier — far more than this bot uses."""
-
     def __init__(self, key: str, secret: str):
         self.headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
 
@@ -90,10 +81,6 @@ class AlpacaREST:
         return df if not df.empty else None
 
     def latest_trade(self, symbol: str):
-        """(price, ET timestamp) of the newest IEX trade. IEX only prints
-        roughly 8:00-17:00 ET, so a caller quoting this as a LIVE price must
-        check the timestamp first: overnight and on weekends the 'latest'
-        trade can be hours or days old. Timestamp None = could not parse."""
         r = requests.get(f"{ALPACA_DATA}/v2/stocks/{symbol}/trades/latest",
                          params={"feed": "iex"}, headers=self.headers, timeout=10)
         r.raise_for_status()
@@ -112,7 +99,12 @@ class DataFeed:
     def __init__(self):
         key = os.environ.get("ALPACA_API_KEY", "").strip()
         secret = os.environ.get("ALPACA_API_SECRET", "").strip()
-        self.alpaca = AlpacaREST(key, secret) if key and secret else None
+        
+        # Fix 3: Ensure placeholder variables aren't blocking initialization
+        if key and secret and "YOUR_" not in key.upper():
+            self.alpaca = AlpacaREST(key, secret)
+        else:
+            self.alpaca = None
 
     def backend_for(self, yf_symbol: str) -> str:
         if self.alpaca and not yf_symbol.startswith("^"):
@@ -121,18 +113,22 @@ class DataFeed:
 
     def today_bars(self, yf_symbol: str, now: datetime):
         """Today's completed 5m bars, ET index. None if no data yet."""
-        if self.alpaca and not yf_symbol.startswith("^"):
+        # Fix 2: Skip Alpaca on weekends (Saturday=5, Sunday=6) to conserve API load
+        is_weekend = now.weekday() >= 5
+        
+        if self.alpaca and not yf_symbol.startswith("^") and not is_weekend:
             try:
                 bars = self.alpaca.today_bars_5m(yf_symbol, now)
                 if bars is not None:
                     return bars
-            except Exception:
-                pass  # fall back to yfinance
+            except Exception as e:
+                # Log the error tracking explicitly instead of hiding it silently
+                print(f"⚠️ Alpaca failed, falling back to yfinance: {e}")
+                pass
         return yf_today_bars(yf_symbol, now)
 
     def latest_price(self, yf_symbol: str):
-        """Freshest trade price available, for option-price estimates."""
-        if self.alpaca and not yf_symbol.startswith("^"):
+        if self.alpaca and not yf_symbol.startswith("^") and not now.weekday() >= 5:
             try:
                 return self.alpaca.latest_price(yf_symbol)
             except Exception:
