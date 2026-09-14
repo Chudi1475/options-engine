@@ -70,7 +70,7 @@ except ImportError:
 
 REPO = pathlib.Path(__file__).parent
 TMP = pathlib.Path(_TMP)
-SCHEMA_MD = REPO / "astra" / "RECORDER_SCHEMA.md"
+SCHEMA_MD = REPO / "docs" / "RECORDER_SCHEMA.md"
 
 failures = []
 
@@ -455,7 +455,8 @@ if fj is not None:
     per = (fj.reconcile("posA").get("by_user") or {}).get(U1) or {}
     check("W07f and only then is there a round trip to report",
           per.get("status") == "closed"
-          and per.get("round_trip_cash_cents") is not None, str(per))
+          and per.get("gross_round_trip_cash_cents") is not None
+          and per.get("round_trip_cash_cents") is None, str(per))
 else:
     for n in ("replying to an EXIT card is read as a close, not a second buy",
               "one of two contracts out leaves one open",
