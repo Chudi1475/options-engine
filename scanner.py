@@ -412,8 +412,23 @@ class Service:
                 # an unrecorded attempt is an evidence gap and is said out loud
                 self._journal_down(f"attempt line refused: {e}")
         try:
-            results = telegram.send_detailed(body, only_indices=wanted,
-                                             start_parts=start_parts)
+            if intent.kind == "catalyst_watch":
+                # Resolve saved recipient references against owners only. Global
+                # broadcast indices would send an owner watch to a member.
+                owners = {event_journal.recipient_ref(c): c for c in telegram.owner_ids()}
+                results = []
+                for delivery in intent.deliveries():
+                    if delivery.recipient_index not in wanted:
+                        continue
+                    cid = owners.get(delivery.recipient_ref)
+                    if cid is None:
+                        result = {"status":event_journal.FAILED,"error":"recipient no longer an owner"}
+                    else:
+                        result = telegram.send_to_detailed(cid, body, start_part=start_parts.get(delivery.recipient_index,0))
+                    results.append(dict(result, recipient_index=delivery.recipient_index))
+            else:
+                results = telegram.send_detailed(body, only_indices=wanted,
+                                                 start_parts=start_parts)
         except RuntimeError as e:      # e.g. no chat IDs configured
             print(f"journaled send failed ({e})")
             results = []
@@ -2230,7 +2245,7 @@ class Service:
     ADMIN_CMDS = {"/adduser", "/removeuser", "/users", "/risk", "/setaccount",
                   "/test", "/health", "/requests", "/approve", "/reject",
                   "/done", "/reqfrom", "/backlog", "/proposals", "/reload",
-                  "/brain", "/calendar", "/closed", "/open"}
+                  "/brain", "/calendar", "/closed", "/open", "/catalysts"}
 
     def run_command(self, cmd: str, args: str, chat_id: str = ""):
         if cmd in self.ADMIN_CMDS and not telegram.is_owner(chat_id):
@@ -2243,6 +2258,9 @@ class Service:
             # the worker texts the verdict back to whoever asked. the
             # ADMIN_CMDS gate above already turned away everyone but an owner.
             return self.cmd_brain(chat_id)
+        if cmd == "/catalysts":
+            import catalyst_watch
+            return catalyst_watch.summary_text()
         if cmd == "/calendar":
             return self.cmd_calendar()
         if cmd == "/adduser":
@@ -2886,8 +2904,8 @@ class Service:
             # number nobody increments.
             "strategy_version": f"momentum-{phash[:8]}",
             "source_commit": commit,
-            "deployment_id": os.environ.get("RAILWAY_DEPLOYMENT_ID", "")
-                             or deployment,
+            "deployment_id": os.environ.get("RAILWAY_DEPLOYMENT_ID", ""),
+            "deployment_id_reason": None if os.environ.get("RAILWAY_DEPLOYMENT_ID") else "runtime deployment identity unavailable; historical snapshot not substituted",
             "input_feed": self.feed.backend_for("SPY") + " 5m bars",
         }
         self._rec_ctx = ctx
@@ -2909,7 +2927,7 @@ class Service:
 
     def record_candidate(self, ticker, direction, bar_end, codes, values,
                          now, selected=False, position_id=None,
-                         gate_passed=False, candidate_id=None):
+                         gate_passed=False, candidate_id=None, decision_id=None):
         """One recorded opportunity. Wrapped whole, because a recorder fault
         may never end a trading cycle: this is an observer and it gets no vote
         on whether the bot scans.
@@ -2924,6 +2942,10 @@ class Service:
             return None
         try:
             ctx = self.recorder_context()
+            import shadow_gate
+            matching = (getattr(self, "backtest_new", None) or {}).get("per_setup", {}).get(f"{ticker}:{direction}")
+            shadow = shadow_gate.evaluate(legacy_passed=bool(gate_passed),
+                report=matching, expected_policy_hash=ctx["policy_hash"])
             return trade_recorder.record_candidate(
                 strategy_id="momentum", symbol=ticker, direction=direction,
                 session_date=str(now.date()),
@@ -2932,12 +2954,13 @@ class Service:
                 input_bar_end_utc=bar_end, input_values=values or {},
                 gate_passed=bool(gate_passed), reject_codes=codes or [],
                 selected=bool(selected), position_id=position_id,
-                candidate_id=candidate_id,
+                candidate_id=candidate_id, decision_id=decision_id,
                 strategy_version=ctx["strategy_version"],
                 policy_hash=ctx["policy_hash"],
                 source_commit=ctx["source_commit"],
                 deployment_id=ctx["deployment_id"],
-                input_feed=ctx["input_feed"])
+                input_feed=ctx["input_feed"], extra={"shadow_gate":shadow,
+                    "input_quality":getattr(self, '_candidate_quality', {}).get(ticker)})
         except Exception as e:                                 # noqa: BLE001
             print(f"{now:%H:%M:%S} recorder: candidate not recorded: {e}")
             return None
@@ -3011,6 +3034,11 @@ class Service:
                     self.record_candidate(ticker, None, None, ["no_bars"],
                                           {"feed": yfs}, now)
                     continue
+                try:
+                    from feed_quality import bar_quality
+                    self.__dict__.setdefault('_candidate_quality', {})[ticker] = bar_quality(bars, now)
+                except Exception:
+                    self.__dict__.setdefault('_candidate_quality', {})[ticker] = {'measurement_ready':False,'reasons':['quality_check_failed']}
                 setup = detect_setup(ticker, bars, now, self.cfg)
             except Exception as e:
                 print(f"{now:%H:%M:%S} {ticker}: data error: {e}")
@@ -3141,11 +3169,8 @@ class Service:
         # are not permission to fire another trade.
         bar_floor = now.replace(minute=now.minute - now.minute % 5, second=0,
                                 microsecond=0)
-        candidate_id = event_journal.candidate_id_for(
-            date=str(now.date()), ticker=setup.ticker,
-            direction=setup.direction, strike=setup.strike,
-            bar=bar_floor.isoformat(), spot=round(float(setup.spot), 4),
-            mom=round(float(setup.mom_pct), 4))
+        candidate_id = trade_recorder.candidate_key(
+            "momentum", setup.ticker, setup.direction, str(now.date()), bar_end)
         decision_id = event_journal.new_decision_id()
         position_id = f"{now:%Y%m%d-%H%M%S}-{setup.ticker}-{right}{setup.strike:g}"
         pos = Position(
@@ -3290,7 +3315,8 @@ class Service:
                 dict(gate_values, entry_source=entry_source,
                      entry_mid=pos.entry_mid, expiry=str(expiry_date),
                      risk_pct=pos.risk_pct, correlated=pos.correlated),
-                now, selected=True, gate_passed=True, position_id=pos.id)
+                now, selected=True, gate_passed=True, position_id=pos.id,
+                candidate_id=pos.candidate_id, decision_id=pos.decision_id)
             trade_recorder.observe(
                 contract_id=cid, contract_role=trade_recorder.CHOSEN,
                 candidate_id=rec_candidate, position_id=pos.id,
@@ -3404,6 +3430,9 @@ class Service:
                 # this keeps arriving until the common horizon so a later high
                 # is on the record rather than censored by the earlier exit.
                 flags.append("after_position_close")
+            if usable:
+                pos.last_mark_is_model = source.startswith("estimat")
+                pos.last_mark_basis = "black_scholes_estimate" if pos.last_mark_is_model else "quote_mid"
             return trade_recorder.record_sample(
                 candidate_id=cand, contract_id=cid,
                 contract_role=trade_recorder.CHOSEN, provider="yfinance",
@@ -3420,10 +3449,10 @@ class Service:
                 price_basis=("quote_mid" if live else
                              "black_scholes_estimate"
                              if source.startswith("estimat")
-                             else "last_known_price" if mark is not None
+                             else getattr(pos, "last_mark_basis", None) if mark is not None
                              else None),
-                is_model=(bool(source.startswith("estimat"))
-                          if mark is not None else None),
+                is_model=(True if source.startswith("estimat") else
+                          False if live else getattr(pos, "last_mark_is_model", None)),
                 quality_flags=flags,
                 missing_reason=(None if usable else
                                 ("stale_mark_carried" if mark is not None
@@ -4028,6 +4057,18 @@ class Service:
                     print(f"{fired_at:%H:%M:%S} sniper selection not recorded "
                           f"for {yfs}: {e}")
             results = self._deliver(intent, None, text=text)
+            try:
+                fill_journal.note_signal(position_id=position_id, candidate_id=cid or "",
+                    symbol=yfs, recipients=[dl.recipient_ref for dl in intent.deliveries()],
+                    alerted_at_utc=fired_at.astimezone(ZoneInfo("UTC")).isoformat())
+                trade_recorder.record_candidate(strategy_id="sniper",symbol=yfs,direction=d,
+                    session_date=day,decision_at_utc=fired_at.astimezone(ZoneInfo("UTC")).isoformat(),
+                    observed_at_utc=trade_recorder._utc_iso(),input_bar_end_utc=None,
+                    input_feed="sniper feed; see source read",input_values=dict(ticket),
+                    gate_passed=True,reject_codes=[],selected=True,position_id=position_id,
+                    candidate_id=cid,decision_id=decision_id)
+            except Exception as exc:
+                print(f"sniper observation incomplete: {exc}", flush=True)
             # ANY send attempt commits the reservation for good. An ambiguous
             # delivered request is not an unsent opportunity, so from here the
             # day key is terminal and nothing releases it.
@@ -4751,6 +4792,7 @@ class Service:
                         self.scan_entries(now)
                     if now.time() >= MONITOR_START:
                         self.monitor_positions(now)
+                    self.maybe_catalyst_watch(now)
                     self.flush_pending_bg()
                     self.handle_commands()
                     try:  # announce "brain is back" when the 5h05m wait ends
@@ -4801,16 +4843,74 @@ class Service:
             return
         try:
             trade_recorder.start()
-            trade_recorder.start_sampler(quotes.chain_snapshot)
+            def repair():
+                try:
+                    import evidence_repair
+                    result = evidence_repair.repair()
+                    if result['errors']: print('evidence recovery incomplete: ' + str(result['errors']), flush=True)
+                except Exception as exc:
+                    print('evidence recovery failed: ' + type(exc).__name__, flush=True)
+            threading.Thread(target=repair,name='evidence-repair',daemon=True).start()
+            trade_recorder.start_sampler(quotes.isolated_chain_snapshot)
         except Exception as e:                                 # noqa: BLE001
             print(f"recorder: could not start, continuing without it: {e}")
 
     def stop_recorder(self):
         try:
+            quotes.close_sampler_provider()
             trade_recorder.stop_sampler()
             trade_recorder.stop()
         except Exception as e:                                 # noqa: BLE001
             print(f"recorder: could not stop cleanly: {e}")
+
+    def maybe_catalyst_watch(self, now):
+        """Independent watch collection, never an order or a momentum gate."""
+        if self.dry or telegram.test_mode() or not telegram.may_write_shared_state():
+            return
+        if os.environ.get("CATALYST_WATCH_ENABLED", "true").lower() != "true":
+            return
+        thread = getattr(self, "_catalyst_worker", None)
+        if thread is not None and thread.is_alive():
+            return
+        last = getattr(self, "_catalyst_last", 0.0)
+        if time_mod.monotonic() - last < 3600:
+            return
+        self._catalyst_last = time_mod.monotonic()
+        def work():
+            provider = quotes.ChainProcess(timeout=120)
+            try:
+                result = provider.read("__catalyst__", "")
+                if telegram.may_write_shared_state():
+                    import catalyst_watch
+                    catalyst_watch.refresh_from_result(result)
+                    self.deliver_catalyst_watches(now)
+            except Exception as exc:
+                print(f"catalyst watch unavailable: {type(exc).__name__}", flush=True)
+            finally:
+                provider.close()
+        self._catalyst_worker = threading.Thread(target=work, name="catalyst-watch", daemon=True)
+        self._catalyst_worker.start()
+
+    def deliver_catalyst_watches(self, now):
+        import catalyst_watch
+        if self.dry or not telegram.may_write_shared_state():
+            return
+        owners = telegram.owner_ids()
+        if not owners:
+            return
+        for event in catalyst_watch.notice_events(now):
+            text = catalyst_watch.watch_text(event)
+            key = "catalyst:" + event["event_id"] + ":" + str(event["revision"])
+            intent = self._commit_intent("catalyst_watch", candidate_id=event["event_id"],
+                decision_id=key, position_id="", strategy_id="catalyst_watch",
+                payload={"event_id":event["event_id"], "revision":event["revision"], "actionable":False},
+                recipients=owners, text=text, event_key=key)
+            if intent is None or intent.duplicate:
+                continue
+            self._deliver(intent, None, text=text)
+            live = event_journal.get(intent.journal_id) or intent
+            if all(d.resolved for d in live.deliveries()):
+                event_journal.resolve(intent.journal_id)
 
     def daemon(self):
         # gagged before the first ownership answer. the window between process
@@ -4834,6 +4934,7 @@ class Service:
                     continue
                 # started here, not before the loop, so it also starts on a
                 # promotion. self-guards on is_alive, so repeats cost nothing.
+                self.maybe_catalyst_watch(now)
                 self.start_sniper_watch()  # gates itself to the US session window
                 if is_session_day(now.date()):
                     if time(9, 0) <= now.time() < time(9, 30) \
