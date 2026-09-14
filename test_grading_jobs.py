@@ -182,12 +182,12 @@ def grade(now=None):
 import pandas as pd  # noqa: E402
 
 
-def flat_bars(day=DAY, start_hh=10, n=12, hi=1.2000, lo=1.0000):
+def flat_bars(day=DAY, start_hh=9, n=84, hi=1.2000, lo=1.0000):
     """Wide bars: everything resolves on the first one."""
     idx = pd.date_range(f"{day} {start_hh:02d}:00", periods=n, freq="5min",
                         tz="America/New_York")
-    return pd.DataFrame({"Open": [1.1] * n, "High": [hi] * n,
-                         "Low": [lo] * n, "Close": [1.1] * n}, index=idx)
+    return pd.DataFrame({"Open": [min(hi,max(lo,1.1))] * n, "High": [hi] * n,
+                         "Low": [lo] * n, "Close": [min(hi,max(lo,1.1))] * n}, index=idx)
 
 
 def fx_evening(day=DAY, wake_hour=20):
@@ -197,7 +197,7 @@ def fx_evening(day=DAY, wake_hour=20):
     close, then the whole ladder taken out at `wake_hour`. This is exactly the
     row A21 is about: nothing the LIVE BOOK could ever have traded happens
     after the close, because the live book settled at 16:00."""
-    idx = pd.date_range(f"{day} 10:00", f"{day} 21:00", freq="5min",
+    idx = pd.date_range(f"{day} 09:30", f"{day} 21:00", freq="5min",
                         tz="America/New_York")
     hi = [1.1050 if t.hour >= wake_hour else 1.1022 for t in idx]
     return pd.DataFrame({"Open": [1.1020] * len(idx), "High": hi,
@@ -405,15 +405,15 @@ print("\n--- J2. the recorded output NAMES its denominator convention ---")
 # were compared as though they were the same number. Both are now published,
 # each labelled, so no reader has to guess which one a figure came from.
 reset()
-_win = cand(9, 50, 1.1020, 1.1008, symbol="EURUSD=X", ss=1)
-_horizon = cand(9, 55, 155.00, 154.00, symbol="JPY=X", ss=2)
+_win = cand(9, 50, 1.1020, 1.1008, symbol="EURUSD=X", ss=0)
+_horizon = cand(9, 55, 155.00, 154.00, symbol="JPY=X", ss=0)
 forward_ledger.mark_selected(_win, fired_at_et=f"{DAY} 09:50:07",
                              position_id="pos-win")
 forward_ledger.mark_selected(_horizon, fired_at_et=f"{DAY} 09:55:07",
                              position_id="pos-horizon")
 install_yf(FakeYF(plan={
     "EURUSD=X": flat_bars(hi=1.2000, lo=1.1015),      # target, never stopped
-    "JPY=X": flat_bars(hi=155.05, lo=154.50),         # neither level touched
+    "JPY=X": flat_bars(hi=155.05, lo=154.50, n=84),         # neither level touched
 }))
 _j2_res = grade()
 
@@ -543,9 +543,9 @@ print("\n--- J4. every due ID is partitioned exactly once ---")
 # all of them.
 reset()
 _ids = {
-    "ok": cand(9, 50, 1.1020, 1.1008, symbol="EURUSD=X", ss=1),
-    "down": cand(9, 51, 155.0, 154.0, symbol="JPY=X", ss=2),
-    "badframe": cand(9, 52, 300.0, 299.0, symbol="TSLA", ss=3),
+    "ok": cand(9, 50, 1.1020, 1.1008, symbol="EURUSD=X", ss=0),
+    "down": cand(9, 55, 155.0, 154.0, symbol="JPY=X", ss=0),
+    "badframe": cand(10, 0, 300.0, 299.0, symbol="TSLA", ss=0),
     "retired": cand(9, 53, 500.0, 499.0, symbol="SPY", day="2026-08-09"),
 }
 # the cohort is the rows that were actually BROADCAST, so a fixture that wants
@@ -644,8 +644,8 @@ guard("J4e a retired historical row is classified durably and never published",
 
 # write failure: no successful grade before a durable write
 reset()
-_w1 = cand(9, 50, 1.1020, 1.1008, symbol="EURUSD=X", ss=1)
-_w2 = cand(9, 51, 155.0, 154.0, symbol="JPY=X", ss=2)
+_w1 = cand(9, 50, 1.1020, 1.1008, symbol="EURUSD=X", ss=0)
+_w2 = cand(9, 55, 155.0, 154.0, symbol="JPY=X", ss=0)
 install_yf(FakeYF(default=flat_bars()))
 _real_write = forward_ledger._write_all
 forward_ledger._write_all = lambda records: False
@@ -1040,7 +1040,7 @@ guard("J7f the session loop hands the closed session to the grading job",
 
 
 def _j7_daemon_still_calls_it():
-    return "self.maybe_grade_forward(now)" in _src_scanner, "no daemon caller"
+    return "self.maybe_grade_forward(now)" in _src_scanner.split("    def daemon(self):", 1)[1].split("    def ", 1)[0], "no daemon caller"
 
 
 guard("J7g the daemon still calls the grading job", _j7_daemon_still_calls_it)
@@ -1050,8 +1050,8 @@ guard("J7g the daemon still calls the grading job", _j7_daemon_still_calls_it)
 print("\n--- J8. missing data, then recovery, through the real scheduler ---")
 # ==========================================================================
 reset()
-_j8a = cand(9, 50, 1.1020, 1.1008, symbol="EURUSD=X", ss=1)
-_j8b = cand(9, 51, 155.0, 154.0, symbol="JPY=X", ss=2)
+_j8a = cand(9, 50, 1.1020, 1.1008, symbol="EURUSD=X", ss=0)
+_j8b = cand(9, 55, 155.0, 154.0, symbol="JPY=X", ss=0)
 for _i, _cid in enumerate((_j8a, _j8b)):
     forward_ledger.mark_selected(_cid, fired_at_et=f"{DAY} 09:50:07",
                                  position_id=f"pos-j8-{_i}")
