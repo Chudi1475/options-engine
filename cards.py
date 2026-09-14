@@ -498,6 +498,8 @@ def fills_card(cov: dict, rows: list, unknown_n: int = 0) -> str:
         rt = u.get("round_trip_cash_cents")
         if rt is not None:
             line += f", round trip {rt / 100:+.2f} dollars net of your fees"
+        elif u.get("gross_round_trip_cash_cents") is not None:
+            line += f", round trip {u['gross_round_trip_cash_cents'] / 100:+.2f} dollars before fees; fees unknown"
         elif u.get("status") == "partially_closed":
             line += ", partially closed so there is no round trip yet"
         lines.append(line)
