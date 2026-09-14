@@ -118,11 +118,11 @@ def _ts_utc(ts):
 
 
 def chain_snapshot(underlying: str, expiry_date, now=None) -> dict:
-    """ONE read of one option chain, shaped for the recorder.
+    """One batched chain operation, shaped for the recorder.
 
     This is the batching Astra asks for: a chain read returns every strike and
     both rights for one expiry, so N contracts under observation on one expiry
-    cost ONE provider call rather than N. It is called from the recorder's own
+    may cost two HTTP requests for the initial expiry lookup, rather than N. It is called from the recorder's own
     thread and NEVER from the monitoring loop, because a synchronous chain read
     in front of a live stop is the one thing the recorder may not do.
 
@@ -143,6 +143,14 @@ def chain_snapshot(underlying: str, expiry_date, now=None) -> dict:
                              "minutes delayed"}
     chain = yf.Ticker(sym).option_chain(exp)   # may raise; the caller counts it
     out["received_at_utc"] = datetime.now(timezone.utc).isoformat()
+    under = getattr(chain, "underlying", None) or {}
+    out["underlying_price"] = under.get("regularMarketPrice")
+    stamp = under.get("regularMarketTime")
+    if stamp is not None:
+        try:
+            out["underlying_at_utc"] = datetime.fromtimestamp(float(stamp), timezone.utc).isoformat()
+        except (ValueError, TypeError, OverflowError):
+            pass
     for right, df in (("C", chain.calls), ("P", chain.puts)):
         if df is None:
             continue
@@ -171,3 +179,79 @@ def estimate_premium(spot: float, strike: float, right: str,
     backtest. Only used (and labeled) when no real quote is available."""
     T = max((expiry_dt - now).total_seconds(), 0) / (365.0 * 24 * 3600)
     return round(bs_price(spot, strike, T, sigma, right), 2)
+
+
+# The sampler must not share yfinance's cookie lock with the exit monitor.
+# A separate process owns its provider state. A failed worker is discarded;
+# the monitor never waits for this lock or this process.
+_ISOLATED = None
+
+def _chain_worker(pipe):
+    try:
+        while True:
+            request = pipe.recv()
+            if request is None: break
+            try:
+                if request[0] == '__catalyst__':
+                    from catalyst_watch import discover_events
+                    result = discover_events()
+                else:
+                    result = chain_snapshot(*request)
+                pipe.send((True, result))
+            except Exception as exc:
+                pipe.send((False, type(exc).__name__))
+    except (EOFError, BrokenPipeError, OSError):
+        pass
+    finally:
+        pipe.close()
+
+
+class ChainProcess:
+    def __init__(self, timeout=12.0, worker=None):
+        import threading
+        self.timeout=timeout
+        self.worker=worker or _chain_worker
+        self.lock=threading.Lock()
+        self.process=None
+        self.pipe=None
+
+    def close(self):
+        p,self.process=self.process,None
+        pipe,self.pipe=self.pipe,None
+        if pipe is not None: pipe.close()
+        if p is not None:
+            if p.is_alive(): p.terminate()
+            p.join(timeout=1)
+            if p.is_alive(): p.kill();p.join(timeout=1)
+
+    def read(self, underlying, expiry):
+        import multiprocessing
+        with self.lock:
+            try:
+                if self.process is None or not self.process.is_alive():
+                    self.close()
+                    ctx=multiprocessing.get_context('spawn')
+                    self.pipe,child=ctx.Pipe()
+                    self.process=ctx.Process(target=self.worker,args=(child,),daemon=True)
+                    self.process.start();child.close()
+                self.pipe.send((underlying,str(expiry)))
+                if not self.pipe.poll(self.timeout):raise TimeoutError('sampler provider timeout')
+                ok,result=self.pipe.recv()
+                if not ok:raise RuntimeError('sampler provider failed: '+result)
+                return result
+            except Exception:
+                self.close()
+                raise
+
+
+def isolated_chain_snapshot(underlying, expiry_date, now=None):
+    global _ISOLATED
+    if _ISOLATED is None: _ISOLATED=ChainProcess()
+    return _ISOLATED.read(underlying,expiry_date)
+
+
+def close_sampler_provider():
+    global _ISOLATED
+    if _ISOLATED is not None:
+        _ISOLATED.close()
+        _ISOLATED=None
