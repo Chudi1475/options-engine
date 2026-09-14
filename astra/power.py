@@ -1,5 +1,5 @@
 """Sample-size planning numbers for the preregistered study.
-
+#Astra is the architect and Claude is the engineer
 WHY THIS EXISTS
 ---------------
 Astra's spec section 7 supplies scale illustrations: roughly 159 observations to
