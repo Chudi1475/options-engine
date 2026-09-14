@@ -1,37 +1,27 @@
-"""Compare single-exit vs two-stage (half then full) exit styles on the same
-entries. Answers: is adding a second profit point on top of the first smarter?"""
+"""Offline regression of the existing exit policy. No data download or tuning."""
+import os,tempfile,unittest
+os.environ['BOT_TEST_MODE']='1'
+os.environ['DATA_DIR']=tempfile.mkdtemp(prefix='kelbot_exit_fixture_')
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import positions,config
 
-import os as _bot_test_os  # NO TEST MAY EVER TEXT A REAL PERSON:
-_bot_test_os.environ["BOT_TEST_MODE"] = "1"  # telegram.test_mode()
-# turns every outbound send into a no-op. Set BEFORE any repo import,
-# because assistant/scanner DM the owner on the billing paths.
-import sys
-
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-from backtest import load_data, metrics, run_backtest
-from strategy import StrategyConfig
-
-CONFIGS = [
-    ("current: all out at +15, stop -60",            None, 15, -60),
-    ("half at +15, rest to +40, stop -60",             15, 40, -60),
-    ("half at +15, rest to +60, stop -60",             15, 60, -60),
-    ("half at +15, rest to +120, stop -60",            15, 120, -60),
-    ("half at +25, rest to +90, stop -50",             25, 90, -50),
-    ("kelechi's stated: half +60, full +120, stop -30", 60, 120, -30),
-]
-
-base = StrategyConfig(direction="call")
-print("Loading data once...")
-intraday, daily = load_data(base)
-
-print(f"{'style':<48} {'win%':>6} {'expect':>8} {'P&L':>10} {'maxDD':>10}")
-for name, half, full, stop in CONFIGS:
-    cfg = StrategyConfig(direction="call")
-    cfg.take_half_pct = float(half) if half is not None else None
-    cfg.take_full_pct = float(full)
-    cfg.stop_pct = float(stop)
-    trades, _ = run_backtest(cfg, intraday, daily)
-    m = metrics(trades)
-    print(f"{name:<48} {m['win_rate']:>5.1f}% {m['expectancy_pct']:>+7.1f}% "
-          f"{m['total_pnl']:>9,.0f} {m['max_drawdown']:>9,.0f}")
+class ExistingExitPolicyTests(unittest.TestCase):
+ def position(self):
+  return positions.Position(id='fixture',date='2026-09-09',time_et='10:00:00',ticker='SPY',direction='call',right='C',strike=640,expiry='2026-09-11',entry_mid=1,entry_source='quote')
+ def step(self,p,pct,comparable=True):
+  return positions.step(p,datetime(2026,9,9,10,5,tzinfo=ZoneInfo('America/New_York')),1+pct/100,'quote',None,False,positions.DEFAULT_OLD_BRACKET,comparable)
+ def test_half_then_trail_keeps_weighted_result(self):
+  p=self.position();half=config.TP_HALF_PCT+1;peak=half+50;end=peak-config.RUNNER_GIVEBACK_PCT
+  self.assertEqual(self.step(p,half)[0]['type'],'sell_half')
+  self.step(p,peak);self.assertEqual(p.state,'half_sold')
+  self.assertEqual(self.step(p,end)[0]['type'],'runner_trail')
+  self.assertAlmostEqual(p.final_pnl_pct,(half+end)/2,places=2)
+ def test_observed_stop_gap_is_not_clipped_to_threshold(self):
+  p=self.position();observed=max(-100,config.STOP_PCT-5)
+  self.assertEqual(self.step(p,observed)[0]['type'],'stop')
+  self.assertAlmostEqual(p.final_pnl_pct,observed,places=2)
+ def test_incomparable_mark_does_not_take_half(self):
+  p=self.position();events=self.step(p,config.TP_HALF_PCT+50,False)
+  self.assertFalse(any(e['type']=='sell_half' for e in events));self.assertEqual(p.state,'open')
+if __name__=='__main__':unittest.main()
