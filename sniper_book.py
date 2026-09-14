@@ -474,3 +474,11 @@ def record() -> dict:
         "total_r": total_r,
         "avg_r": round(total_r / n, 3) if n else None,
     }
+
+
+def research_grade(entry, stop, direction, targets, bars, entry_at, horizon_at):
+    """Versioned common-horizon research; does not replace live step()."""
+    from grading_contract import evaluate_bars
+    return evaluate_bars(entry=entry, stop=stop, direction=direction,
+                         targets=targets, bars=bars, entry_at=entry_at,
+                         horizon_at=horizon_at)
