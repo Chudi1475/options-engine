@@ -68,7 +68,7 @@ except ImportError:
 
 REPO = pathlib.Path(__file__).parent
 TMP = pathlib.Path(_TMP)
-SCHEMA_MD = REPO / "astra" / "RECORDER_SCHEMA.md"
+SCHEMA_MD = REPO / "docs" / "RECORDER_SCHEMA.md"
 
 failures = []
 
@@ -419,7 +419,8 @@ if clean():
           all(k.startswith("observed_") or k in
               ("contract_id", "candidate_id", "samples", "cadence_s",
                "first_sample_at_utc", "last_sample_at_utc", "caveat",
-               "observation_end_utc", "complete")
+               "observation_end_utc", "complete", "coverage_note",
+               "modeled_samples", "quote_samples")
               for k in summ),
           str(sorted(summ)))
     check("W06e the summary carries the unobserved spike caveat",
