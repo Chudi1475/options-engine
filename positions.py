@@ -87,6 +87,8 @@ class Position:
                                # the first mark, so a pure-loser reports its real
                                # (negative) peak instead of a fake 0%
     mae_pct: float = None      # max adverse excursion (worst % seen)
+    last_mark_is_model: bool | None = None
+    last_mark_basis: str | None = None
     last_mark: float = None
     last_mark_pct: float = None
     last_mark_source: str = ""
