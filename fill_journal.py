@@ -42,6 +42,7 @@ It never opens a file itself. storage_io is the write protocol for this repo.
 """
 
 import hashlib
+import math
 import json
 import re
 import uuid
@@ -528,9 +529,15 @@ def record_fill(user_ref, position_id, candidate_id="", contract_id="",
             "this file is where that distinction is kept.")
     if buy_or_sell not in (BUY, SELL):
         raise ValueError(f"buy_or_sell must be {BUY} or {SELL}")
-    if quantity is None or int(quantity) != quantity or int(quantity) <= 0:
+    if isinstance(quantity, bool) or quantity is None or int(quantity) != quantity or int(quantity) <= 0:
         raise ValueError("quantity must be a positive whole number of "
                          "contracts. One contract cannot sell half.")
+    for name, value in [('fill_price', fill_price), ('fees', fees)]:
+        if name == 'fees' and value is None: continue
+        if isinstance(value, bool) or value is None or not math.isfinite(float(value)) or float(value) < 0:
+            raise ValueError(name + ' must be a finite nonnegative number')
+    if isinstance(multiplier,bool) or not isinstance(multiplier,int) or multiplier <= 0:
+        raise ValueError('positive integer multiplier required')
     reported = reported_at_utc or _utc_iso()
     row = {
         "schema_version": SCHEMA_VERSION,
@@ -543,7 +550,8 @@ def record_fill(user_ref, position_id, candidate_id="", contract_id="",
         "buy_or_sell": buy_or_sell,
         "quantity": int(quantity),
         "fill_price": float(fill_price),
-        "fees": (float(fees) if fees is not None else 0.0),
+        "fees": (float(fees) if fees is not None else None),
+        "fees_reason": None if fees is not None else "not_reported",
         # unknown is null WITH A REASON. The message time is a different fact
         # and is recorded in its own field; it never stands in for this one.
         "executed_at_utc": executed_at_utc,
@@ -564,7 +572,7 @@ def record_fill(user_ref, position_id, candidate_id="", contract_id="",
         "source_message_ref": str(source_message_ref or ""),
         "symbol": str(symbol or ""),
         "content_key": str(content_key or ""),
-        "fees_cents": _fee_cents(fees),
+        "fees_cents": _fee_cents(fees) if fees is not None else None,
         "premium_cents": _premium_cents(fill_price, multiplier) * int(quantity),
     }
     res = storage_io.append_jsonl(path_for("fills", _et_day(reported)), row)
@@ -617,6 +625,9 @@ def note_signal(position_id, candidate_id="", contract_id="", symbol="",
     silences looks like two out of two, and "no reply means unknown" has
     nothing to be unknown about."""
     at = alerted_at_utc or _utc_iso()
+    prior = [r for r in read_records('signals', _et_day(at)) if r.get('position_id') == str(position_id)]
+    if prior:
+        return prior[-1]
     row = {
         "schema_version": SCHEMA_VERSION,
         "signal_id": _new_id("s"),
@@ -673,6 +684,8 @@ def _user_reconciliation(rows) -> dict:
                     for r in rows if r["buy_or_sell"] == BUY)
     sell_cents = sum(int(r.get("premium_cents") or 0) - int(r.get("fees_cents") or 0)
                      for r in rows if r["buy_or_sell"] == SELL)
+    fees_known = bool(rows) and all(r.get("fees_cents") is not None
+                                  and 'fees_reason' in r for r in rows)
     fees = sum(int(r.get("fees_cents") or 0) for r in rows)
     open_q = bought - sold
     if not rows:
@@ -693,7 +706,10 @@ def _user_reconciliation(rows) -> dict:
         "bought_quantity": bought, "sold_quantity": sold,
         "open_quantity": open_q,
         "bought_cash_cents": -buy_cents, "sold_cash_cents": sell_cents,
-        "fees_cents": fees, "round_trip_cash_cents": round_trip,
+        "fees_cents": fees if fees_known else None,
+        "known_fees_cents": fees, "fees_complete": fees_known,
+        "gross_round_trip_cash_cents": (round_trip + fees) if round_trip is not None else None,
+        "round_trip_cash_cents": round_trip if fees_known else None,
         "status": status,
         "reconciles": open_q >= 0 and all(
             int(r.get("quantity") or 0) == r.get("quantity") for r in rows),
@@ -769,6 +785,7 @@ def coverage() -> dict:
         "signals_reported": len([p for p in by_pos if p in reported]),
         "signals_unknown": len(unknown),
         "execution_experiences": len(exps),
+        "orphan_reported_positions": sorted(reported - set(by_pos)),
         "recipients_alerted": alerted,
         "recipients_unreported": silent,
         "fills_recorded": len(fills()),
@@ -1172,7 +1189,7 @@ def _supersede(prior, **changes) -> dict:
         "buy_or_sell": prior.get("buy_or_sell"),
         "quantity": prior.get("quantity"),
         "fill_price": prior.get("fill_price"),
-        "fees": prior.get("fees"),
+        "fees": prior.get("fees") if 'fees_reason' in prior else None,
         "executed_at_utc": prior.get("executed_at_utc"),
         "executed_at_reason": prior.get("executed_at_reason"),
         "executed_at_zone": prior.get("executed_at_zone") or "",
