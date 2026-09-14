@@ -159,7 +159,8 @@ def _env_var_names():
 def build():
     head = _git("rev-parse", "HEAD")
     parent = _git("rev-parse", "HEAD^")
-    dirty = _git("status", "--porcelain")
+    dirty = _git("status", "--porcelain", "--", ".",
+                 ":(exclude)release_manifest.json")
     tests = _gate_tests()
 
     tracked = _git("ls-files")
@@ -187,7 +188,8 @@ def build():
     }
 
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "artifact_policy": "Generated after source commit; never committed. Rebuild and verify in the deployment environment.",
         "generated_by": "release_manifest.py",
         "hand_edited": False,
         "source": {
