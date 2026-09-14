@@ -42,3 +42,11 @@ events/
 # isolate one. It carries no prompt and no key, but it is a measurement of this
 # machine, not source.
 api_cost.jsonl
+recorder/
+fills/
+catalyst_data/
+research_output/
+release_manifest.json
+release_evidence/
+
+sniper_forward_grading.jsonl
