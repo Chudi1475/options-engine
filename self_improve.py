@@ -235,7 +235,9 @@ def run_checks(files: list) -> bool:
                      # over close, the late correction, the silence that stays
                      # unknown rather than becoming no trade, and two users
                      # reporting one signal.
-                     "test_fill_journal.py"):
+                     "test_fill_journal.py",
+                     "test_completion.py", "test_research_contracts.py",
+                     "test_finish_integration.py"):
             r = subprocess.run([PYEXE, test], cwd=REPO, timeout=600,
                                capture_output=True, text=True, errors="replace")
             if r.returncode != 0:
