@@ -494,6 +494,7 @@ try:
 finally:
     if proc.poll() is None:
         proc.kill()
+    proc.wait(timeout=15)
     try:
         proc.stdout.close()
     except Exception:
@@ -575,6 +576,7 @@ try:
 finally:
     if rproc.poll() is None:
         rproc.kill()
+    rproc.wait(timeout=15)
     try:
         rproc.stdout.close()
     except Exception:
