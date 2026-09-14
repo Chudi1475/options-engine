@@ -266,11 +266,11 @@ guard("R01d: exactly one observation becomes the selected entry",
 import pandas as pd  # noqa: E402
 
 
-def _bars_for(day="2026-09-08", start_hh=10, n=12, hi=1.2000, lo=1.0000):
+def _bars_for(day="2026-09-08", start_hh=9, n=84, hi=1.2000, lo=1.0000):
     idx = pd.date_range(f"{day} {start_hh:02d}:00", periods=n, freq="5min",
                         tz="America/New_York")
-    return pd.DataFrame({"Open": [1.1] * n, "High": [hi] * n,
-                         "Low": [lo] * n, "Close": [1.1] * n}, index=idx)
+    return pd.DataFrame({"Open": [min(hi,max(lo,1.1))] * n, "High": [hi] * n,
+                         "Low": [lo] * n, "Close": [min(hi,max(lo,1.1))] * n}, index=idx)
 
 
 class _FakeYF(types.ModuleType):
