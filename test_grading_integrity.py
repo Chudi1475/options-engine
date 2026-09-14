@@ -185,11 +185,11 @@ def grade(now=None):
 import pandas as pd  # noqa: E402
 
 
-def bars(day=DAY, start_hh=10, n=12, hi=1.2000, lo=1.0000):
+def bars(day=DAY, start_hh=9, n=84, hi=1.2000, lo=1.0000):
     idx = pd.date_range(f"{day} {start_hh:02d}:00", periods=n, freq="5min",
                         tz="America/New_York")
-    return pd.DataFrame({"Open": [1.1] * n, "High": [hi] * n,
-                         "Low": [lo] * n, "Close": [1.1] * n}, index=idx)
+    return pd.DataFrame({"Open": [min(hi,max(lo,1.1))] * n, "High": [hi] * n,
+                         "Low": [lo] * n, "Close": [min(hi,max(lo,1.1))] * n}, index=idx)
 
 
 def fx_day(day=DAY):
@@ -198,7 +198,7 @@ def fx_day(day=DAY):
     Quiet between the stop and the first target all the way through the equity
     close, then the whole ladder taken out at 20:00 ET. Nothing about this row
     is decided at 16:12, and everything about it is decided by 20:05."""
-    idx = pd.date_range(f"{day} 10:00", f"{day} 21:00", freq="5min",
+    idx = pd.date_range(f"{day} 09:30", f"{day} 21:00", freq="5min",
                         tz="America/New_York")
     hi = [1.1050 if t.hour >= 20 else 1.1022 for t in idx]
     return pd.DataFrame({"Open": [1.1020] * len(idx), "High": hi,
