@@ -117,9 +117,9 @@ REASON_CODES = {
     "chain_read_failed":
         "the provider call for this expiry raised, so nothing was observed "
         "for any contract on it this pass",
-    "no_underlying_price":
-        "the feed gave no underlying price this cycle, so the bot could not "
-        "price the contract at all",
+    "no_underlying_price": "the underlying price was not supplied for this observation",
+    "no_underlying_timestamp": "no timestamp was supplied for the underlying observation",
+    "committed_decision_id_missing": "a commitment exists but its decision identity is missing",
     "stale_mark_carried":
         "no live option price this cycle; the bot carried its last known mark "
         "and this sample is not a fresh observation",
@@ -381,12 +381,12 @@ def _enqueue(kind: str, record: dict) -> bool:
         _bump("dropped_samples")
         with _LOCK:
             n = _COUNTS["dropped_samples"]
-            say = n == 1 or n - _DROP_SAID[0] >= 500
+            say = True  # every lost record reaches platform logs even if the disk is down
             if say:
                 _DROP_SAID[0] = n
         if say:
             print(f"recorder: queue full, {n} records lost so far. Evidence "
-                  "completeness is degraded for this session.")
+                  "completeness is degraded for this session.", flush=True)
         return False
 
 
@@ -421,16 +421,22 @@ def stop(timeout: float = 5.0):
     t = _WRITER[0]
     if t is not None and t.is_alive():
         t.join(timeout=timeout)
+    if t is not None and t.is_alive():
+        _bump('gaps')
+        print('recorder: writer shutdown deadline exceeded; existing owner retained', flush=True)
+        return False
     _WRITER[0] = None
     drain_once(budget_s=timeout)
     _persist_coverage(force=True)
     _save_observations()
+    return True
 
 
 def _writer_loop():
     while not _STOP.is_set():
         try:
             drain_once(block_s=0.5)
+            _persist_coverage()
         except Exception as e:                                 # noqa: BLE001
             # the writer thread is the last line. It may not die, because a
             # dead writer turns every later sample into a silent loss.
@@ -511,18 +517,31 @@ def _persist_coverage(force: bool = False):
     window, and stop() forces it."""
     with _LOCK:
         snapshot = tuple(sorted(_COUNTS.items()))
-        due = (force or snapshot != _PERSIST[1]
-               or (_now_s() - _PERSIST[0]) >= COVERAGE_PERSIST_S)
+        prior_counts = dict(_PERSIST[1])
+        lost_changed = any(_COUNTS[k] != prior_counts.get(k, 0) for k in
+                           ("dropped_samples", "write_failures", "gaps"))
+        due = (force or lost_changed or (snapshot != _PERSIST[1] and
+               (_now_s() - _PERSIST[0]) >= COVERAGE_PERSIST_S))
         if not due:
             return
         _PERSIST[0] = _now_s()
         _PERSIST[1] = snapshot
-    storage_io.write_json(path_for("coverage"), coverage())
+    result = storage_io.write_json(path_for("coverage"), coverage())
+    if not result.ok:
+        _bump("write_failures")
+        print("recorder: coverage checkpoint failed; completeness is unknown until reconciled", flush=True)
+        with _LOCK:
+            _PERSIST[1] = ()
 
 
 # ---------------------------------------------------------------------------
 # record 1: event identity and decision
 # ---------------------------------------------------------------------------
+def candidate_key(strategy_id, symbol, direction, session_date, bar_end):
+    """One observation identity shared by journal, recorder and fills."""
+    return "cnd" + _sha(f"{strategy_id}|{symbol}|{direction}|{session_date}|{bar_end}")[:14]
+
+
 def _fingerprint(values, gate_passed, reject_codes, selected) -> str:
     def _round(v):
         if isinstance(v, float):
@@ -558,11 +577,13 @@ def record_candidate(*, strategy_id, symbol, direction, session_date,
     opportunity or a silent overwrite. Scan evaluations are counted separately
     so both numbers stay available."""
     key = f"{strategy_id}|{symbol}|{direction}|{session_date}|{input_bar_end_utc}"
+    if input_bar_end_utc is None:
+        key += "|" + ",".join(sorted(reject_codes or []))
     cid = candidate_id or ("cnd" + _sha(key)[:14])
     fp = _fingerprint(input_values, gate_passed, reject_codes, selected)
     with _LOCK:
         prior = _CANDIDATES.get(key)
-        if prior is not None and prior["fingerprint"] == fp:
+        if prior is not None and prior["fingerprint"] == fp and prior["id"] == cid:
             return prior["id"]                # the same bar, unchanged
         revision = 0 if prior is None else prior["revision"] + 1
         _CANDIDATES[key] = {"id": cid, "revision": revision, "fingerprint": fp}
@@ -570,7 +591,7 @@ def record_candidate(*, strategy_id, symbol, direction, session_date,
         _COUNTS["candidate_revisions"] += (0 if prior is None else 1)
     missing = []
     if decision_id is None:
-        missing.append("no_decision_id")
+        missing.append("committed_decision_id_missing" if selected else "no_decision_id")
     row = {
         "schema_version": SCHEMA_VERSION, "record": "candidate",
         "candidate_id": cid, "decision_id": decision_id,
@@ -637,6 +658,9 @@ def record_sample(*, candidate_id, contract_id, contract_role, provider, feed,
             if sha == last["sha"]:
                 flags.append("identical_to_previous")
             _bump("duplicate_samples")
+        elif provider_at_utc is None and sha == last["sha"]:
+            flags.append("unchanged_without_timestamp")
+            _bump("duplicate_samples")
         elif (provider_at_utc is not None and last["provider_at"] is not None
                 and str(provider_at_utc) < str(last["provider_at"])):
             flags.append("out_of_order_provider")
@@ -648,6 +672,10 @@ def record_sample(*, candidate_id, contract_id, contract_role, provider, feed,
     with _LOCK:
         _LAST[contract_id] = {"provider_at": provider_at_utc,
                               "received_at": received_at_utc, "sha": sha}
+    if underlying_price is None:
+        reasons.append("no_underlying_price")
+    if underlying_at_utc is None:
+        reasons.append("no_underlying_timestamp")
     if provider_at_utc is None:
         reasons.append("no_provider_timestamp")
     if bid is None or ask is None:
@@ -966,11 +994,15 @@ def save_observations():
 
 
 def _save_observations():
-    storage_io.write_json(path_for("observations"),
+    result = storage_io.write_json(path_for("observations"),
                           {"schema_version": SCHEMA_VERSION,
                            "saved_at_utc": _utc_iso(),
                            "observations": observations(),
                            "pending_controls": pending_controls()})
+    if not result.ok:
+        _bump("write_failures")
+        print("recorder: observation registry write failed; paths may be incomplete", flush=True)
+    return result.ok
 
 
 def _resolve_controls(req, snap, now_iso) -> int:
@@ -1027,12 +1059,12 @@ def _resolve_controls(req, snap, now_iso) -> int:
                    "spot_at_decision": req["spot"],
                    "decision_at_utc": req.get("decision_at_utc"),
                    "grid_read_at_utc": grid_at,
-                   "selection_is_price_blind": True,
+                   "selection_is_price_blind": True, "selection_used_later_grid": True,
                    "selection_note":
                        "the rule reads the listed strike grid, the chosen "
                        "strike and the spot at the decision, and no price at "
                        "all, so resolving it against a grid read after the "
-                       "decision cannot let a later price choose the control"})
+                       "decision avoids price selection, but later listing changes can still bias it; replay must check grid timing"})
         n += 1
     # Every quote the rule had in front of it, so a later reader can confirm
     # that no future information could have entered the selection.
@@ -1056,7 +1088,9 @@ def _resolve_controls(req, snap, now_iso) -> int:
             pool.add((right, s))
     for (right, strike) in sorted(pool):
         cell = cells.get((right, strike)) or {}
-        if strike is None:
+        observed_keys = {(o.get("right"), o.get("strike")) for o in observations()
+                         if o.get("candidate_id") == req["candidate_id"]}
+        if strike is None or (right, strike) in observed_keys:
             continue
         pool_id = contract_id_for(req["underlying"], right, strike,
                                   req["expiry_date"])
@@ -1064,7 +1098,7 @@ def _resolve_controls(req, snap, now_iso) -> int:
             candidate_id=req["candidate_id"], contract_id=pool_id,
             contract_role=SELECTION_POOL, provider=snap.get("provider"),
             feed=snap.get("feed"), provider_at_utc=snap.get("provider_at_utc"),
-            received_at_utc=snap.get("received_at_utc") or now_iso,
+            received_at_utc=snap.get("received_at_utc"),
             requested_at_utc=snap.get("requested_at_utc"),
             bid=cell.get("bid"), ask=cell.get("ask"),
             bid_size=cell.get("bid_size"), ask_size=cell.get("ask_size"),
@@ -1077,7 +1111,7 @@ def _resolve_controls(req, snap, now_iso) -> int:
             observation_end_utc=req["observation_end_utc"],
             position_id=req.get("position_id"),
             extra={"selection_for": req["candidate_id"],
-                   "selection_is_price_blind": True,
+                   "selection_is_price_blind": True, "selection_used_later_grid": True,
                    "selection_pool_width": SELECTION_POOL_WIDTH,
                    "selection_was_chosen": (right, strike) in picked_strikes})
     return n
@@ -1150,6 +1184,18 @@ def _resume_state():
     sample_sequence is deliberately NOT resumed. It is monotonic within one
     process life, and rebuilding it would mean reading the whole day of samples
     at every boot to learn a number that received_at_utc already orders."""
+    try:
+        previous = json.loads(path_for("coverage").read_text())
+    except FileNotFoundError:
+        previous = {}
+    except (OSError, ValueError):
+        previous = {"gaps": 1, "write_failures": 1}
+    with _LOCK:
+        for name in _zero_counts():
+            _COUNTS[name] = max(_COUNTS[name], int(previous.get(name, 0) or 0))
+        # A checkpoint cannot prove the unflushed tail survived process death.
+        if previous:
+            _COUNTS["gaps"] += 1
     _load_contracts()
     _load_candidates()
     return _load_observations()
@@ -1173,6 +1219,8 @@ def _load_candidates():
         key = (f"{row.get('strategy_id')}|{row.get('symbol')}|"
                f"{row.get('direction')}|{row.get('session_date')}|"
                f"{row.get('input_bar_end_utc')}")
+        if row.get("input_bar_end_utc") is None:
+            key += "|" + ",".join(sorted(row.get("reject_codes") or []))
         rev = int(row.get("revision") or 0)
         with _LOCK:
             prior = _CANDIDATES.get(key)
@@ -1249,6 +1297,7 @@ def sample_once(chain_fn, now=None) -> int:
     for (under, exp), rows in groups.items():
         try:
             snap = chain_fn(under, exp, now=now)
+            if not isinstance(snap, dict): raise ValueError('invalid provider response')
         except Exception as e:                                 # noqa: BLE001
             _bump("provider_errors")
             snap = None
@@ -1259,8 +1308,8 @@ def sample_once(chain_fn, now=None) -> int:
                     candidate_id=o.get("candidate_id"),
                     contract_id=o.get("contract_id"),
                     contract_role=o.get("contract_role"),
-                    provider="unknown", feed="unknown", provider_at_utc=None,
-                    received_at_utc=now_iso, requested_at_utc=now_iso,
+                    provider="yfinance", feed="yahoo option chain", provider_at_utc=None,
+                    received_at_utc=None, requested_at_utc=now_iso,
                     bid=None, ask=None, bid_size=None, ask_size=None,
                     underlying_price=None, underlying_at_utc=None,
                     price_basis=None, is_model=None, quality_flags=["no_read"],
@@ -1302,7 +1351,7 @@ def sample_once(chain_fn, now=None) -> int:
         for o in rows:
             key = (str(o.get("right") or "")[:1], float(o.get("strike") or 0))
             cell = cells.get(key)
-            miss = None if cell else "no_chain_row"
+            miss = snap.get("missing_reason") if cell else "no_chain_row"
             cell = cell or {}
             record_sample(
                 candidate_id=o.get("candidate_id"),
@@ -1369,7 +1418,12 @@ def stop_sampler(timeout: float = 3.0):
     t = _SAMPLER[0]
     if t is not None and t.is_alive():
         t.join(timeout=timeout)
+    if t is not None and t.is_alive():
+        _bump('gaps')
+        print('recorder: sampler shutdown deadline exceeded; existing owner retained', flush=True)
+        return False
     _SAMPLER[0] = None
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1523,11 +1577,14 @@ def path_summary(candidate_id, contract_id) -> dict:
     A15 is about, one level down."""
     rows = [r for r in read_records("samples")
             if r.get("contract_id") == contract_id
-            and (candidate_id is None or r.get("candidate_id") == candidate_id)]
+            and (candidate_id is None or r.get("candidate_id") == candidate_id)
+            and r.get("contract_role") != SELECTION_POOL]
     rows.sort(key=lambda r: (r.get("received_at_utc") or "",
                              r.get("sample_sequence") or 0))
+    from feed_quality import quote_quality
     marks = [(r.get("mark"), r.get("provider_at_utc") or r.get("received_at_utc"))
-             for r in rows if r.get("mark") is not None]
+             for r in rows if r.get("mark") is not None
+             and r.get("is_model") is False and r.get("price_basis") == "quote_mid"]
     stamps = [r.get("received_at_utc") for r in rows if r.get("received_at_utc")]
     cadence = None
     if len(stamps) > 1:
@@ -1554,7 +1611,13 @@ def path_summary(candidate_id, contract_id) -> dict:
         "observed_max_mark": hi[0], "observed_max_at_utc": hi[1],
         "observed_min_mark": lo[0], "observed_min_at_utc": lo[1],
         "observed_missing_samples": missing,
-        "complete": bool(rows) and missing == 0,
+        "complete": (bool(rows) and missing == 0 and len(marks) == len(rows)
+                     and all(quote_quality(r)['eligible_for_execution_research'] for r in rows)
+                     and bool(stamps) and bool(rows[-1].get("observation_end_utc"))
+                     and stamps[-1] >= rows[-1]["observation_end_utc"]),
+        "modeled_samples": sum(r.get("is_model") is True for r in rows),
+        "quote_samples": len(marks),
+        "coverage_note": "Observed marks only. Missing timestamps, model marks or incomplete horizons prevent complete status.",
         "caveat": _CAVEAT,
     }
 
