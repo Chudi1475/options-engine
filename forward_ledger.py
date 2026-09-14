@@ -27,7 +27,7 @@ whose rules are inferred afterwards is not a measurement:
 import contextlib
 import json
 import math
-from datetime import date as _date, datetime
+from datetime import date as _date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import config
@@ -122,7 +122,7 @@ HORIZON_POLICY = "session_close_v1"
 HORIZON_BASIS = (
     "the ET session close of the row's own day (13:00 on a half day). This is "
     "the clock the live sniper book settles on (sniper_book.SETTLE_ET), so the "
-    "forward ledger and the live book grade the same trade. Quotes printed "
+    "research uses this clock; legacy live polling may include later prints. Quotes printed "
     "after it are outside the declared strategy horizon and are not evidence.")
 
 # class: what kind of instrument it is. quotes: when it actually prints, which
@@ -587,6 +587,16 @@ def _walk_outcome(rec: dict, bars, horizon: dict = None) -> dict:
     (every tier resolved before the horizon) or 'horizon' (the declared
     horizon arrived with a tier still open). 'horizon' is the row the live book
     calls a session-end exit, and those are NOT flat: see CONVENTIONS."""
+    if horizon and horizon.get("iso"):
+        from grading_contract import evaluate_bars, frame_bars
+        start = datetime.fromisoformat(f"{rec['date']}T{rec['time_et']}").replace(tzinfo=ET)
+        result = evaluate_bars(entry=rec["entry"], stop=rec["stop"],
+            direction=rec["direction"], targets=rec["targets"], bars=frame_bars(bars),
+            entry_at=start, horizon_at=horizon["iso"])
+        result.update(horizon_at=horizon["iso"], horizon_policy=horizon["policy"], horizon_basis=horizon["basis"],
+            horizon_et=horizon.get("et"),instrument=horizon.get("instrument"),
+            graded_at=f"{datetime.now(ET):%Y-%m-%d %H:%M}")
+        return result
     sign = 1 if rec["direction"] == "BUY" else -1
     entry, stop = rec["entry"], rec["stop"]
     risk = rec["risk"]
@@ -815,6 +825,8 @@ def _grading_result(eligible=0, graded=0, unresolved=0, pending=0,
         and all(tally.get(f, 0) == res[f] for f in
                 ("graded", "pending", "missing_data", "failed_writes",
                  "permanent_failures")))
+    if statuses is not None and not res['partition_ok']:
+        res.update(complete=False, job_complete=False, measurement_complete=False)
     res["statuses"] = dict(statuses or {})
     # the partition goes in the audit line too, not just the counts. Astra's
     # acceptance bar is that every due id ends in a counted status, and a claim
@@ -972,7 +984,7 @@ def fill_outcomes(now_et: datetime = None) -> dict:
                 # stamps a 5m bar at its OPEN, so the last bar of a 16:00 session
                 # is the one stamped 15:55 and a bar stamped 16:00 covers trading
                 # the live book never held. sniper_book walks the same last bar.
-                bars = df[(df.index > start) & (df.index < day_end)]
+                bars = df[(df.index >= start) & (df.index < day_end)]
             except Exception as e:
                 # the ONE statement in this loop that used to sit outside every
                 # try. a frame the vendor hands back with a naive or non
@@ -984,6 +996,12 @@ def fill_outcomes(now_et: datetime = None) -> dict:
                 missing_data += 1
                 print(f"forward_ledger: unusable frame for {symbol} "
                       f"{r.get('time_et')} ({e}); left for the next pass")
+                continue
+            if bars.empty and start >= day_end - timedelta(minutes=5) and now >= day_end:
+                retired[_row_key(r)] = _retired_outcome(
+                    "no complete post-entry bar before declared horizon", now)
+                permanent_failures += 1
+                statuses[_row_key(r)] = STATUS_RETIRED
                 continue
             if bars.empty:
                 # the signal day has no bars yet (grading the same evening on
@@ -998,6 +1016,9 @@ def fill_outcomes(now_et: datetime = None) -> dict:
                 missing_data += 1
                 print(f"forward_ledger: walk failed for {symbol} "
                       f"{r.get('time_et')} ({e}); left for the next pass")
+                continue
+            if oc.get("terminal") == "missing" and now >= day_end:
+                missing_data += 1
                 continue
             if not _outcome_is_final(oc, day_end, now):
                 # the walk ran out of bars with tiers still open and the row's
@@ -1161,11 +1182,12 @@ def scoreboard() -> dict:
     # a retired row carries an outcome so the grader stops retrying it, but it
     # is evidence of nothing: it must reach neither a numerator nor a
     # denominator here. see _retired_outcome.
-    records = [r for r in _cohort(_read_all())
+    all_records = _read_all()
+    records = [r for r in _cohort(all_records)
                if r.get("outcome") and not _is_retired(r)]
     tiers = {"t04": "0.4R (the live, verified target)",
-             "t1": "1R (needs >50 of 100 to beat 0.4R)",
-             "t2": "2R (needs >33 of 100 to beat 0.4R)",
+             "t1": "1R research target",
+             "t2": "2R research target",
              "liq": "structure target (the big one)"}
     out = {
         "n": len(records), "tiers": {}, "sibling": None,
@@ -1185,6 +1207,26 @@ def scoreboard() -> dict:
             "strategy_version": STRATEGY_VERSION,
         },
     }
+    policies = {}
+    versions = {}
+    for row in records:
+        version = row['outcome'].get('grading_version') or 'legacy_unspecified'
+        versions[version] = versions.get(version,0)+1
+        policy = row["outcome"].get("horizon_policy") or "legacy_unspecified"
+        policies[policy] = policies.get(policy, 0) + 1
+    out["horizon"]["policy"] = next(iter(policies)) if len(policies) == 1 else "mixed"
+    out["horizon"]["policies"] = policies
+    out["horizon"]["basis"] = "Per-row declared horizons; legacy outcomes retain unknown provenance."
+    out['grading_versions'] = versions
+    out['entry_edge_established'] = False
+    out['research_note'] = 'Underlying bar research, not executable option returns or proof of a live entry edge.'
+    out["coverage"] = {"all_candidates":len(all_records),
+        "cohort":len(_cohort(all_records)), "graded":len(records),
+        "retired":sum(_is_retired(r) for r in all_records),
+        "ungraded":sum(r.get("outcome") is None for r in all_records)}
+    out["by_horizon"] = {p:{k:_tier_conventions([r for r in records if
+        (r["outcome"].get("horizon_policy") or "legacy_unspecified")==p], k)
+        for k in tiers} for p in policies}
     for k, label in tiers.items():
         graded = [r for r in records
                   if r["outcome"]["hit"].get(k) is not None]
@@ -1213,7 +1255,9 @@ def scoreboard() -> dict:
         # zero-cost binary breakeven for 0.4R. Changing the denominator under a
         # pre-committed bar would be re-scoping the rule after the fact.
         "convention": HEADLINE_CONVENTION,
-        "promote": n >= SIBLING_MIN_TRADES and lb > BREAKEVEN_04R,
+        "promote": (n >= SIBLING_MIN_TRADES and lb > BREAKEVEN_04R
+                    and set(policies) == {HORIZON_POLICY}
+                    and set(versions) == {'research_session_v1'}),
         "all_rows": _tier_conventions(sib, "t04")["all_rows"],
     }
     return out
@@ -1224,8 +1268,10 @@ def nightly_summary() -> str:
     when there is nothing new to say."""
     sb = scoreboard()
     if not sb["n"]:
-        return ""
-    lines = [f"Sniper forward record: {sb['n']} live signals graded so far."]
+        return f"Sniper forward coverage: {sb['coverage']}"
+    lines = [f"Sniper forward record: {sb['n']} tracked research candidates graded so far.",
+             f"Horizon groups: {sb['horizon']['policies']}. Coverage: {sb['coverage']}.",
+             f"Grading versions: {sb['grading_versions']}. {sb['research_note']}"]
     t = sb["tiers"]
     for k in ("t04", "t1", "t2", "liq"):
         s = t[k]
@@ -1239,8 +1285,8 @@ def nightly_summary() -> str:
     both = t["t04"]["conventions"]
     lines.append(
         f"Counted as {both['resolved_only']['formula']}, session end left out. "
-        f"{horizon_exits} of {sb['n']} reached neither level by the session "
-        "close; counting those in the denominator the way the backtest does "
+        f"{horizon_exits} of {sb['n']} reached neither level by their recorded "
+        "horizon; counting those in the denominator the way the backtest does "
         f"makes 0.4R {both['all_rows']['wins']} of {both['all_rows']['n']}. "
         "Those exits are not flat.")
     sib = sb["sibling"]
@@ -1248,10 +1294,10 @@ def nightly_summary() -> str:
         need = SIBLING_MIN_TRADES - sib["n"]
         if sib["promote"]:
             lines.append(
-                f"PROMOTION READY: the stricter sibling config hit "
+                f"RESEARCH THRESHOLD MET: the stricter sibling config hit "
                 f"{sib['wins']} of {sib['n']} with a safety-adjusted floor of "
                 f"{sib['wilson_lb']:.0f} of 100 (bar: {BREAKEVEN_04R:.0f}). "
-                "Tell Chudi to flip it live.")
+                "Costs and executable performance still need separate validation.")
         else:
             lines.append(
                 f"Sibling config (stricter entries): {sib['wins']} of "
