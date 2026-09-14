@@ -262,6 +262,11 @@ def try_acquire(budget_s: float = ACQUIRE_BUDGET_S) -> str:
     with _lock:
         if _fd is not None and _owner_pid == os.getpid():
             return "held"
+        if _fd is not None:
+            # A forked child closes its inherited handle without unlocking the parent.
+            os.close(_fd)
+            _fd = None
+            _owner_pid = None
         if _msvcrt is None and _fcntl is None:
             return "unavailable"
         try:
@@ -322,11 +327,14 @@ def release():
     excludes nobody, and then two copies both believe they own the token."""
     global _fd, _owner_pid
     with _lock:
+        owned = _owner_pid == os.getpid()
         fd, _fd = _fd, None
         _owner_pid = None
         if fd is None:
             return
         try:
+            if not owned:
+                return
             os.lseek(fd, 0, os.SEEK_SET)
             if _msvcrt is not None:
                 _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
