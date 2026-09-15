@@ -69,6 +69,13 @@ STOP_PCT = _f("STOP_PCT", -50.0)             # sell EVERYTHING when the option i
                                              # stop-out still costs
                                              # RISK_PER_TRADE_PCT, so each position
                                              # is about 1.8x the size it was at -90.
+if not -100.0 < STOP_PCT < 0.0:
+    # a stop at or below -100 can never fire (no option mark goes under zero)
+    # and one at or above zero fires on any red mark, so an env value like that
+    # is a typo, not a strategy: say so and use the default instead
+    print(f"config: STOP_PCT {STOP_PCT:g} is outside -100 to 0, using "
+          f"{DEFAULT_STOP_PCT:g}")
+    STOP_PCT = DEFAULT_STOP_PCT
 RUNNER_GIVEBACK_PCT = _f("RUNNER_GIVEBACK_PCT", 40.0)  # after banking half at +25%,
                                              # let the runner RUN; sell it only when
                                              # it gives back this many points from its

@@ -175,12 +175,23 @@ class HardStopTests(unittest.TestCase):
         self.assertEqual(p.old_rules["exit_reason"], "old stop")
 
     def test_malformed_stamp_falls_back_to_the_live_setting(self):
-        for bad in (float("nan"), float("inf"), float("-inf"), True, 0, 5.0, None, "-50"):
+        for bad in (float("nan"), float("inf"), float("-inf"), True, 0, 5.0, None, "-50",
+                    -100.0, -150.0):
             with self.subTest(bad=bad):
                 p = new_position("bad")
                 p.stop_pct = bad
                 self.assertIsNone(positions.stamped_stop(p))
                 self.assertEqual(positions.stop_level(p), config.STOP_PCT)
+
+    def test_stamp_at_or_below_minus_100_still_gets_a_stop_that_can_fire(self):
+        p = new_position("too-wide")
+        p.stop_pct = -150.0
+        self.assertEqual(types(step(p, -50.0)), ["stop"])
+
+    def test_env_stop_outside_minus_100_to_0_falls_back_to_the_default(self):
+        for raw in ("-150", "-100", "0", "5"):
+            with self.subTest(raw=raw):
+                self.assertEqual(stop_in_child({"STOP_PCT": raw}), config.DEFAULT_STOP_PCT)
 
     # --- rows saved before the stamp existed --------------------------------
 

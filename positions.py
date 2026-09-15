@@ -161,10 +161,11 @@ LEGACY_STOP_PCT = -90.0
 def stamped_stop(pos):
     """The stop stamped on this position at entry, or None when there is no
     usable stamp: a closed row from before stamps existed, or a malformed hand
-    edited value (NaN, a bool, zero, a gain, text)."""
+    edited value (NaN, a bool, zero, a gain, text). A stamp at or below -100
+    is unusable too: no option mark goes under zero, so it could never fire."""
     v = getattr(pos, "stop_pct", None)
     if (isinstance(v, (int, float)) and not isinstance(v, bool)
-            and math.isfinite(v) and v < 0):
+            and math.isfinite(v) and -100 < v < 0):
         return float(v)
     return None
 
