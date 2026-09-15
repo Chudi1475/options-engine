@@ -684,12 +684,12 @@ class Service:
         already made, never a new one: no quote is fetched, no gate is
         re-evaluated and no threshold is consulted."""
         try:
-            allowed = {f.name for f in poslib.fields(Position)}
-            row = {k: v for k, v in (intent.payload.get("position") or {}).items()
-                   if k in allowed}
+            row = dict(intent.payload.get("position") or {})
             if not row.get("id"):
                 return None, False
-            pos = Position(**row)
+            # same loader as positions.json, so a row journaled before the stop
+            # was stamped comes back with the stop it opened under
+            pos = poslib.position_from_row(row)
         except (TypeError, ValueError, AttributeError) as e:
             print(f"replay could not rebuild the position for "
                   f"{intent.journal_id}: {e}")
@@ -2786,8 +2786,12 @@ class Service:
             lines.append("Open positions:")
             for p in open_pos:
                 pct = p.last_mark_pct if p.last_mark_pct is not None else 0.0
+                # each trade's own stop: an open row can carry a stop from
+                # before the live setting moved, and /status is also what the
+                # chat brain reads as the bot's state
                 lines.append(f"  {cards.contract_str(p)}: {pct:+.1f}% "
-                             f"({p.state}, in since {ct_hm(p.time_et)} CT)")
+                             f"({p.state}, in since {ct_hm(p.time_et)} CT, "
+                             f"stop {poslib.stop_level(p):g}%)")
         else:
             lines.append("Open positions: none")
         return "\n".join(lines)
@@ -3613,6 +3617,8 @@ class Service:
                 # goes out, and the degradation is recorded as an evidence gap.
                 self._journal_down(f"exit intent for {pos.id}: {e}")
             print(f"{now:%H:%M:%S} {pos.ticker}: {ev['type']} at {ev['pct']:+.1f}%")
+            if ev["type"] == "stop":
+                print(self.hard_stop_line(now, pos, ev, source))
             if intent is None:
                 degraded.append(text)
             elif intent.duplicate and intent.any_attempt():
@@ -3644,6 +3650,16 @@ class Service:
         # rather than a hopeful one. Nothing above waits on this.
         self._record_exit_events(pos, now, events, source, sample_id, journaled)
 
+    @staticmethod
+    def hard_stop_line(now, pos, ev, source) -> str:
+        """The console line for a fired hard stop: which trade, live or paper,
+        where it was marked and the stop it was judged under (its own stamp,
+        which can differ from the live setting)."""
+        stop = ev.get("stop_pct", poslib.stop_level(pos))
+        return (f"{now:%H:%M:%S} HARD STOP fired: {pos.id} "
+                f"{'paper' if pos.paper else 'live'} at {ev['pct']:+.1f}% "
+                f"against its {stop:g}% stop ({source})")
+
     def _record_exit_events(self, pos, now, events, source, sample_id,
                             journaled):
         """The exit, the exact quote that fired it, and where the card went.
@@ -3661,7 +3677,7 @@ class Service:
                 live = event_journal.get(intent.journal_id) or intent
                 by_leg[(live.payload or {}).get("leg")] = live
             thresholds = {"sell_half": config.TP_HALF_PCT,
-                          "stop": config.STOP_PCT,
+                          "stop": poslib.stop_level(pos),
                           "runner_trail": config.RUNNER_GIVEBACK_PCT}
             for ev in events:
                 intent = by_leg.get(ev["type"])
@@ -5014,7 +5030,10 @@ class Service:
         pos.half_exit = {"time": "10:05:00", "pct": 27.3, "mark": 5.60}
         msgs.append(cards.trail_card(pos, {"pct": 18.0, "total_pct": 22.7,
                                            "source": src}))
-        msgs.append(cards.stop_card(pos, {"pct": -31.2, "source": src}))
+        # the sample stop sits just past the stop the sample card states, so
+        # the example never shows a stop firing before its own level
+        sample_stop = max(-100.0, poslib.stop_level(pos) - 1.2)
+        msgs.append(cards.stop_card(pos, {"pct": sample_stop, "source": src}))
         msgs.append(cards.expiry_card(pos, {"pct": -8.0, "source": src}))
         for i, msg in enumerate(msgs, 1):
             tagged = (f"🧪 TEST {i}/5: EXAMPLE ONLY, NOT A REAL ALERT 🧪\n\n{msg}")

@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta
 import config
 import fvg
 import market_calendar
+import positions as poslib
 import strategy_spec
 
 TIERS = [
@@ -456,7 +457,7 @@ def entry_card(setup, pos, quote, stats: dict, risk_mode: str,
     lines.append(f"2️⃣ let the rest RUN. I text you to sell when its gain drops "
                  f"{gb:g} points from its peak "
                  f"({strategy_spec.get().giveback_example()})")
-    lines.append(f"3️⃣ STOP: {config.STOP_PCT:g}% → sell everything")
+    lines.append(f"3️⃣ STOP: {poslib.stop_level(pos):g}% → sell everything")
     if expiry == today:
         lines.append(f"4️⃣ expires today → I warn you "
                      f"{config.EXPIRY_WARN_MINUTES} min before close")
@@ -564,6 +565,7 @@ def stop_card(pos, ev: dict) -> str:
         f"{_paper(pos)}🛑 STOP: SELL EVERYTHING",
         f"{contract_str(pos)} is down {ev['pct']:+.0f}% from your "
         f"${pos.entry_mid:.2f} entry ({ev['source']}).",
+        f"That hits the {poslib.stop_level(pos):g}% hard stop.",
         "Sell it all now. The stop is the stop. One ignored stop "
         "erases a week of wins.",
         "Your call.",

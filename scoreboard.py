@@ -28,7 +28,7 @@ from pathlib import Path
 
 import config
 import strategy_spec
-from positions import PositionBook, valid_bracket
+from positions import PositionBook, stamped_stop, valid_bracket
 
 REPORTS_DIR = Path(__file__).parent / "reports"
 
@@ -159,9 +159,16 @@ def weekly_report(book: PositionBook, backtest_old, backtest_new,
                 "(how high trades got before we left)")
         add("")
         new_total = sum(p.final_pnl_pct for p in week)
+        # the hard stop is stamped per trade, so one week can mix stops (a
+        # trade opened before the setting moved, a legacy row with no stamp).
+        # Quote the number only when every trade shares one stamp, the same
+        # rule _old_rules_label applies to the OLD side.
+        stamps = {stamped_stop(p) for p in week}
+        stop_txt = (f"stop {next(iter(stamps)):g}"
+                    if len(stamps) == 1 and None not in stamps
+                    else "each trade's own entry stop")
         add(f"NEW exit rules (half at +{config.TP_HALF_PCT:g} → let the runner "
-            f"give back {config.RUNNER_GIVEBACK_PCT:g} off peak → stop "
-            f"{config.STOP_PCT:g}):")
+            f"give back {config.RUNNER_GIVEBACK_PCT:g} off peak → {stop_txt}):")
         add(f"  this week: {new_total:+.0f}% summed across {len(week)} "
             f"trade{'s' if len(week) != 1 else ''} "
             f"({new_total / len(week):+.0f}% per trade on average)")

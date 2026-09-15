@@ -146,7 +146,10 @@ def position_story(p):
         peaked = (f" It even peaked at {p.mfe_pct:+.0f}% first, a reminder "
                   "the half-target matters."
                   if p.mfe_pct is not None and p.mfe_pct >= 10 else "")
-        story = (f"It hit the {config.STOP_PCT:g}% stop at {_t(exit_t)}. "
+        stamp = poslib.stamped_stop(p)
+        hit = (f"It hit the {stamp:g}% stop" if stamp is not None
+               else "It hit its hard stop")
+        story = (f"{hit} at {_t(exit_t)}. "
                  f"Why it failed: {why}. The stop did its job: it kept a bad "
                  f"trade small.{peaked}")
     elif reason in ("momentum flip", "runner give-back"):
