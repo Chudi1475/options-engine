@@ -7,7 +7,8 @@ Exit system (constants in config.py):
 - SELL HALF when the option is +TP_HALF_PCT over entry mid
 - then let the runner RUN: sell the remaining half when it gives back
   RUNNER_GIVEBACK_PCT points from its peak (give-back trail)
-- hard stop: sell everything at STOP_PCT from entry mid, any time
+- hard stop: sell everything at the stop stamped on the position when it
+  opened (config.STOP_PCT at that moment), measured from entry mid, any time
 - "close before expiry" warning EXPIRY_WARN_MINUTES before the 4 PM ET close
 
 Each position also runs a shadow simulation of the OLD rules (a single
@@ -102,6 +103,14 @@ class Position:
                                # to the caller's current bracket (old behavior).
     old_rules: dict = field(default_factory=lambda: {
         "status": "open", "exit_pct": None, "exit_reason": None, "exit_time": None})
+    stop_pct: float = field(default_factory=lambda: config.STOP_PCT)
+                               # the hard stop live AT ENTRY, pinned for the same
+                               # reason old_bracket is: a config change or a deploy
+                               # must never move the stop on a trade that is
+                               # already open. A row saved before this field
+                               # existed has no stop_pct: position_from_row gives
+                               # an open one LEGACY_STOP_PCT, the stop it opened
+                               # under, and a closed one None (no stamp).
     # W02 identity. Three ids with three different jobs, carried on the row so
     # a delivered card, the observation behind it and this position name each
     # other instead of being matched afterwards by guessing on a clock.
@@ -139,6 +148,49 @@ class Position:
 # unchanged from the copies it replaces; the normal path still prefers the
 # bracket in reports/backtest_results.json.
 DEFAULT_OLD_BRACKET = {"target_pct": 15, "stop_pct": -60}
+
+# The hard stop any position still OPEN from before stop_pct existed was opened
+# under. config.STOP_PCT defaulted to -90 for every row that can still be open
+# and no deployment overrode it, so a legacy open position keeps -90 until it
+# closes instead of picking up whatever the config says on the day it reloads.
+# Closed legacy rows are history from several stop eras (-30, -70, -90), so
+# they get no stamp at all rather than a number they may never have run under.
+LEGACY_STOP_PCT = -90.0
+
+
+def stamped_stop(pos):
+    """The stop stamped on this position at entry, or None when there is no
+    usable stamp: a closed row from before stamps existed, or a malformed hand
+    edited value (NaN, a bool, zero, a gain, text)."""
+    v = getattr(pos, "stop_pct", None)
+    if (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v) and v < 0):
+        return float(v)
+    return None
+
+
+def stop_level(pos) -> float:
+    """The hard stop this position is judged under: its stamp. With no usable
+    stamp it falls back to the live config rather than to no stop at all."""
+    s = stamped_stop(pos)
+    return config.STOP_PCT if s is None else s
+
+
+def position_from_row(row: dict) -> Position:
+    """A Position rebuilt from a saved row (positions.json or a journal intent).
+
+    Unknown keys are dropped, so one schema evolved row can never crash a boot.
+    A row with no stop_pct was saved before the stop was stamped per position.
+    If it is still open it gets LEGACY_STOP_PCT rather than the dataclass
+    default, because the default is today's config and that would move the
+    stop on an open trade. If it is closed it gets None, so the durable row
+    never claims a stop it did not run under. Every loader goes through here so
+    the two can never disagree."""
+    allowed = {f.name for f in fields(Position)}
+    kw = {k: v for k, v in row.items() if k in allowed}
+    if "stop_pct" not in kw:
+        kw["stop_pct"] = None if kw.get("state") == "closed" else LEGACY_STOP_PCT
+    return Position(**kw)
 
 
 def valid_bracket(b) -> bool:
@@ -194,11 +246,15 @@ def step(pos: Position, now: datetime, mark: float, mark_source: str,
         # out early even while a fresh live quote sat well above the stop.
         stop_trigger = eff if comparable else (
             min(eff, est_pct) if est_pct is not None else eff)
-        if stop_trigger <= config.STOP_PCT:
+        # judged against the stop stamped at entry, never today's config, so a
+        # deploy that moves STOP_PCT cannot sell a trade the old stop was holding
+        stop = stop_level(pos)
+        if stop_trigger <= stop:
             pos.final_exit = {"time": ts, "pct": eff, "mark": mark, "reason": "stop"}
             pos.final_pnl_pct = pos.weighted_final(eff)
             pos.state = "closed"
-            events.append({"type": "stop", "pct": eff, "source": mark_source})
+            events.append({"type": "stop", "pct": eff, "source": mark_source,
+                           "stop_pct": stop})
         elif pos.state == "open" and comparable and pct >= config.TP_HALF_PCT:
             pos.half_exit = {"time": ts, "pct": pct, "mark": mark}
             pos.state = "half_sold"
@@ -294,11 +350,10 @@ class PositionBook:
         # parse each record on its own and filter unknown keys, so ONE bad /
         # legacy / schema-evolved record can never crash the whole bot on boot
         # and silently drop every live position from monitoring
-        allowed = {f.name for f in fields(Position)}
         out = []
         for p in raw:
             try:
-                out.append(Position(**{k: v for k, v in p.items() if k in allowed}))
+                out.append(position_from_row(p))
             except (TypeError, ValueError, AttributeError) as e:
                 rid = p.get("id") if isinstance(p, dict) else repr(p)
                 print(f"skipping unloadable position record {rid}: {e}")
