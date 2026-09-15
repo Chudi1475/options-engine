@@ -42,6 +42,11 @@ TICKER_FEED = ("Yahoo Finance",
                "https://feeds.finance.yahoo.com/rss/2.0/headline"
                "?s={sym}&region=US&lang=en-US")
 
+# Yahoo answers HTTP 429 to a feed request that carries no browser style
+# User-Agent. Every feed read in the repo sends this one header, so the
+# catalyst watch cannot drift from the news desk again.
+USER_AGENT = "Mozilla/5.0 (options-engine)"
+
 # words that historically mean "today is not a normal day" for a ticker
 # or the whole market. Case-insensitive. Keep blunt — false positives just
 # add a warning line, false negatives are the expensive kind.
@@ -126,7 +131,7 @@ def same_story(title: str, sent_titles, min_shared: int = 3,
 
 def _fetch_titles(url: str) -> list:
     r = requests.get(url, timeout=10,
-                     headers={"User-Agent": "Mozilla/5.0 (options-engine)"})
+                     headers={"User-Agent": USER_AGENT})
     r.raise_for_status()
     root = ETree.fromstring(r.content)
     return [(it.findtext("title") or "").strip()

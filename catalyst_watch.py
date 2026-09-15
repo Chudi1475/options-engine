@@ -104,7 +104,7 @@ def discover_events(symbols=None, now=None):
     for symbol in symbols:
         try:
             url='https://feeds.finance.yahoo.com/rss/2.0/headline?s='+quote(symbol)
-            response=requests.get(url,timeout=8);response.raise_for_status()
+            response=requests.get(url,timeout=8,headers={'User-Agent':news.USER_AGENT});response.raise_for_status()
             for item in ET.fromstring(response.content).findall('.//item')[:8]:
                 title=item.findtext('title') or '';link=item.findtext('link');pub=item.findtext('pubDate')
                 if not link or not pub:continue

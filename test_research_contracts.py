@@ -41,4 +41,19 @@ class ResearchTests(unittest.TestCase):
   q=quote(0,.24,.25,'DELL');q.update(last_trading_at_utc=stamp(5),multiplier=100,tick_size=.01,expiry_date='2026-09-09')
   cases=cw.budget_cases(q,ev,now,.1);self.assertFalse(cases[0]['feasible']);self.assertTrue(cases[1]['feasible'])
   q['last_trading_at_utc']=stamp(2);self.assertTrue(all(not x['feasible'] for x in cw.budget_cases(q,ev,now,.1)))
+ def test_catalyst_news_read_sends_the_shared_browser_header(self):
+  # yahoo answers 429 to a feed request with no browser style user agent
+  import news,requests
+  from unittest.mock import patch
+  seen=[]
+  class Resp:
+   content=b'<rss><channel></channel></rss>'
+   def raise_for_status(self):pass
+  def fake_get(url,timeout=None,headers=None):
+   seen.append(headers or {});return Resp()
+  with patch.object(requests,'get',fake_get),patch.object(news,'next_earnings',lambda s:None):
+   out=cw.discover_events(symbols=['AMD'])
+  self.assertEqual(out['errors'],[])
+  self.assertEqual([h.get('User-Agent') for h in seen],[news.USER_AGENT])
+
 if __name__=='__main__':unittest.main()
