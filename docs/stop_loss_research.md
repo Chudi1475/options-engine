@@ -180,6 +180,29 @@ just past the level containing 75-85% of winners. If 80% of winners never went
 more than ~15 SPX points against us, -30% is right and this document is wrong.
 Needs 50 trades minimum, 100+ for a distribution worth acting on.
 
+## 8. What shipped for issue #3
+
+The owner took the -50% recommendation as the default. What landed, and what
+did not:
+
+- **Shipped.** `config.DEFAULT_STOP_PCT = -50`, still overridable with the
+  `STOP_PCT` env var. It is one number for all four setups: the -45% for the
+  TSLA/QCOM weeklies suggested in section 6 is not implemented.
+- **Shipped.** Each position stamps the stop that was live when it opened
+  (`Position.stop_pct`). Open rows saved before that field existed reload at
+  -90, and closed ones carry no stamp rather than a stop they may not have run
+  under, so a deploy never moves the stop on an open trade. The stop card, the
+  log line, the recap, `/status` and the weekly board name each trade's own
+  stop. `test_hard_stop.py` pins all of it.
+- **Unchanged on purpose.** Sizing stays risk based, so a full stop-out still
+  costs `RISK_PER_TRADE_PCT` and each position is about 2.00% of the account
+  instead of 1.11%. The +25% half, the 40 point give-back trail and the
+  old-rules shadow are untouched, as the issue required.
+- **Not shipped.** The time stop, the -90% disaster backstop and the
+  `MIN_WINRATE` recalibration from section 6. Until those are decided, the
+  warning in section 4 stands: if the backtest reports are rebuilt under -50,
+  no current setup clears the 70% floor and the momentum path goes quiet.
+
 ## Sources
 
 - Options Cafe, 0DTE SPY opening-range-breakout backtest (303 trades) — https://options.cafe/blog/0dte-opening-range-breakout-strategy-spy-backtested-results/

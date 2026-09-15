@@ -34,7 +34,7 @@ THE ENTRY ALERT (this is the money text)
 
   📈 BUY CALL, SPXW 7300, expires TODAY 6/11
   Quote: Bid $4.20 / Ask $4.60, set a LIMIT order near $4.40. Never market-order.
-  Size: ~1.11% of account, risking 1% if stopped
+  Size: ~2.00% of account, risking 1% if stopped
 
   WHY: SPX just turned UP in the last 15 minutes (+0.21%), the exact
   pattern behind Kelechi's best trades.
@@ -42,7 +42,7 @@ THE ENTRY ALERT (this is the money text)
   EXIT PLAN: I'll text you each step:
   1️⃣ SELL HALF at +25%
   2️⃣ let the rest RUN. I text you when it gives back 40 points from its peak
-  3️⃣ STOP: -90% → sell everything
+  3️⃣ STOP: -50% → sell everything
   4️⃣ expires today → I warn you 15 min before close
 
   🟢 Win rate in testing: at least 70 of 100, SOLID (...)
@@ -63,8 +63,8 @@ Quote / LIMIT, buy with a LIMIT order near the middle price shown.
   was not what got backtested.
 
 Size, how much to put in so that a full stop-out costs you exactly
-  1% of your account. At the live -90% stop that works out
-  to roughly 1.11% of the account per trade. Text /setaccount 25000
+  1% of your account. At the live -50% stop that works out
+  to roughly 2.00% of the account per trade. Text /setaccount 25000
   to the bot once and it shows real dollar amounts. "CORRELATED, half size"
   means you already have a same-direction trade open, so this one risks
   0.5% instead.
@@ -79,7 +79,7 @@ THE EXIT TEXTS (the bot watches your trade so you don't have to)
 💰 SELL HALF, +25% target hit.......sell half, let the rest ride
    (only bought 1 contract? just sell it, banking the win is the play)
 🔄 GAVE BACK 40, SELL REST..the move peaked and faded, sell what's left
-🛑 STOP, SELL EVERYTHING.............down -90%. Sell. No hoping.
+🛑 STOP, SELL EVERYTHING.............down -50%. Sell. No hoping.
 ⏰ CLOSE BEFORE EXPIRY................15 min to the bell, close it out
 
 The runner exit is a GIVE-BACK trail, not a prediction: once the trade is up,
@@ -123,7 +123,7 @@ THE THREE RULES THAT KEEP YOU ALIVE
 ------------------------------------
 1. If you didn't get a text, there is no trade. Boredom is not a setup.
 2. The stop is the stop. One ignored stop can erase a week of wins.
-3. Size off the text (~1.11% of account). Losing streaks happen even
+3. Size off the text (~2.00% of account). Losing streaks happen even
    when nothing is wrong, size so that 5 losses in a row barely sting.
 
 HONESTY NOTES (read once)

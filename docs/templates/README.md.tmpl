@@ -1,3 +1,6 @@
+## Current status
+Running in paper + limited live. Hard stop at __STOP__. Position state survives restarts. Live stats replace backtest stats after sufficient closed trades. Single-instance only.
+
 # options-engine
 
 Options strategy engine: trade history analysis, strategy definition, honest backtesting, and a live Telegram alert service with all-day position tracking. **Analysis and alerts only, never places orders.**
@@ -104,7 +107,7 @@ signals (and at least __LIVE_MIN_SETUP__ for the specific setup).
 ```
 python test_pipeline.py            # offline: every exit path, persistence, sizing
 python test_no_hardcoded_stats.py  # no hand-typed rule numbers in text surfaces
-python test_replay.py 2026-05-13   # replay a historic day end to end
+python replay_day.py 2026-05-13    # replay a historic day end to end (needs the network)
 python scanner.py --test           # live: all 5 alert types to your phone
 ```
 

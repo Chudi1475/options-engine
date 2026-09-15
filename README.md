@@ -1,4 +1,5 @@
 <!-- GENERATED FILE. Edit docs/templates/README.md.tmpl and run `python gen_docs.py`. Numbers come from strategy_spec. -->
+
 ## Current status
 Running in paper + limited live. Hard stop at -50%. Position state survives restarts. Live stats replace backtest stats after sufficient closed trades. Single-instance only.
 
@@ -40,7 +41,7 @@ What it does each trading day (ET):
   Entry cards lead with **expected value per trade** (the honest stat),
   show the option's live bid/ask + a limit price, and size every trade so
   a full stop-out costs exactly 1% of the account (`/setaccount`),
-  which is about 1.11% of it per trade at the live stop.
+  which is about 2.00% of it per trade at the live stop.
   Live allow-list: QCOM:call, SPX:call, SPY:call, TSLA:put.
 - **all day**, every alert becomes a tracked position (`positions.json`,
   survives restarts). The bot texts each exit step: **SELL HALF at +25%**,
@@ -108,7 +109,7 @@ signals (and at least 10 for the specific setup).
 ```
 python test_pipeline.py            # offline: every exit path, persistence, sizing
 python test_no_hardcoded_stats.py  # no hand-typed rule numbers in text surfaces
-python test_replay.py 2026-05-13   # replay a historic day end to end
+python replay_day.py 2026-05-13    # replay a historic day end to end (needs the network)
 python scanner.py --test           # live: all 5 alert types to your phone
 ```
 
