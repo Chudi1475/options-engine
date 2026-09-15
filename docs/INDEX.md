@@ -13,6 +13,8 @@
 
 Add topic files in `docs/learnings/` and list them here.
 
+- `docs/REVIEW_LOOP.md`: how to request an outside architecture review and validate the packet it returns
+
 ---
 
 **Last Updated**: 2026-07-12

@@ -119,6 +119,10 @@ python scanner.py --test           # live: all 5 alert types to your phone
 and run `python gen_docs.py`. `python gen_docs.py --check` fails if they are
 stale, so a config change cannot quietly leave the docs behind.
 
+`docs/REVIEW_LOOP.md` is how an outside architecture review is requested and
+validated. Suggestions are proposals only and are never merged on the
+reviewer's word.
+
 ## History & research
 
 ```
