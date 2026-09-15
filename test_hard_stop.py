@@ -334,6 +334,25 @@ class HardStopTests(unittest.TestCase):
                 self.assertLessEqual(shown, live)
                 self.assertIn(f"That hits the {live:g}% hard stop", card)
 
+    def test_status_shows_each_open_trades_own_stop(self):
+        from strategy import StrategyConfig
+        config.STOP_PCT = -90.0
+        legacy = new_position("status-old")
+        config.STOP_PCT = -50.0
+        fresh = new_position("status-new")
+        svc = scanner.Service.__new__(scanner.Service)
+        svc.book = positions.PositionBook.__new__(positions.PositionBook)
+        svc.book.positions = [legacy, fresh]
+        svc.current_mode = lambda: ("green", "test")
+        svc.feed = SimpleNamespace(backend_for=lambda symbol: "yfinance")
+        svc.cfg = StrategyConfig()
+        svc._brain_status = lambda: "test"
+        text = svc.status_text()
+        lines = [ln for ln in text.splitlines() if " 640 " in ln]
+        self.assertEqual(len(lines), 2, text)
+        self.assertIn("stop -90%", lines[0])
+        self.assertIn("stop -50%", lines[1])
+
 
 if __name__ == "__main__":
     unittest.main()
