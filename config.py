@@ -43,17 +43,32 @@ def _f(name: str, default: float) -> float:
 
 # ---------------------------- CONFIG ----------------------------
 TP_HALF_PCT = _f("TP_HALF_PCT", 25.0)        # sell HALF when option is +25% over entry mid
-STOP_PCT = _f("STOP_PCT", -90.0)             # sell EVERYTHING at -90%. Walk-forward
-                                             # validated (bt_exp_stop_walkforward):
-                                             # -90 beat the old -70 on BOTH win rate
-                                             # and expectancy in BOTH halves
-                                             # (76.8% vs 73.2% win overall) and kept
-                                             # the second half above the 70% floor.
-                                             # Tradeoff, on record: deeper paper
-                                             # drawdown per trade, and risk-based
-                                             # sizing shrinks positions ~7/9, so
-                                             # account compounding is slightly
-                                             # slower. Win rate is the priority.
+DEFAULT_STOP_PCT = -50.0                     # owner decision, issue #3. Kept equal
+                                             # to the literal on the next line,
+                                             # which is what release_manifest
+                                             # records; test_hard_stop checks it.
+STOP_PCT = _f("STOP_PCT", -50.0)             # sell EVERYTHING when the option is
+                                             # down this far from entry mid: -50
+                                             # means half the premium. Override
+                                             # with the STOP_PCT env var.
+                                             # Each position keeps the stop that
+                                             # was live when it opened
+                                             # (positions.stop_pct), so changing
+                                             # this never moves the stop on a
+                                             # trade that is already open.
+                                             # On record: the walk-forward
+                                             # (bt_exp_stop_walkforward) had picked
+                                             # -90 over -70 on win rate. The tight
+                                             # stop sweep (bt_exp_stop_tight)
+                                             # measured -50 at a lower win rate
+                                             # with more stop-outs, and none of the
+                                             # four allow-listed setups clears
+                                             # MIN_WINRATE there if the backtest
+                                             # reports are rebuilt under this stop.
+                                             # Sizing stays risk-based: a full
+                                             # stop-out still costs
+                                             # RISK_PER_TRADE_PCT, so each position
+                                             # is about 1.8x the size it was at -90.
 RUNNER_GIVEBACK_PCT = _f("RUNNER_GIVEBACK_PCT", 40.0)  # after banking half at +25%,
                                              # let the runner RUN; sell it only when
                                              # it gives back this many points from its
