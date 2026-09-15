@@ -315,6 +315,25 @@ class HardStopTests(unittest.TestCase):
         self.assertEqual(float(declared["declared"]), config.DEFAULT_STOP_PCT)
         self.assertTrue(declared["env_overridable"])
 
+    def test_test_sequence_sample_stop_fires_past_the_stop_it_names(self):
+        import re
+        for live in (-50.0, -99.5):
+            with self.subTest(live=live):
+                config.STOP_PCT = live
+                sent = []
+                svc = scanner.Service.__new__(scanner.Service)
+                svc.dry = True
+                svc.book = positions.PositionBook(
+                    Path(os.environ["DATA_DIR"]) / f"sample_{abs(live):g}.json")
+                svc.backtest_old = svc.backtest_new = None
+                svc.current_mode = lambda: ("green", "test")
+                svc.notify = lambda text: sent.append(text) or []
+                svc.test_sequence()
+                card = next(m for m in sent if "STOP: SELL EVERYTHING" in m)
+                shown = float(re.search(r"is down ([+-]?\d+)%", card).group(1))
+                self.assertLessEqual(shown, live)
+                self.assertIn(f"That hits the {live:g}% hard stop", card)
+
 
 if __name__ == "__main__":
     unittest.main()
