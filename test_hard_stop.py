@@ -300,6 +300,15 @@ class HardStopTests(unittest.TestCase):
         uniform = scoreboard.weekly_report(book, None, None, date(2026, 9, 18))
         self.assertIn("stop -50", uniform)
 
+    def test_recap_still_open_story_names_the_trades_own_stop(self):
+        config.STOP_PCT = -90.0
+        p = new_position("recap-open")
+        config.STOP_PCT = -50.0
+        self.assertEqual(step(p, -60.0), [])
+        verdict, story = recap.position_story(p)
+        self.assertTrue(verdict.startswith("STILL OPEN"), verdict)
+        self.assertIn("Its hard stop is -90%.", story)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -126,9 +126,13 @@ def position_story(p):
                 "Your broker shows the real outcome." + est_note)
     if p.state != "closed":
         cur = p.last_mark_pct if p.last_mark_pct is not None else 0.0
+        # name this trade's own stop: it can differ from the live setting
+        # the closing line quotes, and a trade already past that number must
+        # not read like a stop the bot missed
         return (f"STILL OPEN ({cur:+.0f}% so far)",
                 "This one doesn't expire today. I'm still watching it and "
-                "will text the exits as they come." + est_note)
+                "will text the exits as they come. Its hard stop is "
+                f"{poslib.stop_level(p):g}%." + est_note)
 
     total = p.final_pnl_pct
     verdict = "RIGHT ✅" if total > 0 else "WRONG ❌"
