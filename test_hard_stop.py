@@ -353,6 +353,18 @@ class HardStopTests(unittest.TestCase):
         self.assertIn("stop -90%", lines[0])
         self.assertIn("stop -50%", lines[1])
 
+    def test_exit_loop_prints_the_hard_stop_line(self):
+        import ast
+        tree = ast.parse((REPO / "scanner.py").read_text(encoding="utf-8"))
+        monitor = next(n for n in ast.walk(tree)
+                       if isinstance(n, ast.FunctionDef) and n.name == "monitor_one")
+        printed = [c for c in ast.walk(monitor)
+                   if isinstance(c, ast.Call) and getattr(c.func, "id", "") == "print"
+                   and any(isinstance(a, ast.Call)
+                           and getattr(a.func, "attr", "") == "hard_stop_line"
+                           for a in c.args)]
+        self.assertEqual(len(printed), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
