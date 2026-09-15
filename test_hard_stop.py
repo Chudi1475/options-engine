@@ -309,6 +309,12 @@ class HardStopTests(unittest.TestCase):
         self.assertTrue(verdict.startswith("STILL OPEN"), verdict)
         self.assertIn("Its hard stop is -90%.", story)
 
+    def test_release_manifest_records_the_stop_as_a_number(self):
+        import release_manifest
+        declared = release_manifest._effective_config()["STOP_PCT"]
+        self.assertEqual(float(declared["declared"]), config.DEFAULT_STOP_PCT)
+        self.assertTrue(declared["env_overridable"])
+
 
 if __name__ == "__main__":
     unittest.main()
