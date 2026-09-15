@@ -237,7 +237,11 @@ def run_checks(files: list) -> bool:
                      # reporting one signal.
                      "test_fill_journal.py",
                      "test_completion.py", "test_research_contracts.py",
-                     "test_finish_integration.py"):
+                     "test_finish_integration.py",
+                     # issue 3, the hard stop: the default, the env override,
+                     # the stamp at entry that keeps an open trade on its own
+                     # stop, and legacy rows that reload at minus ninety.
+                     "test_hard_stop.py"):
             r = subprocess.run([PYEXE, test], cwd=REPO, timeout=600,
                                capture_output=True, text=True, errors="replace")
             if r.returncode != 0:
