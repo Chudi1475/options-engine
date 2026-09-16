@@ -138,6 +138,28 @@ def learn_enabled() -> bool:
         not in ("0", "false", "no", "off")
 
 
+def news_alerts_enabled() -> bool:
+    """Whether the bot may text NEWS on its own. Defaults OFF.
+
+    Covers every unprompted news push there is: the breaking-headline alert,
+    the AI quick read that follows one, the hourly catalyst watch notices, the
+    headline lines on the morning card, and the news line on an entry card.
+
+    Owner instruction 2026-09-16, issue 7. One day put 60 to 70 catalyst and
+    breaking texts on his phone against barely any trades, so the rule is now
+    blunt: a notification is for a trade. Set NEWS_ALERTS_ENABLED=true to put
+    them back.
+
+    This deliberately does NOT touch how a trade is picked. news.earnings_inside
+    still skips a setup whose option lives through an earnings report and
+    risk_gate still reads the event calendar, because those make the bot pickier
+    rather than louder, and that is the half of the news layer he asked to keep.
+    A /catalysts command he types himself is a pull, not a push, so it still
+    answers."""
+    return os.environ.get("NEWS_ALERTS_ENABLED", "").strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
 # ---------------------- paid-API spending policy ----------------------
 # The Anthropic key this bot runs on is metered pay-per-use and is NOT the
 # owner's Claude subscription. It has repeatedly run to $0 and taken the whole

@@ -1899,6 +1899,33 @@ class Service:
 
     # ---------- morning ----------
 
+    def _morning_news_lines(self) -> list:
+        """Earnings radar and hot headlines for the morning card, or nothing.
+
+        Its own method so the quiet rule has one seam a test can hold. News
+        must never block or break the morning report, so a failure here costs
+        the extra lines and nothing else."""
+        if not config.news_alerts_enabled():
+            return []
+        try:
+            return list(news.morning_lines(self.cfg.watchlist) or [])
+        except Exception as e:
+            print(f"news scan failed: {e}")
+            return []
+
+    def _entry_news_lines(self, ticker: str) -> list:
+        """The warning line an entry card carries about the ticker's own news.
+
+        Off by default with every other news push. SPX has no company feed of
+        its own, so it never had one of these."""
+        if not config.news_alerts_enabled() or ticker == "SPX":
+            return []
+        try:
+            return [f"⚠️ News today: {outlet}: {title}"
+                    for outlet, title in news.hot_headlines(ticker)[:2]]
+        except Exception:
+            return []
+
     def morning_report(self, now: datetime, include_gap: bool = True,
                        premarket: bool = False):
         today = now.date()
@@ -1946,12 +1973,9 @@ class Service:
         card = cards.morning_card(mode, reason, today,
                                   window_ct=cards.entry_window_ct(self.cfg),
                                   sniper_line=self._sniper_line())
-        try:  # earnings radar + hot headlines (news must never block the report)
-            extra = news.morning_lines(self.cfg.watchlist)
-            if extra:
-                card += "\n" + "\n".join(extra)
-        except Exception as e:
-            print(f"news scan failed: {e}")
+        extra = self._morning_news_lines()
+        if extra:
+            card += "\n" + "\n".join(extra)
         if config.paper_mode():
             card += "\n[PAPER MODE is ON: cards are practice, not trades.]"
         self.notify(card)
@@ -3195,13 +3219,7 @@ class Service:
             # can't mutate it) — the shadow is judged under the rules it opened on
             old_bracket=dict(self.old_bracket),
         )
-        news_lines = []
-        if setup.ticker != "SPX":
-            try:
-                news_lines = [f"⚠️ News today: {outlet}: {title}"
-                              for outlet, title in news.hot_headlines(setup.ticker)[:2]]
-            except Exception:
-                pass
+        news_lines = self._entry_news_lines(setup.ticker)
         card = cards.entry_card(setup, pos, quote, display, mode, mode_reason,
                                 expiry_date, now.date(), news_lines=news_lines)
         # DURABLE INTENT FIRST, then the position, then the card.
@@ -4132,6 +4150,11 @@ class Service:
         instant a fresh headline lands instead of waiting on the ~15s trading
         loop, and so a slow AI 'read' never delays the alert or the next trade
         cycle. Safe to call repeatedly."""
+        if not config.news_alerts_enabled():
+            # owner 2026-09-16, issue 7: no BREAKING texts and no quick reads.
+            # Checked BEFORE the standby gate so the reason a thread does not
+            # start is this rule and not an ownership accident.
+            return
         if telegram.standby()[0]:
             return  # a standby copy sends no BREAKING texts
         t = getattr(self, "_news_thread", None)
@@ -4883,7 +4906,13 @@ class Service:
         """Independent watch collection, never an order or a momentum gate."""
         if self.dry or telegram.test_mode() or not telegram.may_write_shared_state():
             return
-        if os.environ.get("CATALYST_WATCH_ENABLED", "true").lower() != "true":
+        if not config.news_alerts_enabled():
+            # owner 2026-09-16, issue 7. This is the loop that texted the AVGO
+            # and MU watch notices: hourly, up to four notices a pass, from the
+            # session loop AND the round-the-clock daemon loop. Off by default
+            # now, and off means it does not even collect.
+            return
+        if os.environ.get("CATALYST_WATCH_ENABLED", "false").lower() != "true":
             return
         thread = getattr(self, "_catalyst_worker", None)
         if thread is not None and thread.is_alive():
