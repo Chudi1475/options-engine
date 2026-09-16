@@ -393,6 +393,18 @@ def why_text(setup) -> str:
             "setup. Less proven; extra care.")
 
 
+def _win_chance_line(stats: dict) -> str:
+    """The chance of the win, at the TOP of the card.
+
+    Owner instruction 2026-09-16, issue 8: he wants the percentage on the alert
+    itself, not only in the small print. The footer still carries the
+    provenance (which exits, which report, how many trades measured it); this
+    line is just the number, read from the same stats dict so the two can never
+    disagree."""
+    emoji, label = tier_for(stats["win_rate"])
+    return f"{emoji} WIN CHANCE: {stats['win_rate']:.0f} of 100 tested, {label}"
+
+
 def _expected_lines(stats: dict, dollars):
     ev = stats["ev_pct"]
     line = f"💰 EXPECTED: {ev:+.1f}% per trade {stats['costs_note']}"
@@ -438,6 +450,7 @@ def entry_card(setup, pos, quote, stats: dict, risk_mode: str,
     elif risk_mode == "yellow":
         lines.append(f"⚠️ CAUTION DAY: {mode_reason}")
     size, dollars = size_lines(pos.risk_pct, pos.entry_mid, pos.correlated)
+    lines.append(_win_chance_line(stats))
     lines += _expected_lines(stats, dollars)
     lines.append("")
     arrow = "📈" if setup.direction == "call" else "📉"
