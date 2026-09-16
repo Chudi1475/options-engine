@@ -255,7 +255,11 @@ def run_checks(files: list) -> bool:
                      # the running per-setup tally that goes on every alert and
                      # is re-added at the end of each day, so the next card on
                      # that ticker carries a denominator including today.
-                     "test_setup_record.py"):
+                     "test_setup_record.py",
+                     # the money floor: no alert on a contract under the
+                     # owner's minimum premium, checked before anything is
+                     # written or sent, and never fatal to a real trade.
+                     "test_min_premium.py"):
             r = subprocess.run([PYEXE, test], cwd=REPO, timeout=600,
                                capture_output=True, text=True, errors="replace")
             if r.returncode != 0:

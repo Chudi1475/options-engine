@@ -86,6 +86,20 @@ RISK_PER_TRADE_PCT = _f("RISK_PER_TRADE_PCT", 1.0)    # full stop-out costs 1% o
 CORRELATED_RISK_PCT = _f("CORRELATED_RISK_PCT", 0.5)  # risk when same-direction trade already open
 SPREAD_COST_PCT = _f("SPREAD_COST_PCT", 4.0)  # est. round-trip cost of crossing the spread (live stats)
 MIN_WINRATE = _f("MIN_WINRATE", 70.0)        # never alert below this backtested win rate
+MIN_PREMIUM = _f("MIN_PREMIUM", 1.00)        # never alert on a contract cheaper
+                                             # than this. Owner decision
+                                             # 2026-09-16: "aim for decent money
+                                             # and not ant bite dollars". A $1.00
+                                             # contract costs $100, so banking
+                                             # half at the take profit returns
+                                             # about $12 per contract while the
+                                             # risk is the whole premium; under
+                                             # that it is real risk for lunch
+                                             # money. This is a PRICE filter on
+                                             # the contract a setup already
+                                             # chose. It does not touch the
+                                             # allow-list, the win-rate floor or
+                                             # the entry signal. 0 disables it.
 GAP_UP_SKIP_PCT = _f("GAP_UP_SKIP_PCT", 1.0) # stand aside when SPX opens this far
                                              # above yesterday's close. Verified
                                              # regime study (bt_exp_regime_split):

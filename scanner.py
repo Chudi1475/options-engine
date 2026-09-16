@@ -1940,6 +1940,24 @@ class Service:
                   f"{type(e).__name__}")
             return None
 
+    def _premium_below_floor(self, entry_mid) -> bool:
+        """True when the chosen contract is too cheap to be worth a text.
+
+        Owner decision 2026-09-16, no more ant bite dollars. This is a PRICE
+        test on the contract this setup already chose, nothing more: the entry
+        signal, the allow-list and the win-rate gate are all untouched, so it
+        can only ever remove an alert, never create one.
+
+        It is re-checked every cycle rather than being final for the day,
+        because a premium moves and the same setup can be worth texting an hour
+        later. A price that will not parse returns False on purpose: a filter
+        this cosmetic must never be the reason a real trade goes untexted."""
+        try:
+            floor = float(config.MIN_PREMIUM)
+            return floor > 0 and float(entry_mid) < floor
+        except (TypeError, ValueError):
+            return False
+
     def morning_report(self, now: datetime, include_gap: bool = True,
                        premarket: bool = False):
         today = now.date()
@@ -3190,6 +3208,22 @@ class Service:
                 setup.ticker, setup.direction, bar_end, ["no_option_price"],
                 dict(gate_values, sigma=sigma, expiry=str(expiry_date)), now)
             return False
+
+        # Checked HERE: the contract's price is settled and nothing has been
+        # written, journaled or sent yet, so a skip costs a log line and a
+        # recorded reject rather than a half-built trade.
+        if self._premium_below_floor(entry_mid):
+            print(f"{now:%H:%M:%S} {setup.ticker} {setup.direction}: contract "
+                  f"is ${entry_mid:.2f}, under the ${config.MIN_PREMIUM:.2f} "
+                  "floor, skipped. Not texting an ant bite.")
+            self.record_candidate(
+                setup.ticker, setup.direction, bar_end,
+                ["premium_below_floor"],
+                dict(gate_values, entry_mid=entry_mid,
+                     entry_source=entry_source,
+                     min_premium=config.MIN_PREMIUM,
+                     expiry=str(expiry_date)), now)
+            return False  # a premium moves; look again next cycle
 
         risk = config.RISK_PER_TRADE_PCT
         correlated = self.book.open_same_direction(setup.direction)
@@ -4803,7 +4837,8 @@ class Service:
               f"{ct_wall(self.cfg.entry_start):%H:%M}-"
               f"{ct_wall(self.cfg.entry_end):%H:%M} CT, polling every "
               f"{config.POLL_SECONDS}s. Watchlist: {', '.join(self.cfg.watchlist)}. "
-              f"Min win rate {config.MIN_WINRATE:.0f}%. Exits: half at "
+              f"Min win rate {config.MIN_WINRATE:.0f}%. Min premium "
+              f"${config.MIN_PREMIUM:.2f}. Exits: half at "
               f"+{config.TP_HALF_PCT:g}%, give-back {config.RUNNER_GIVEBACK_PCT:g} "
               f"off peak, stop {config.STOP_PCT:g}%. Being picky, no forced trades.")
         if self.backtest_old is None:
