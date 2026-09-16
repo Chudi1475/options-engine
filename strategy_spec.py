@@ -53,6 +53,11 @@ REPORT_NEW_RULES = "reports/backtest_new_rules.json"
 # The un-floored source report stays as the fallback.
 REPORT_SNIPER = "reports/chart_backtest_round6_session.json"
 REPORT_SNIPER_SOURCE = "reports/chart_backtest_round6.json"
+# Yahoo code to the name the reports and the cards use. One map, because the
+# record is now restricted to the live roster and the roster is spelled in
+# Yahoo codes while the report rows are spelled in display names.
+_SNIPER_REPORT_NAMES = {"EURUSD=X": "EUR/USD", "JPY=X": "USD/JPY",
+                        "^GSPC": "SPX"}
 REPORT_REGIME = "bt_exp_regime_split.json"
 
 # The text surfaces that must not hand-type a stat. Kept here so the guard
@@ -275,8 +280,7 @@ class StrategySpec:
 
     def sniper_symbol_names(self) -> list:
         """Human names for the verified symbols (Yahoo codes stay internal)."""
-        names = {"EURUSD=X": "EUR/USD", "JPY=X": "USD/JPY", "^GSPC": "SPX"}
-        return [names.get(s, s) for s in self.sniper_symbols]
+        return [_SNIPER_REPORT_NAMES.get(s, s) for s in self.sniper_symbols]
 
     def sniper_short_txt(self) -> str:
         """'83% verified' for chart titles (whole number: a chart chip is not
@@ -368,13 +372,51 @@ def _measured_from_setup(report: dict, path: str, basis: str) -> Measured:
                     trades=_num(over.get("trades")), source=path, basis=basis)
 
 
+def _roster_report_names() -> set:
+    """The live sniper roster spelled the way the report spells it."""
+    return {_SNIPER_REPORT_NAMES.get(s, s) for s in fvg.SNIPER_SYMBOLS}
+
+
+def _roster_oos(rep: dict):
+    """(rate, trades, wins) over the report's OUT-OF-SAMPLE rows for the
+    symbols still on the roster, or None when the report cannot supply them.
+
+    Derived from the published rows instead of the report's precomputed oos
+    block, because that block pools every symbol the round was scored on. When
+    a symbol comes off the roster the pooled rate keeps describing trades the
+    bot can no longer take, which is the exact drift this module exists to
+    prevent. Restricting to a subset is sound here and not a re-selection: the
+    replay resets its cooldown and its per-day slot per signal group and took
+    one trade per symbol per day, so the rows for one symbol never depended on
+    another symbol being in the run.
+    """
+    if not isinstance(rep, dict):
+        return None
+    rows, split = rep.get("trades"), rep.get("split_date")
+    if not isinstance(rows, list) or not isinstance(split, str):
+        return None
+    names = _roster_report_names()
+    kept = [r for r in rows if isinstance(r, dict)
+            and r.get("symbol") in names and str(r.get("day", "")) >= split]
+    if not kept:
+        return None
+    wins = sum(1 for r in kept if r.get("exit") == "tp")
+    return round(100.0 * wins / len(kept), 1), len(kept), wins
+
+
 def _sniper_measured() -> Measured:
     """The SNIPER record, read from its report: the OUT-OF-SAMPLE pair (rate
-    with its own count) of the session re-score. Falls back to the un-floored
-    round-6 report's OOS leg, then to fvg.SNIPER_MEASURED, then to an empty
+    with its own count) of the session re-score, restricted to the symbols the
+    gate can still fire. Falls back to the report's pooled OOS leg, then to the
+    un-floored round-6 report, then to fvg.SNIPER_MEASURED, then to an empty
     record so the claim drops instead of going stale."""
     basis = "out-of-sample replays"
     rep = _read_report(REPORT_SNIPER) or {}
+    on_roster = _roster_oos(rep)
+    if on_roster is not None:
+        rate, trades, wins = on_roster
+        return Measured(win_rate=rate, trades=trades, wins=wins,
+                        source=REPORT_SNIPER, basis=basis)
     oos = rep.get("oos") if isinstance(rep, dict) else None
     if isinstance(oos, dict) and _num(oos.get("win_rate_pct")) is not None:
         return Measured(win_rate=_num(oos.get("win_rate_pct")),

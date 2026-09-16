@@ -42,7 +42,17 @@ _MIN_GAP_ATR = 0.05
 # strategy_spec (never typed here); SNIPER_MEASURED below is only the
 # offline fallback when the report file is missing.
 # ---------------------------------------------------------------------------
-SNIPER_SYMBOLS = {"EURUSD=X", "JPY=X", "^GSPC", "TSLA", "SPY"}
+# Owner instruction 2026-09-16, issue 8: this is an OPTIONS bot, so forex is
+# off the roster. EURUSD=X and JPY=X were removed here and nowhere else,
+# because every live surface reads this set.
+#
+# Removing them does not disturb the stock record. backtest_chart_v6.replay
+# resets its cooldown and its per-day slot whenever the signal group changes
+# and the round was scored at one trade per symbol per day, so a forex signal
+# could never consume a stock's slot. The measured record is therefore just
+# the same published rows restricted to these names, which strategy_spec now
+# does rather than quoting a rate pooled over symbols the gate cannot fire.
+SNIPER_SYMBOLS = {"^GSPC", "TSLA", "SPY"}
 # Yahoo symbols whose verified data was the REGULAR US session only. The
 # backtest's stock/index bars ran 09:30-16:00 ET and it never signalled one
 # stock trade before 10:00 ET, so pre-market bars are outside the pattern:
@@ -64,10 +74,13 @@ _SNIPER_MAX_RISK_ATR = 3.6   # skip if the stop sits this far away or more
 _SNIPER_STOP_BUF_ATR = 0.1   # stop = FVG far edge +/- this buffer
 _SNIPER_TP_R = 0.4           # take profit, all out, no runner
 # offline fallback only (strategy_spec reads the report when it exists):
-# the OUT-OF-SAMPLE pair from the session re-score, rate with its own count.
-SNIPER_MEASURED = {"win_rate": 83.3, "trades": 48, "wins": 40,
-                   "basis": "out-of-sample walk-forward replays, "
-                            "chart_backtest_round6_session"}
+# the OUT-OF-SAMPLE pair from the session re-score, rate with its own count,
+# restricted to the symbols above. Recount it from the report whenever the
+# roster changes; strategy_spec derives the live number from the report rows
+# and only falls back here when that file is missing.
+SNIPER_MEASURED = {"win_rate": 83.7, "trades": 43, "wins": 36,
+                   "basis": "out-of-sample walk-forward replays on the "
+                            "current roster, chart_backtest_round6_session"}
 
 
 def sniper_window_open(now_et) -> bool:
@@ -76,13 +89,14 @@ def sniper_window_open(now_et) -> bool:
     window is defined so the watcher thread, the gate and the text surfaces
     can never disagree.
 
-    A market holiday is not a trading day even though it is a weekday. Two of
-    the five sniper symbols are forex, which does keep quoting on Thanksgiving
-    or Labor Day, so without this check the bot would fire EUR/USD and USD/JPY
-    tickets on a session the round-6 replay never contained: that config was
-    validated on the US session, and a US holiday is not one. Half days close
-    at 13:00 ET, so the window closes with them rather than three hours after
-    the tape stops."""
+    A market holiday is not a trading day even though it is a weekday. This
+    check was load-bearing when forex was on the roster: those pairs keep
+    quoting on Thanksgiving or Labor Day, so without it the bot fired tickets
+    on a session the round-6 replay never contained. Every remaining symbol is
+    a US stock or index that simply does not trade on a closure, so the check
+    is now belt and braces rather than the only thing standing in the way. It
+    stays because it is also what closes the window early on a half day, at
+    13:00 ET, rather than three hours after the tape stops."""
     try:
         d = now_et.date()
         if not market_calendar.is_trading_day(d):
@@ -320,7 +334,7 @@ def sniper_check(bars, direction, price, atr, conf, yf_symbol, now_et):
     """Gate a read against the verified SNIPER pattern (see SNIPER_* above,
     from reports/chart_backtest_round6.json). ALL conditions must pass:
 
-      - yf_symbol is one of the five verified symbols (SNIPER_SYMBOLS)
+      - yf_symbol is on the verified roster (SNIPER_SYMBOLS)
       - `conf` is a grade A confirming FVG in the plan `direction`
       - FVG gap size >= 1.0*ATR and < 3.0*ATR
       - clock (now_et) is inside the US session window: a weekday at/after
@@ -348,8 +362,10 @@ def sniper_check(bars, direction, price, atr, conf, yf_symbol, now_et):
         reasons = []
 
         if yf_symbol not in SNIPER_SYMBOLS:
+            # the roster is read, never retyped, so this reason cannot go stale
+            # the next time a symbol comes off it
             reasons.append(f"{yf_symbol or '?'} is not a verified sniper symbol "
-                           "(EUR/USD, USD/JPY, SPX, TSLA, SPY only)")
+                           f"({', '.join(sorted(SNIPER_SYMBOLS))} only)")
 
         if not conf or conf.get("grade") != "A":
             reasons.append("no grade A confirming FVG")

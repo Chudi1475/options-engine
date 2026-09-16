@@ -80,9 +80,13 @@ check("fvg: 16:00 ET is closed", not fvg.sniper_window_open(
 check("fvg: Saturday noon is closed", not fvg.sniper_window_open(
     datetime(2026, 8, 22, 12, 0, tzinfo=ET)))
 check("fvg: the CT label renders 8:50 AM CT", fvg.sniper_open_ct_txt() == "8:50 AM CT")
+# Subset, no longer STRICT: forex came off the roster (issue 8), so every
+# symbol left is a US stock or index evaluated on regular-session bars and the
+# two sets are now equal. A strict-subset assertion here would be asserting
+# that some symbol is still exempt from the regular-session rule.
 check("fvg: the stock/index names are the regular-session set",
       fvg.SNIPER_RTH_SYMBOLS == {"^GSPC", "TSLA", "SPY"}
-      and fvg.SNIPER_RTH_SYMBOLS < fvg.SNIPER_SYMBOLS)
+      and fvg.SNIPER_RTH_SYMBOLS <= fvg.SNIPER_SYMBOLS)
 
 day = date(2026, 8, 21)
 sess = bars_frame(day, [(9, 30), (9, 35), (9, 40), (9, 45), (9, 50), (9, 55),
@@ -229,10 +233,25 @@ check("rescore: the report is labeled a measurement, not a selection",
 spec = strategy_spec.get()
 check("spec: the sniper record is read from the session report file",
       spec.sniper.source.endswith("chart_backtest_round6_session.json"))
-check("spec: the rate and count are the report's OUT-OF-SAMPLE pair",
-      spec.sniper.win_rate == rep.get("oos", {}).get("win_rate_pct")
-      and spec.sniper.trades == rep.get("oos", {}).get("trades")
-      and spec.sniper.wins == rep.get("oos", {}).get("wins"))
+# The record must describe the symbols the gate can still fire, not every
+# symbol the round was scored on. The owner took forex off the roster (issue
+# 8) and the report's pooled oos block still counts those trades, so quoting it
+# would put a rate on the card that includes trades the bot cannot take.
+_names = {"EURUSD=X": "EUR/USD", "JPY=X": "USD/JPY", "^GSPC": "SPX"}
+_roster = {_names.get(s, s) for s in fvg.SNIPER_SYMBOLS}
+_rows = [r for r in rep.get("trades", [])
+         if r.get("symbol") in _roster
+         and str(r.get("day", "")) >= str(rep.get("split_date", ""))]
+_wins = sum(1 for r in _rows if r.get("exit") == "tp")
+check("rescore: the report still carries the rows the record is derived from",
+      bool(_rows))
+check("spec: the rate and count are the OUT-OF-SAMPLE pair for the LIVE roster",
+      spec.sniper.trades == len(_rows)
+      and spec.sniper.wins == _wins
+      and spec.sniper.win_rate == round(100.0 * _wins / len(_rows), 1))
+check("spec: the quoted record counts no symbol the gate can no longer fire",
+      spec.sniper.trades < rep.get("oos", {}).get("trades")
+      and all(r.get("symbol") in _roster for r in _rows))
 card = spec.sniper_card_txt()
 check("spec: the card claim pairs the rate with its own count",
       card.startswith(f"hit target {spec.sniper.wins} of {spec.sniper.trades}")

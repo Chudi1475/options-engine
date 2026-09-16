@@ -60,8 +60,8 @@ Telegram commands: `/setaccount 25000`, `/risk green|yellow|red`,
 ## The SNIPER chart pattern
 
 The high-conviction path is the walk-forward-verified FVG setup: measured at
-81.1% win rate over 53 out-of-sample replays, target 0.4R all out, one trade per symbol per day,
-on EURUSD=X, JPY=X, SPY, TSLA, ^GSPC. It fires 8:50 AM CT to the close, weekdays (from 09:50 ET),
+83.7% win rate over 43 out-of-sample replays, target 0.4R all out, one trade per symbol per day,
+on SPY, TSLA, ^GSPC. It fires 8:50 AM CT to the close, weekdays (from 09:50 ET),
 on completed 5-minute bars only, and for the stock and index names on
 regular-session bars only (never pre-market). Every fired ticket is tracked in
 `sniper_book.py` and graded bar by bar the way the backtest graded it. Its gate
