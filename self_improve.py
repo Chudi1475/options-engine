@@ -251,7 +251,11 @@ def run_checks(files: list) -> bool:
                      # issue 8, options only: forex off the sniper roster, the
                      # gate refusing an FX symbol, and a quoted record that
                      # counts only the symbols the gate can still fire.
-                     "test_options_only.py"):
+                     "test_options_only.py",
+                     # the running per-setup tally that goes on every alert and
+                     # is re-added at the end of each day, so the next card on
+                     # that ticker carries a denominator including today.
+                     "test_setup_record.py"):
             r = subprocess.run([PYEXE, test], cwd=REPO, timeout=600,
                                capture_output=True, text=True, errors="replace")
             if r.returncode != 0:

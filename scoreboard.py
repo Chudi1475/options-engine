@@ -65,6 +65,48 @@ def live_stats(book: PositionBook):
     return {k: _stats(v) for k, v in per.items()}, sum(len(v) for v in per.values())
 
 
+def setup_record(book: PositionBook, ticker: str, direction: str):
+    """The running LIVE record for one exact setup, counted from trade one.
+
+    Deliberately separate from stats_for_card. That one decides which stats the
+    card QUOTES as the setup's expectancy, and it holds off on live numbers
+    until there are enough of them to mean something, which is right for a
+    number presented as an edge.
+
+    This is the owner's running tally (2026-09-16). He wants every alert to say
+    how many times that exact trade has been taken and how many of them hit, so
+    that he, Ryan and Kelechi can judge it themselves, and he wants the
+    denominator to grow as trades close so tomorrow's card counts today's
+    result. It therefore reports from the very first closed trade and never
+    waits for a threshold.
+
+    A trade that closed without the bot ever seeing a price has no result, so
+    it is left OUT of the denominator rather than counted as a loss, and the
+    count of those is returned so the card can say so out loud. Returns None
+    when nothing has closed yet."""
+    key = f"{ticker}:{direction}"
+    closed = [p for p in book.closed() if p.setup_key() == key]
+    graded = [p for p in closed if p.final_pnl_pct is not None]
+    if not graded:
+        return None
+    wins = sum(1 for p in graded if p.final_pnl_pct > 0)
+    return {"trades": len(graded), "wins": wins,
+            "win_rate": 100.0 * wins / len(graded),
+            "first_date": min(p.date for p in graded),
+            "ungraded": len(closed) - len(graded)}
+
+
+def all_setup_records(book: PositionBook) -> dict:
+    """Every setup's running record, keyed by setup key, for the daily retally."""
+    out = {}
+    for key in sorted({p.setup_key() for p in book.closed()}):
+        ticker, _, direction = key.partition(":")
+        record = setup_record(book, ticker, direction)
+        if record:
+            out[key] = record
+    return out
+
+
 def stats_for_card(ticker: str, direction: str, book: PositionBook,
                    backtest_old, backtest_new):
     """What the card quotes, with its honest label. Live beats backtest once

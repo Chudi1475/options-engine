@@ -1926,6 +1926,20 @@ class Service:
         except Exception:
             return []
 
+    def _setup_record(self, ticker: str, direction: str):
+        """Our running hits-over-takes for this setup, or None if unreadable.
+
+        Guarded for the same reason the sniper's measured claim is guarded at
+        its own call site: this is one LINE on a trade alert, and nothing
+        cosmetic may ever stop the alert itself from going out. A book that
+        cannot answer costs the line, not the trade."""
+        try:
+            return scoreboard.setup_record(self.book, ticker, direction)
+        except Exception as e:                                 # noqa: BLE001
+            print(f"running record unavailable for {ticker} {direction}: "
+                  f"{type(e).__name__}")
+            return None
+
     def morning_report(self, now: datetime, include_gap: bool = True,
                        premarket: bool = False):
         today = now.date()
@@ -3188,6 +3202,12 @@ class Service:
         display = scoreboard.stats_for_card(setup.ticker, setup.direction,
                                             self.book, self.backtest_old,
                                             self.backtest_new)
+        # The owner's running tally for this exact setup, counted from trade
+        # one and recounted on every alert, so the denominator on tomorrow's
+        # card already includes whatever closed today. Separate from `display`
+        # on purpose: that decides which stats the card quotes as the edge,
+        # this is just our own hits over our own takes.
+        record = self._setup_record(setup.ticker, setup.direction)
         # ---- W02 identity, minted before anything is written or sent ----
         # candidate_id is the OBSERVATION. It is hashed over the decision's own
         # inputs including the 5 minute bar the read came from, so the same
@@ -3221,7 +3241,8 @@ class Service:
         )
         news_lines = self._entry_news_lines(setup.ticker)
         card = cards.entry_card(setup, pos, quote, display, mode, mode_reason,
-                                expiry_date, now.date(), news_lines=news_lines)
+                                expiry_date, now.date(), news_lines=news_lines,
+                                record=record)
         # DURABLE INTENT FIRST, then the position, then the card.
         #
         # The old order was book.add then notify, on the reasoning that a

@@ -377,6 +377,24 @@ def main(require_date=None):
         lines.append(f"OUR TRADES TODAY: none. The bot stayed quiet because {why_quiet}. "
                      "No text = no trade. Sitting out is a position too.")
 
+    # The daily retally. Owner instruction 2026-09-16: at the end of the day,
+    # add up what we took and what hit, per setup, so the next alert on that
+    # same ticker carries a denominator that already includes today.
+    import scoreboard
+    records = scoreboard.all_setup_records(book)
+    if records:
+        lines.append("")
+        lines.append("RUNNING RECORD, every closed trade we have tracked:")
+        for key, r in records.items():
+            ticker, _, direction = key.partition(":")
+            extra = (f", {r['ungraded']} more closed with no price"
+                     if r.get("ungraded") else "")
+            lines.append(f"  {ticker} {direction.upper()}: hit {r['wins']} of "
+                         f"{r['trades']} since {r['first_date']} "
+                         f"({r['win_rate']:.0f} of 100){extra}")
+        lines.append("Tomorrow's card on any of these carries these same "
+                     "numbers, today included.")
+
     lines.append("")
     lines.append(f"Tomorrow: same plan. Wait for the text, sell half at "
                  f"+{config.TP_HALF_PCT:g}%, let the rest run and sell when I say "

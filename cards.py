@@ -405,6 +405,27 @@ def _win_chance_line(stats: dict) -> str:
     return f"{emoji} WIN CHANCE: {stats['win_rate']:.0f} of 100 tested, {label}"
 
 
+def record_line(record, ticker: str, direction: str) -> str:
+    """Our own running tally for this exact setup, on every alert.
+
+    Owner instruction 2026-09-16: he wants to see how many times this trade has
+    been taken and how many of those hit, from the first one, next to the
+    tested number. The tested rate says what the backtest measured; this says
+    what actually happened to us. They are shown as two separate lines on
+    purpose so neither can be mistaken for the other."""
+    name = f"{disp_ticker(ticker)} {direction.upper()}"
+    if not record:
+        return (f"📒 OUR RECORD: no {name} has closed yet, so there is no rate "
+                "to quote. This is the first one I am tracking.")
+    line = (f"📒 OUR RECORD: {name} has hit {record['wins']} of "
+            f"{record['trades']} since {record['first_date']} "
+            f"({record['win_rate']:.0f} of 100).")
+    if record.get("ungraded"):
+        line += (f" {record['ungraded']} more closed without a price ever being "
+                 "seen and are left out of that count.")
+    return line
+
+
 def _expected_lines(stats: dict, dollars):
     ev = stats["ev_pct"]
     line = f"💰 EXPECTED: {ev:+.1f}% per trade {stats['costs_note']}"
@@ -441,7 +462,7 @@ def _winrate_footer(stats: dict) -> str:
 
 def entry_card(setup, pos, quote, stats: dict, risk_mode: str,
                mode_reason: str, expiry: date, today: date,
-               news_lines=None) -> str:
+               news_lines=None, record=None) -> str:
     lines = []
     if pos.paper:
         lines.append("[PAPER] practice mode: track it, don't trade it")
@@ -451,6 +472,7 @@ def entry_card(setup, pos, quote, stats: dict, risk_mode: str,
         lines.append(f"⚠️ CAUTION DAY: {mode_reason}")
     size, dollars = size_lines(pos.risk_pct, pos.entry_mid, pos.correlated)
     lines.append(_win_chance_line(stats))
+    lines.append(record_line(record, setup.ticker, setup.direction))
     lines += _expected_lines(stats, dollars)
     lines.append("")
     arrow = "📈" if setup.direction == "call" else "📉"
