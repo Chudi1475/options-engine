@@ -241,7 +241,17 @@ def run_checks(files: list) -> bool:
                      # issue 3, the hard stop: the default, the env override,
                      # the stamp at entry that keeps an open trade on its own
                      # stop, and legacy rows that reload at minus ninety.
-                     "test_hard_stop.py"):
+                     "test_hard_stop.py",
+                     # issue 7, trades not news: the breaking-news thread that
+                     # never starts, the catalyst watch that collects nothing,
+                     # the morning and entry cards with no headline line, and
+                     # the earnings skip that stays on because it makes the bot
+                     # pickier rather than louder.
+                     "test_quiet_alerts.py",
+                     # issue 8, options only: forex off the sniper roster, the
+                     # gate refusing an FX symbol, and a quoted record that
+                     # counts only the symbols the gate can still fire.
+                     "test_options_only.py"):
             r = subprocess.run([PYEXE, test], cwd=REPO, timeout=600,
                                capture_output=True, text=True, errors="replace")
             if r.returncode != 0:
